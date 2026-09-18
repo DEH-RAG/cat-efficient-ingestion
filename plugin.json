@@ -1,0 +1,10 @@
+{
+    "name": "Efficient Ingestion",
+    "description": "Plugin that owns the chunk-reuse re-embed engine on embedder changes: stored sources of every agent are re-embedded reusing the stored chunks (fallback to full re-ingest) and image points are recovered via embed_images when multimodal. Settings live in the global system:agent store under the 'ingestion' category.",
+    "author_name": "Andrea Sterbini",
+    "plugin_url": "https://github.com/DEH-RAG/cat-efficient-ingestion",
+    "tags": "core, default, ingestion, re-embed, re-ingestion, embedder, status",
+    "thumb": "",
+    "version": "0.0.1",
+    "dependencies": ["cat-multimodal-ingestion"]
+}
