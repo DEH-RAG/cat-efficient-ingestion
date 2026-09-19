@@ -22,6 +22,9 @@ import asyncio
 from langchain_core.documents import Document
 
 from cat import hook
+from cat.db import crud
+from cat.db.models import generate_timestamp
+from cat.log import log
 
 from .configs import EfficientIngestionConfiguration
 from .phases import PHASES
@@ -33,8 +36,10 @@ from .registry import (
     clear_agent,
     delete_status,
     get_status,
+    ingestion_canceled,
     set_phase,
     set_status,
+    status_key,
 )
 from .split import split_oversized
 
@@ -96,9 +101,33 @@ async def _heartbeat_status(agent_id: str, scope: str, source: str, interval: fl
     A long parse/embed can otherwise make the row look stale and get re-claimed
     by another worker (see ``claim_source_for_resume``). Stops as soon as the
     row leaves the PROCESSING state.
+
+    The deletion marker is checked on EVERY tick: this is the fast-abort path
+    for long phases (embedding can take minutes), so a deleted agent's worker
+    self-aborts within one interval instead of letting the delete's bounded
+    quiesce-wait time out.
     """
     while True:
         await asyncio.sleep(interval)
+        if await ingestion_canceled(agent_id):
+            # Agent deleted mid-ingestion: mark the row ERROR and stop. The
+            # ERROR write goes through a DIRECT crud.store because set_status
+            # is itself guarded by ingestion_canceled (it returns {} without
+            # writing when canceled) — the direct store bypasses the guard so
+            # the row ends terminal instead of dangling as PROCESSING. Only
+            # overwrite a row still in PROCESSING (the loop's own invariant).
+            current = await get_status(agent_id, scope, source)
+            if current and current.get("status") == IngestionStatus.PROCESSING.value:
+                await crud.store(
+                    status_key(agent_id, scope, source),
+                    {
+                        **current,
+                        "status": IngestionStatus.ERROR.value,
+                        "error": "Agent deleted — ingestion aborted",
+                        "updated_at": generate_timestamp(),
+                    },
+                )
+            return
         current = await get_status(agent_id, scope, source)
         if current and current.get("status") == IngestionStatus.PROCESSING.value:
             await set_status(
@@ -146,6 +175,11 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
 @hook(priority=0)
 async def rabbithole_ingestion_start(source, metadata, is_url, cat) -> None:
     """Record that an ingestion is about to begin (source known, nothing stored yet)."""
+    if await ingestion_canceled(cat.agent_key):
+        # Agent deleted (or master key gone): never write an UPLOADED row for
+        # a dead agent — the teardown wipes the namespace anyway.
+        log.debug(f"ingestion aborted: agent {cat.agent_key} deleted")
+        return
     scope, chat_id = _scope_and_chat(cat)
     await set_status(
         cat.agent_key,
@@ -160,6 +194,11 @@ async def rabbithole_ingestion_start(source, metadata, is_url, cat) -> None:
 @hook(priority=0)
 async def rabbithole_url_downloading(url, filename, cat) -> None:
     """Record that a URL download is about to start."""
+    if await ingestion_canceled(cat.agent_key):
+        # Same gate as rabbithole_ingestion_start: no DOWNLOADING row for a
+        # deleted agent.
+        log.debug(f"ingestion aborted: agent {cat.agent_key} deleted")
+        return
     scope, chat_id = _scope_and_chat(cat)
     await set_status(
         cat.agent_key,
@@ -190,6 +229,12 @@ async def rabbithole_url_download_completed(url, filename, cat) -> None:
 @hook(priority=0)
 async def rabbithole_ingestion_processing(source, cat) -> None:
     """Record that the source is being parsed, chunked and embedded."""
+    if await ingestion_canceled(cat.agent_key):
+        # Agent deleted mid-ingestion: skip the write entirely. Marking the
+        # row ERROR via set_status would be a NO-OP here — set_status itself
+        # aborts (returns {}) when ingestion_canceled — and the teardown
+        # wipes the whole namespace anyway, so the row is left as-is.
+        return
     scope, chat_id = _scope_and_chat(cat)
     await set_status(
         cat.agent_key,
@@ -221,9 +266,16 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
       with the phase diary cleared. Re-probing first makes any double write
       harmless (idempotent).
     - Never overwrites an already-recorded ERROR state, and ignores the
-      unresolved empty source.
+      unresolved empty source. A canceled agent (delete marker / missing
+      master key) is skipped entirely: no phase advance, no COMPLETED.
     """
     if not source:
+        return
+    if await ingestion_canceled(cat.agent_key):
+        # Agent deleted mid-ingestion: skip the write (same reasoning as
+        # rabbithole_ingestion_processing — set_status would no-op and the
+        # teardown wipes the namespace). A canceled agent never gets a phase
+        # advance nor a terminal COMPLETED.
         return
     scope, chat_id = _scope_and_chat(cat)
     current = await get_status(cat.agent_key, scope, source)

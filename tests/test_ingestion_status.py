@@ -5,6 +5,7 @@ flushed by the autouse ``encapsulate_each_test`` fixture). The lifecycle tests
 drive the plugin's hook handlers with fake cat/stray objects so the status
 transitions are observable without booting the full app.
 """
+import asyncio
 import hashlib
 
 import pytest
@@ -482,3 +483,76 @@ async def test_after_stored_never_resurrects_error_row():
     assert doc["error"] == "store failed"
     # the ERROR guard returned before consulting the probe
     assert pm.calls == []
+
+
+# ---------- lifecycle cancellation guards (Todo 11) ----------
+
+
+async def test_canceled_agent_hooks_write_no_row():
+    """A canceled agent (delete marker set) must never get a status write:
+    ``rabbithole_ingestion_start`` and ``rabbithole_ingestion_processing``
+    early-return, so no row appears at all."""
+    cat = FakeCat()
+    await set_delete_marker(agent_id)
+
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+
+    assert await get_status(agent_id, "agent", "doc.pdf") is None
+    assert await list_statuses(agent_id) == []
+
+
+async def test_canceled_agent_after_stored_never_completes():
+    """A canceled agent never gets a phase advance nor a terminal COMPLETED:
+    a pre-existing PROCESSING row is left untouched by the completion hook."""
+    cat = FakeCat()
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+    await set_delete_marker(agent_id)
+
+    await ingestion_plugin.after_rabbithole_stored_documents.function("doc.pdf", [object()], cat)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "processing"  # never COMPLETED
+    assert doc["phase"] == PHASE_PARSING_CHUNKING  # never advanced/cleared
+
+
+async def test_heartbeat_fast_aborts_canceled_agent_to_error():
+    """The heartbeat is the fast-abort path: on a canceled agent it writes
+    ERROR via a DIRECT store (bypassing the guarded ``set_status``, which
+    would no-op) and stops, so the row ends terminal instead of dangling
+    as PROCESSING."""
+    await set_status(agent_id, "agent", "doc.pdf", type_="file", status=IngestionStatus.PROCESSING)
+    await set_delete_marker(agent_id)
+
+    await ingestion_plugin._heartbeat_status(agent_id, "agent", "doc.pdf", 0)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == IngestionStatus.ERROR
+    assert doc["error"] == "Agent deleted — ingestion aborted"
+
+
+async def test_heartbeat_keeps_live_processing_row_fresh():
+    """A live (non-canceled) agent's heartbeat keeps bumping ``updated_at``
+    while the row is PROCESSING — the fast-abort path must not change that."""
+    cat = FakeCat()
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+    before = (await get_status(agent_id, "agent", "doc.pdf"))["updated_at"]
+
+    task = asyncio.ensure_future(
+        ingestion_plugin._heartbeat_status(agent_id, "agent", "doc.pdf", 0.01)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "processing"
+    assert doc["updated_at"] > before
