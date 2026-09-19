@@ -25,6 +25,14 @@ A missing settings entry means the fast-path cannot apply (no current
 version) and the phase falls to the slow-path with the marker the plugin
 returns — conservatively stale when the marker is unknown.
 
+**Phase registration.** External plugins declare their own phases through the
+``ingestion_phase_specs`` accumulator hook (see ``hooks.py``);
+:func:`merged_phases` merges the returned ``PhaseSpec`` objects into the
+built-in ``PHASES`` at probe time — built-ins win on duplicate ids — and the
+``ingestion_phase_pending`` registrant computes staleness for ALL merged
+phases, so a provider only declares a spec + a marker and never re-implements
+staleness.
+
 Import-safe: the only top-level statements are the dataclass, the ``PHASES``
 data structure and the ``@hook`` decorator — no Redis, no network, no
 filesystem access at import time.
@@ -67,6 +75,39 @@ PHASES = {
     "parsing_chunking": PhaseSpec("parsing_chunking", "chunker", ()),
     "embedding": PhaseSpec("embedding", "embedder", ("parsing_chunking",)),
 }
+
+
+async def merged_phases(ccat, cat) -> dict[str, PhaseSpec]:
+    """Merge the registered phase specs into the built-in ``PHASES``.
+
+    Starts from a copy of the built-in ``PHASES`` and appends every
+    ``PhaseSpec`` returned by the ``ingestion_phase_specs`` accumulator hook
+    whose ``id`` is not already present — built-ins win, a registered spec
+    with a duplicate id is IGNORED. Malformed hook output (``None``,
+    non-``PhaseSpec`` entries) is skipped, never raised on.
+
+    Args:
+        ccat: the cat whose ``plugin_manager`` executes the hook (may be
+            ``None`` in unit tests -> built-ins only).
+        cat: the caller threaded into ``execute_hook(..., caller=cat)``.
+
+    Returns:
+        The merged ``dict[str, PhaseSpec]`` (a fresh dict; ``PHASES`` is
+        never mutated).
+    """
+    merged = dict(PHASES)
+    plugin_manager = (
+        getattr(ccat, "plugin_manager", None) if ccat is not None else None
+    )
+    if plugin_manager is None:
+        return merged
+    specs = await plugin_manager.execute_hook("ingestion_phase_specs", [], caller=cat)
+    if not isinstance(specs, list):
+        return merged
+    for spec in specs:
+        if isinstance(spec, PhaseSpec) and spec.id not in merged:
+            merged[spec.id] = spec
+    return merged
 
 
 def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:
@@ -160,21 +201,26 @@ def is_phase_stale(
 async def ingestion_phase_pending(
     pending, source, completed_phases, cat
 ) -> list[dict[str, Any]]:
-    """Accumulator registrant declaring the built-in phases stale for ``source``.
+    """Accumulator registrant declaring the stale phases for ``source``.
 
     Accumulator convention (see ``hooks.py``): ``pending`` is the mutable
     list threaded through every registrant by ``execute_hook``; this
-    registrant appends ``{"phase": <id>}`` for each built-in phase that is
-    stale and returns the (possibly extended) list. The default no-op in
-    ``hooks.py`` (same priority) returns ``pending`` unchanged, so the two
-    compose safely in any execution order.
+    registrant appends ``{"phase": <id>}`` for each phase that is stale and
+    returns the (possibly extended) list. The default no-op in ``hooks.py``
+    (same priority) returns ``pending`` unchanged, so the two compose safely
+    in any execution order.
 
-    For each ``PhaseSpec`` the current inputs are resolved live:
+    The phases probed are the MERGED set from :func:`merged_phases`: the
+    built-in ``PHASES`` plus every ``PhaseSpec`` registered through the
+    ``ingestion_phase_specs`` accumulator hook (built-ins win on duplicate
+    ids). For each ``PhaseSpec`` the current inputs are resolved live:
 
     - ``current_settings_updated_at``: the ``updated_at`` of the settings
       entry for ``spec.settings_category`` (via ``crud_settings`` — the
       official CRUD API, no raw Redis), used only as an opaque equality
       token; a missing settings entry yields None and falls to the slow-path;
+      registered phases with ``settings_category=None`` skip the fast-path
+      entirely (their marker IS the material settings fingerprint);
     - ``current_marker``: the plugin-defined marker from the
       ``ingestion_phase_settings_marker`` hook (None = unknown ->
       conservative stale).
@@ -196,7 +242,7 @@ async def ingestion_phase_pending(
         pending = []
     diary = _diary_from_completed_phases(completed_phases)
 
-    for spec in PHASES.values():
+    for spec in (await merged_phases(cat, cat)).values():
         current_settings_updated_at = None
         current_marker = None
         if cat is not None:

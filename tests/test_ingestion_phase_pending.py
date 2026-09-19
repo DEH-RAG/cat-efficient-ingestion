@@ -9,6 +9,11 @@ Covers ``phases.py``:
 - the ``ingestion_phase_pending`` accumulator registrant, driven with a fake
   ``cat`` (agent_key + plugin_manager) and a stubbed settings CRUD — no
   Redis needed;
+- the phase-registration merge: ``merged_phases`` appends specs declared via
+  the ``ingestion_phase_specs`` accumulator hook (built-ins win on duplicate
+  ids, malformed entries skipped) and the registrant probes ALL merged
+  phases (fresh when markers match, stale when they differ, stale on a
+  missing upstream);
 - adversarial input: ``pending=None``, ``completed_phases=None`` / non-dict
   entries never crash.
 
@@ -163,25 +168,29 @@ def test_diary_conversion_from_list_and_malformed():
 
 
 class _FakePluginManager:
-    """Minimal plugin_manager: execute_hook returns the configured markers."""
+    """Minimal plugin_manager: execute_hook returns the configured markers
+    and the configured registered phase specs."""
 
-    def __init__(self, markers):
+    def __init__(self, markers, specs=None):
         self.markers = markers
+        self.specs = list(specs or [])
         self.calls = []
 
     async def execute_hook(self, hook_name, *args, **kwargs):
         self.calls.append((hook_name, args, kwargs))
         if hook_name == "ingestion_phase_settings_marker":
             return self.markers.get(args[0])
+        if hook_name == "ingestion_phase_specs":
+            return list(self.specs)
         return None
 
 
 class _FakeCat:
     """Minimal CheshireCat stand-in: agent_key + plugin_manager."""
 
-    def __init__(self, markers=None, agent_key="agent_test"):
+    def __init__(self, markers=None, agent_key="agent_test", specs=None):
         self.agent_key = agent_key
-        self.plugin_manager = _FakePluginManager(markers or {})
+        self.plugin_manager = _FakePluginManager(markers or {}, specs)
 
 
 def _stub_settings(monkeypatch, settings):
@@ -318,3 +327,132 @@ async def test_hook_uses_settings_crud_and_marker_hook(monkeypatch):
                     if c[0] == "ingestion_phase_settings_marker"]
     assert {c[1][0] for c in marker_calls} == {"parsing_chunking", "embedding"}
     assert all(c[2].get("caller") is cat for c in marker_calls)
+
+
+# ---------------------------------------------------------------------------
+# Phase registration: merged_phases + pending over ALL merged phases
+# ---------------------------------------------------------------------------
+
+FAKE_SPEC = PhaseSpec("fake_phase", None, ("parsing_chunking", "embedding"))
+
+
+def _fake_diary():
+    """A fresh diary including a completed fake_phase with matching deps."""
+    diary = _fresh_diary()
+    diary["fake_phase"] = _entry(
+        marker="fp1", settings_version=None,
+        deps={"parsing_chunking": "pc1", "embedding": "em1"},
+    )
+    return diary
+
+
+async def test_merged_phases_merges_registered_and_builtins_win():
+    """merged_phases: registered specs appended; a duplicate built-in id is
+    IGNORED (built-in wins); PHASES itself is never mutated."""
+    cat = _FakeCat(specs=[
+        FAKE_SPEC,
+        PhaseSpec("embedding", None, ()),  # duplicate of a built-in
+    ])
+    merged = await phases.merged_phases(cat, cat)
+    assert set(merged) == {"parsing_chunking", "embedding", "fake_phase"}
+    assert merged["embedding"] is PHASES["embedding"]
+    assert merged["fake_phase"] == FAKE_SPEC
+    assert set(PHASES) == {"parsing_chunking", "embedding"}  # untouched
+
+
+async def test_merged_phases_malformed_specs_no_crash():
+    """Adversarial: execute_hook returns None / non-PhaseSpec entries ->
+    skipped, never raised on."""
+    cat = _FakeCat(specs=[None, "junk", 42, FAKE_SPEC])
+    merged = await phases.merged_phases(cat, cat)
+    assert set(merged) == {"parsing_chunking", "embedding", "fake_phase"}
+
+
+async def test_merged_phases_cat_none_builtins_only():
+    """Adversarial: cat=None (unit-test contract) -> built-ins only."""
+    assert await phases.merged_phases(None, None) == PHASES
+
+
+async def test_hook_registered_phase_fresh_when_markers_match(monkeypatch):
+    """(a) fake_phase declared via ingestion_phase_specs, fresh diary with
+    matching markers -> NOT stale (nothing pending)."""
+    _stub_settings(monkeypatch, {"chunker": {"updated_at": "v1"},
+                                 "embedder": {"updated_at": "v1"}})
+    cat = _FakeCat(
+        markers={"parsing_chunking": "pc1", "embedding": "em1",
+                 "fake_phase": "fp1"},
+        specs=[FAKE_SPEC],
+    )
+    pending = await phases.ingestion_phase_pending.function(
+        [], "doc.pdf", _diary_list(_fake_diary()), cat
+    )
+    assert pending == []
+
+
+async def test_hook_registered_phase_stale_when_marker_differs(monkeypatch):
+    """(b) fake_phase marker differs (via the fake
+    ingestion_phase_settings_marker) -> stale."""
+    _stub_settings(monkeypatch, {"chunker": {"updated_at": "v1"},
+                                 "embedder": {"updated_at": "v1"}})
+    cat = _FakeCat(
+        markers={"parsing_chunking": "pc1", "embedding": "em1",
+                 "fake_phase": "fp2"},
+        specs=[FAKE_SPEC],
+    )
+    pending = await phases.ingestion_phase_pending.function(
+        [], "doc.pdf", _diary_list(_fake_diary()), cat
+    )
+    assert [p["phase"] for p in pending] == ["fake_phase"]
+
+
+async def test_hook_registered_phase_appended_after_builtins(monkeypatch):
+    """(b) no diary -> built-ins are appended FIRST, the registered phase
+    AFTER them."""
+    _stub_settings(monkeypatch, {"chunker": {"updated_at": "v1"},
+                                 "embedder": {"updated_at": "v1"}})
+    cat = _FakeCat(
+        markers={"parsing_chunking": "pc1", "embedding": "em1",
+                 "fake_phase": "fp1"},
+        specs=[FAKE_SPEC],
+    )
+    pending = await phases.ingestion_phase_pending.function([], "doc.pdf", [], cat)
+    assert [p["phase"] for p in pending] == [
+        "parsing_chunking", "embedding", "fake_phase",
+    ]
+
+
+async def test_hook_registered_phase_missing_upstream_stale(monkeypatch):
+    """(c) fake_phase's upstreams missing from the diary -> stale."""
+    _stub_settings(monkeypatch, {"chunker": {"updated_at": "v1"},
+                                 "embedder": {"updated_at": "v1"}})
+    cat = _FakeCat(
+        markers={"parsing_chunking": "pc1", "embedding": "em1",
+                 "fake_phase": "fp1"},
+        specs=[FAKE_SPEC],
+    )
+    diary = {"fake_phase": _entry(
+        marker="fp1", settings_version=None,
+        deps={"parsing_chunking": "pc1", "embedding": "em1"},
+    )}
+    pending = await phases.ingestion_phase_pending.function(
+        [], "doc.pdf", _diary_list(diary), cat
+    )
+    assert [p["phase"] for p in pending] == [
+        "parsing_chunking", "embedding", "fake_phase",
+    ]
+
+
+async def test_hook_registered_duplicate_builtin_id_ignored(monkeypatch):
+    """(d) a registered spec duplicating a built-in id is IGNORED: the
+    built-in spec wins, so its settings fast-path still applies and a changed
+    marker for the duplicate does NOT make embedding stale."""
+    _stub_settings(monkeypatch, {"chunker": {"updated_at": "v1"},
+                                 "embedder": {"updated_at": "v1"}})
+    cat = _FakeCat(
+        markers={"parsing_chunking": "pc1", "embedding": "em2"},
+        specs=[PhaseSpec("embedding", None, ())],  # duplicate, no fast-path
+    )
+    pending = await phases.ingestion_phase_pending.function(
+        [], "doc.pdf", _diary_list(_fresh_diary()), cat
+    )
+    assert pending == []
