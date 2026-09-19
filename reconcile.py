@@ -14,11 +14,12 @@ import os
 from typing import Any, Dict, List, Optional
 
 from cat.db.cruds import conversations as crud_conversations
+from cat.exceptions import CustomNotFoundException
 from cat.looking_glass.bill_the_lizard import BillTheLizard
 from cat.log import log
 from cat.services.memory.models import VectorMemoryType
 
-from .registry import delete_status, list_statuses
+from .registry import delete_status, has_delete_marker, list_statuses
 
 
 async def reconcile_agent(
@@ -50,8 +51,15 @@ async def reconcile_agent(
         The list of purged status docs.
     """
     if ccat is None:
-        ccat = await BillTheLizard().get_cheshire_cat(agent_id)
+        try:
+            ccat = await BillTheLizard().get_cheshire_cat(agent_id)
+        except CustomNotFoundException:
+            # ghost agent (peripheral keys without a master): nothing to reconcile
+            return []
     if ccat is None:
+        return []
+    if await has_delete_marker(agent_id):
+        # agent is being deleted: never reconcile a teardown in progress
         return []
 
     entries = await list_statuses(agent_id, chat_id=chat_id)

@@ -35,6 +35,7 @@ from langchain_core.documents.base import Blob
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
 from cat.db.cruds import settings as crud_settings
 from cat.env import get_env_int
+from cat.exceptions import CustomNotFoundException
 from cat.log import log
 from cat.looking_glass.models import StoredSourceWithMetadata
 from cat.services.factory.embedder import is_multimodal_embedder
@@ -58,6 +59,7 @@ from .registry import (
     claim_source_for_resume,
     get_completed_phases,
     get_status,
+    ingestion_canceled,
     record_phase_completed,
     set_phase,
     set_status,
@@ -1002,7 +1004,15 @@ class EfficientIngestionEngine(BaseIngestionEngine):
             # metadata stored within the vector memory; nothing is removed from
             # the latter to avoid any race condition
             for ccat_id in ccat_ids:
-                if (ccat := await lizard.get_cheshire_cat(ccat_id)) is None:
+                if await ingestion_canceled(ccat_id):
+                    # agent is being deleted (marker) or dead (ghost): never re-embed it
+                    continue
+                try:
+                    ccat = await lizard.get_cheshire_cat(ccat_id)
+                except CustomNotFoundException:
+                    # ghost agent: skip without crashing the pass
+                    continue
+                if ccat is None:
                     continue
                 stored_files_by_ccat.append({
                     "ccat": ccat,
