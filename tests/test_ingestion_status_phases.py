@@ -7,6 +7,9 @@ embedder_name / chunker_name are only updated when provided), the clock-free
 ``claim_source_for_resume`` (engine re-embed of completed rows). Uses the
 autouse Redis db=1 fixture.
 """
+import pytest
+
+from cat.db import crud
 from cat.plugins.cat_efficient_ingestion.registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
@@ -19,6 +22,17 @@ from cat.plugins.cat_efficient_ingestion.registry import (
     set_phase,
     set_status,
 )
+
+
+@pytest.fixture(autouse=True)
+async def _ensure_agent_master_key():
+    """The ``ingestion_canceled`` guard makes ``set_status`` a no-op when the
+    agent master key ``agents:agent_1:agent`` is absent. These tests call
+    ``set_status`` directly, so create the master key first (the production
+    contract: ``set_status`` is only called for existing agents)."""
+    await crud.store("agents:agent_1:agent", [{"name": "x", "value": 1}])
+    yield
+    await crud.destroy("agents:agent_1:*")
 
 
 async def test_set_phase_records_processing_and_embedder():

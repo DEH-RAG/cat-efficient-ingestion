@@ -5,13 +5,17 @@ re-embed flow): ``agents:{agent_id}:ingestion:{scope}:{sha256(source)}`` where
 ``scope`` is ``"agent"`` for agent-KB ingestion or a conversation ``chat_id``.
 
 Every status transition is written as a Redis-JSON document via ``cat.db.crud``
-(no raw Redis client is used here).
+(no raw Redis client is used here). Enumeration is crud-based too:
+``list_statuses`` walks the ``agents:{agent_id}:ingestion:*`` namespace through
+the crud-documented pattern scan (``get_agents_main_keys``) and reads every
+doc via ``crud.read``; ``clear_agent`` wipes the namespace via
+``crud.destroy`` and re-stores the delete marker. No raw Redis client.
 """
 import hashlib
 from typing import Dict, List, Optional
 
 from cat.db import crud
-from cat.db.database import get_async_db
+from cat.db.cruds.settings import get_agents_main_keys
 from cat.db.models import generate_timestamp
 from cat.utils import Enum
 
@@ -75,6 +79,26 @@ def delete_marker_key(agent_id: str) -> str:
         ``agents:{agent_id}:ingestion:delete``
     """
     return f"agents:{agent_id}:ingestion:{DELETE_MARKER_KEY_PART}"
+
+
+async def _list_status_keys(agent_id: str) -> List[str]:
+    """List the agent's ``agents:{agent_id}:ingestion:*`` keys (crud-only).
+
+    ``cat.db.crud`` exposes no non-destructive pattern scan, so enumeration
+    uses the crud-documented scan primitive ``get_agents_main_keys``, which
+    accepts an arbitrary key pattern and returns every matching key with the
+    ``agents:`` prefix stripped (it is primarily used for agent master keys,
+    but the stripping is exact for every key in this namespace — none ends
+    with ``:agent``, so the ``:agent`` suffix-strip is a no-op here). The
+    prefix is re-added to reconstruct the full keys. The function is imported
+    by name so this scan is unaffected by callers mocking the
+    ``crud_settings`` module attribute for their own (agent-key) enumeration.
+    Never a raw client.
+    """
+    stripped = await get_agents_main_keys(
+        pattern=f"agents:{agent_id}:ingestion:*"
+    )
+    return ["agents:" + key for key in stripped]
 
 
 async def set_delete_marker(agent_id: str) -> None:
@@ -523,15 +547,19 @@ async def list_statuses(agent_id: str, chat_id: Optional[str] = None) -> List[Di
 
     With no ``chat_id`` only agent-scope entries are returned; with a
     ``chat_id`` only that conversation's entries are returned.
+
+    Enumeration is crud-based: the ``agents:{agent_id}:ingestion:*`` namespace
+    is walked through the crud-documented pattern scan and each status doc is
+    read via ``crud.read`` — no raw Redis client. Keys that read as ``None``
+    (deleted/never written) are skipped.
     """
-    db = get_async_db()
     results: List[Dict] = []
-    async for key in db.scan_iter(f"agents:{agent_id}:ingestion:*"):
-        doc = await _read_doc(key)
-        if not doc:
-            continue
+    for key in await _list_status_keys(agent_id):
         if key == delete_marker_key(agent_id):
             # the deletion-marker doc is not a status entry
+            continue
+        doc = await _read_doc(key)
+        if not doc:
             continue
         scope = doc.get("scope")
         if chat_id is None:
@@ -548,21 +576,21 @@ async def clear_agent(agent_id: str) -> int:
 
     The deletion marker (``agents:{agent_id}:ingestion:delete``) is
     deliberately PRESERVED: the teardown removes it explicitly as the LAST
-    step, so a wipe here must not clear it.
+    step, so a wipe here must not clear it. Crud-only: the marker is read, the
+    whole namespace is wiped via ``crud.destroy``, then the marker is
+    re-stored if it was present.
 
     Returns:
         The number of keys deleted (marker excluded).
     """
-    db = get_async_db()
-    marker = delete_marker_key(agent_id)
-    keys = [
-        key
-        async for key in db.scan_iter(f"agents:{agent_id}:ingestion:*")
-        if key != marker
-    ]
-    if keys:
-        await db.delete(*keys)
-    return len(keys)
+    marker_key = delete_marker_key(agent_id)
+    marker = await _read_doc(marker_key)
+    deleted = await crud.destroy(f"agents:{agent_id}:ingestion:*")
+    if marker is not None:
+        await crud.store(marker_key, marker)
+    # ``crud.destroy`` counted every key in the namespace; the marker
+    # (re-stored above) is excluded from the returned count.
+    return deleted - (1 if marker is not None else 0)
 
 
 async def clear_chat(agent_id: str, chat_id: str) -> int:
