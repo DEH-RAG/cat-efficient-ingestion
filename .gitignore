@@ -12,3 +12,8 @@ wheels/
 # Virtual environments
 .venv
 uv.lock
+
+# Opencode
+.opencode/
+.omo/
+AGENTS.md
