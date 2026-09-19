@@ -9,10 +9,19 @@ the ``after_lizard_bootstrap`` hook schedules a fire-and-forget background pass
       (:func:`reembed_sources <cat.plugins.cat_efficient_ingestion.reembed.reembed_sources>`);
       the machine re-reads the file from disk (or re-downloads the URL), claims
       the per-source work, records the phase, cleans up orphan images and
-      performs the full re-ingest; and
-  (b) purges status entries whose source is absent from the canonical lists
+      performs the full re-ingest;
+  (b) REVALIDATES ``completed`` rows: the ``ingestion_phase_pending`` probe is
+      re-run READ-ONLY for every completed row and only the rows whose probe
+      comes back non-empty (a chunker/embedder/settings change made a phase
+      stale) are claimed and handed to the phase machine — a genuinely-fresh
+      completed row is never touched; and
+  (c) purges status entries whose source is absent from the canonical lists
       (files on disk, URLs in the vector store, existing conversations) via the
       plugin's own shared helper :func:`reconcile_agent`.
+
+Canceled agents (deletion marker present, or ghost agents whose master key is
+gone) are skipped entirely, and a ghost agent that raises
+``CustomNotFoundException`` on resolution is treated as a skip, never a crash.
 
 The same pass is re-run periodically (every
 ``CAT_INGESTION_RESUME_INTERVAL_SECONDS``, default 60) so a stale entry is
@@ -37,13 +46,18 @@ from cat import BillTheLizard, hook, log
 from cat.db import crud
 from cat.db.cruds import settings as crud_settings
 from cat.env import get_env_int
+from cat.exceptions import CustomNotFoundException
 from cat.services.memory.models import VectorMemoryType
 from cat.utils import is_url
 
+from .phases import PHASES
 from .reconcile import reconcile_agent
 from .reembed import reembed_sources
 from .registry import (
     IngestionStatus,
+    backfill_completed_phases,
+    claim_source_for_resume,
+    ingestion_canceled,
     list_statuses,
     set_status,
 )
@@ -153,10 +167,18 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
     claims the per-source work atomically (so two workers never double-process),
     records the phase, cleans up any orphan images and performs the full re-ingest
     from disk (or URL re-download). Fresh entries and ``completed`` entries are
-    left untouched.
+    left untouched (completed rows are revalidated by :func:`_revalidate_agent`).
+    A canceled agent (deletion marker or ghost) is skipped entirely.
     """
+    if await ingestion_canceled(agent_id):
+        # agent is being deleted (marker) or dead (ghost): never resume it
+        return
     if ccat is None:
-        ccat = await lizard.get_cheshire_cat(agent_id)
+        try:
+            ccat = await lizard.get_cheshire_cat(agent_id)
+        except CustomNotFoundException:
+            # ghost agent (master key gone): treat as a skip, never a crash
+            return
     if ccat is None:
         return
 
@@ -198,6 +220,99 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
         )
 
 
+async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) -> None:
+    """Revalidation pass: re-probe completed rows and re-ingest the stale ones.
+
+    A ``completed`` row is only authoritative while its recorded phase diary
+    matches the CURRENT settings. This pass re-runs the clock-free
+    ``ingestion_phase_pending`` probe READ-ONLY for every completed row
+    (diary backfilled for legacy rows, converted to the hook list shape) and,
+    when the probe returns non-empty (a chunker/embedder/settings change made
+    a phase stale), claims the row (``claim_completed=True`` — ONLY after the
+    non-empty probe) and hands it to the ONE phase machine, the same path the
+    recovery sweep uses (:func:`_source_from_entry` + ``reembed_sources``).
+
+    Rows whose probe is empty are NEVER claimed: a genuinely-fresh completed
+    row is left untouched. The probe governs COMPLETED revalidation while the
+    ``stale_after`` claim in :func:`_resume_agent` governs crashed
+    PROCESSING recovery — the two coexist without conflict. ``error`` rows
+    are not revalidated (absorbing, handled by the stale-error sweep).
+    Per-row exceptions are tolerated and counted, so one bad row never aborts
+    the pass. A canceled agent (deletion marker or ghost) is skipped entirely.
+    """
+    if await ingestion_canceled(agent_id):
+        # agent is being deleted (marker) or dead (ghost): never revalidate it
+        return
+    if ccat is None:
+        try:
+            ccat = await lizard.get_cheshire_cat(agent_id)
+        except CustomNotFoundException:
+            # ghost agent (master key gone): treat as a skip, never a crash
+            return
+    if ccat is None:
+        return
+
+    entries = await list_statuses(agent_id)
+    revalidated = 0
+    for entry in entries:
+        if entry.get("status") != IngestionStatus.COMPLETED.value:
+            continue
+        source = entry.get("source")
+        scope = entry.get("scope")
+        type_ = entry.get("type")
+        if not source or not scope:
+            continue
+        try:
+            # READ-ONLY probe: backfill the diary (legacy completed rows get a
+            # sentinel -> conservatively stale once), convert it to the hook
+            # list shape (every entry carries a "phase" key) and let the
+            # accumulator registrants report the stale phases. A non-empty
+            # result means at least one phase must be re-run.
+            completed = await backfill_completed_phases(entry, list(PHASES.keys()))
+            completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
+            pending = await ccat.plugin_manager.execute_hook(
+                "ingestion_phase_pending", [], source, completed_as_list, caller=ccat
+            )
+            pending = [p for p in (pending or []) if p and p.get("phase")]
+            if not pending:
+                # probe empty: the row is genuinely complete — never claim it
+                continue
+            # claim ONLY after a non-empty probe (atomic across workers; the
+            # agent-level sweep lock already serializes the pass per agent)
+            claimed = await claim_source_for_resume(
+                agent_id, str(scope), source,
+                stale_after=0.0, owner=f"revalidate-{os.getpid()}",
+                claim_completed=True,
+            )
+            if claimed is None:
+                # another worker already claimed it (or the agent was canceled
+                # in the meantime)
+                continue
+            source_obj = _source_from_entry(ccat, agent_id, str(scope), source, type_)
+            if source_obj is None:
+                if type_ != "url" and not is_url(source):
+                    await mark_file_missing(agent_id, str(scope), source)
+                continue
+            log.info(
+                f"Ingestion revalidation: handing {source} (stale phase(s) "
+                f"{[p.get('phase') for p in pending]}) to the ingestion phase "
+                f"machine for {agent_id}"
+            )
+            # stale_after=0: the sweep already claimed the row, so the machine's
+            # internal claim must not refuse it as "fresh in-flight work"
+            await reembed_sources(
+                ccat, _collection_for_scope(str(scope)), [source_obj],
+                stale_after=0.0,
+            )
+            revalidated += 1
+        except Exception as e:  # noqa: BLE001 - a failing row must not abort the pass
+            log.error(f"Ingestion revalidation failed for {source} (agent {agent_id}): {e}")
+    log.info(
+        f"Ingestion revalidation for agent {agent_id}: {revalidated} completed "
+        f"row(s) re-ingested"
+    )
+
+
 async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
     """Run the recovery + GC pass for one agent.
 
@@ -205,15 +320,24 @@ async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
     actual (re)ingestion of each candidate happens under its own per-source
     lock (inside the phase machine's claim), so different sources of the same
     agent are processed concurrently while the same source can never be
-    double-processed by another worker.
+    double-processed by another worker. A canceled agent (deletion marker or
+    ghost) is skipped entirely.
     """
+    if await ingestion_canceled(agent_id):
+        # agent is being deleted (marker) or dead (ghost): never sweep it
+        return
     try:
         async with crud.distributed_lock(f"ingestion-sweep:{agent_id}", timeout=30, blocking_timeout=5):
-            ccat = await lizard.get_cheshire_cat(agent_id)
+            try:
+                ccat = await lizard.get_cheshire_cat(agent_id)
+            except CustomNotFoundException:
+                # ghost agent (master key gone): treat as a skip, never a crash
+                return
             if ccat is None:
                 return
             if _resume_enabled():
                 await _resume_agent(lizard, agent_id, ccat=ccat)
+                await _revalidate_agent(lizard, agent_id, ccat=ccat)
             if _gc_enabled():
                 await reconcile_agent(agent_id, ccat=ccat)
     except crud.LockError:
@@ -232,6 +356,9 @@ async def _startup_pass(lizard: BillTheLizard) -> None:
         log.error(f"Ingestion startup pass: failed to enumerate agents: {e}")
         return
     for agent_id in agent_ids:
+        if await ingestion_canceled(agent_id):
+            # agent is being deleted (marker) or dead (ghost): skip it
+            continue
         await _pass_for_agent(lizard, agent_id)
 
 

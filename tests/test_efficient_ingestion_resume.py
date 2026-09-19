@@ -17,14 +17,18 @@ from cat.plugins.cat_efficient_ingestion import reembed
 from cat.plugins.cat_efficient_ingestion import resume
 from cat.plugins.cat_efficient_ingestion import plugin as ingestion_plugin
 from cat.plugins.cat_efficient_ingestion.reconcile import reconcile_agent
+from cat.plugins.cat_efficient_ingestion.reembed import EfficientIngestionEngine
 from cat.plugins.cat_efficient_ingestion.registry import (
     IngestionStatus,
+    clear_delete_marker,
     get_completed_phases,
     get_status,
+    set_delete_marker,
     set_status,
     status_key,
 )
 from cat.db import crud
+from cat.exceptions import CustomNotFoundException
 
 
 def _install_machine_spy(monkeypatch):
@@ -1005,3 +1009,355 @@ async def test_reembed_malformed_pending_does_not_crash(cheshire_cat, monkeypatc
         assert doc["status"] == "completed"
         assert "resume_owner" not in doc
         assert len(calls["probe"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cancellation + ghost-agent guards (Todo 13)
+#
+# - ``reconcile_agent`` early-returns when the agent has a deletion marker (a
+#   teardown in progress must never be purged by the GC) and swallows
+#   ``CustomNotFoundException`` from ``get_cheshire_cat`` (ghost agents);
+# - ``EfficientIngestionEngine.run`` skips canceled agents
+#   (``ingestion_canceled``) and swallows ``CustomNotFoundException`` around
+#   ``get_cheshire_cat`` (ghosts never crash the re-embed pass).
+# ---------------------------------------------------------------------------
+
+
+async def test_reconcile_skips_delete_marked_agent(cheshire_cat, monkeypatch):
+    """A delete-marked agent is never reconciled: its rows are not purged.
+
+    The marker (``agents:{id}:ingestion:delete``) is written by the delete
+    flow and removed only at teardown completion, so a GC pass running while
+    the agent is being deleted must leave every status row untouched.
+    """
+    agent_key = cheshire_cat.agent_key
+    # seed a completed entry whose source is absent from the file manager
+    await set_status(agent_key, "agent", "gone.pdf", type_="file", status=IngestionStatus.COMPLETED)
+    await set_delete_marker(agent_key)
+    # the file manager lists no files -> would be purged without the guard
+    monkeypatch.setattr(cheshire_cat.file_manager, "list_files", lambda path: [])
+
+    purged = await reconcile_agent(agent_key, ccat=cheshire_cat)
+
+    assert purged == []
+    assert await get_status(agent_key, "agent", "gone.pdf") is not None
+
+
+async def test_reconcile_ghost_agent_does_not_crash(monkeypatch):
+    """A ghost agent (``get_cheshire_cat`` raises ``CustomNotFoundException``)
+    is skipped by the reconcile: no crash, nothing purged."""
+    from cat.exceptions import CustomNotFoundException
+
+    import cat.plugins.cat_efficient_ingestion.reconcile as reconcile_mod
+
+    async def raise_not_found(self, agent_id):
+        raise CustomNotFoundException("Agent not found")
+
+    # BillTheLizard is a @singleton wrapper; patch the real class so the
+    # instance created by ``BillTheLizard()`` in reconcile raises.
+    monkeypatch.setattr(reconcile_mod.BillTheLizard.__wrapped__, "get_cheshire_cat", raise_not_found)
+
+    purged = await reconcile_agent("ghost_agent_id")
+
+    assert purged == []
+
+
+def _fake_run_lizard(fake_get_cheshire_cat, embedder):
+    """A minimal lizard for ``EfficientIngestionEngine.run``."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    return SimpleNamespace(
+        embedder=AsyncMock(return_value=embedder),
+        get_cheshire_cat=fake_get_cheshire_cat,
+        plugin_manager=SimpleNamespace(execute_hook=AsyncMock(return_value=[])),
+    )
+
+
+async def test_run_skips_canceled_agent(cheshire_cat, monkeypatch):
+    """run() on a canceled (delete-marked) agent is a no-op: the agent is never
+    resolved, never re-embedded, and the pass still reports success."""
+    agent_key = cheshire_cat.agent_key
+    await set_delete_marker(agent_key)
+
+    resolved = []
+
+    async def fake_get_cheshire_cat(agent_id):
+        resolved.append(agent_id)
+        return cheshire_cat
+
+    lizard = _fake_run_lizard(fake_get_cheshire_cat, _FakeEmbedder())
+    monkeypatch.setattr(
+        "cat.plugins.cat_efficient_ingestion.reembed.crud_settings.get_agents_main_keys",
+        AsyncMock(return_value=[agent_key]),
+    )
+
+    success = await EfficientIngestionEngine().run(lizard)
+
+    assert success is True
+    assert resolved == []  # the canceled agent was never resolved
+    lizard.plugin_manager.execute_hook.assert_awaited_once_with(
+        "after_all_cheshire_cats_embedded", True, caller=lizard
+    )
+
+
+async def test_run_skips_ghost_agent(cheshire_cat, monkeypatch):
+    """run() swallows ``CustomNotFoundException`` from ``get_cheshire_cat``:
+    a ghost agent (master key present, but the lizard cannot resolve it) is
+    skipped without crashing the pass."""
+    agent_key = cheshire_cat.agent_key  # master key present -> not canceled
+
+    lizard = _fake_run_lizard(
+        AsyncMock(side_effect=CustomNotFoundException("Agent not found")),
+        _FakeEmbedder(),
+    )
+    monkeypatch.setattr(
+        "cat.plugins.cat_efficient_ingestion.reembed.crud_settings.get_agents_main_keys",
+        AsyncMock(return_value=[agent_key]),
+    )
+
+    success = await EfficientIngestionEngine().run(lizard)
+
+    assert success is True
+    lizard.get_cheshire_cat.assert_awaited_once_with(agent_key)
+    lizard.plugin_manager.execute_hook.assert_awaited_once_with(
+        "after_all_cheshire_cats_embedded", True, caller=lizard
+    )
+
+
+# ---------------------------------------------------------------------------
+# Todo 12: cancellation guards, ghost-agent handling and the completed-row
+# REVALIDATION SWEEP (_revalidate_agent).
+#
+#   (a) a completed row whose settings changed (probe -> non-empty) is
+#       revalidated and re-run;
+#   (b) a fresh completed row (probe -> []) is untouched, never claimed;
+#   (c) a crashed PROCESSING row is still recovered via stale_after — the
+#       revalidation sweep does not conflict with the stale-claim recovery;
+#   (d) a canceled agent (deletion marker) is skipped by every entry point;
+#   (e) a ghost agent (get_cheshire_cat raises CustomNotFoundException) does
+#       not crash the sweep.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_completed(agent_key: str, source: str, diary: dict) -> None:
+    """Seed a COMPLETED row with an explicit completed-phases diary."""
+    await set_status(
+        agent_key, "agent", source, type_="file",
+        status=IngestionStatus.COMPLETED,
+        completed_phases=diary,
+    )
+
+
+def _probe_mock(probe_calls, pending_by_source):
+    """execute_hook stub: records ingestion_phase_pending calls and returns a
+    per-source scripted pending list ([] for unknown sources)."""
+
+    async def fake_execute_hook(name, *args, **kwargs):
+        if name == "ingestion_phase_pending":
+            probe_calls.append(args)
+            return list(pending_by_source.get(args[1], []))
+        return []
+
+    return fake_execute_hook
+
+
+async def test_revalidate_completed_row_with_stale_phases(cheshire_cat, monkeypatch):
+    """(a) A completed row whose settings changed (probe -> embedding stale)
+    is claimed ONLY after the non-empty probe and re-run through the machine."""
+    lizard = cheshire_cat.lizard
+    agent_key = cheshire_cat.agent_key
+    source = "outdated.pdf"
+    await _seed_completed(agent_key, source, {
+        "parsing_chunking": {"marker": "pc1", "settings_version": "v1", "deps": {}},
+        "embedding": {
+            "marker": "em_old", "settings_version": "v1",
+            "deps": {"parsing_chunking": "pc1"},
+        },
+    })
+
+    monkeypatch.setattr(lizard, "get_cheshire_cat", AsyncMock(return_value=cheshire_cat))
+    monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda source, remote: b"content")
+    machine_calls = _install_machine_spy(monkeypatch)
+
+    probe_calls = []
+    monkeypatch.setattr(
+        cheshire_cat.plugin_manager, "execute_hook",
+        _probe_mock(probe_calls, {source: [{"phase": "embedding"}]}),
+    )
+
+    await resume._revalidate_agent(lizard, agent_key)
+
+    # the probe was fed the diary converted to the hook list shape
+    assert len(probe_calls) == 1
+    completed_as_list = probe_calls[0][2]
+    assert {e["phase"] for e in completed_as_list} == {"parsing_chunking", "embedding"}
+    # the stale row was handed to the ONE phase machine (stale_after=0: the
+    # sweep already claimed it) and completed
+    assert machine_calls == [("declarative", source, 0.0)]
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "completed"
+
+
+async def test_revalidate_leaves_fresh_completed_alone(cheshire_cat, monkeypatch):
+    """(b) A fresh completed row (probe -> []) is NEVER claimed nor re-run."""
+    lizard = cheshire_cat.lizard
+    agent_key = cheshire_cat.agent_key
+    source = "fresh_done.pdf"
+    await _seed_completed(agent_key, source, {
+        "parsing_chunking": {"marker": "pc1", "settings_version": "v1", "deps": {}},
+        "embedding": {
+            "marker": "em1", "settings_version": "v1",
+            "deps": {"parsing_chunking": "pc1"},
+        },
+    })
+
+    monkeypatch.setattr(lizard, "get_cheshire_cat", AsyncMock(return_value=cheshire_cat))
+    monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda source, remote: b"content")
+    machine_calls = _install_machine_spy(monkeypatch)
+
+    probe_calls = []
+    monkeypatch.setattr(
+        cheshire_cat.plugin_manager, "execute_hook",
+        _probe_mock(probe_calls, {}),  # empty probe for every source
+    )
+
+    await resume._revalidate_agent(lizard, agent_key)
+
+    # probed once, but never claimed nor handed to the machine
+    assert len(probe_calls) == 1
+    assert machine_calls == []
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "completed"
+    assert "resume_owner" not in doc
+
+
+async def test_revalidate_does_not_conflict_with_stale_processing_recovery(cheshire_cat, monkeypatch):
+    """(c) A crashed PROCESSING row is still recovered via stale_after while a
+    fresh completed row is left untouched — the two sweeps coexist."""
+    lizard = cheshire_cat.lizard
+    agent_key = cheshire_cat.agent_key
+
+    # crashed processing row (old updated_at -> claimable via boot staleness)
+    old = time.time() - 1000
+    await crud.store(status_key(agent_key, "agent", "crashed.pdf"), {
+        "source": "crashed.pdf",
+        "scope": "agent",
+        "chat_id": None,
+        "type": "file",
+        "status": "processing",
+        "error": None,
+        "error_at": None,
+        "created_at": old,
+        "updated_at": old,
+    })
+    # fresh completed row (probe -> [] -> untouched)
+    await _seed_completed(agent_key, "fresh_done.pdf", {
+        "parsing_chunking": {"marker": "pc1", "settings_version": "v1", "deps": {}},
+        "embedding": {
+            "marker": "em1", "settings_version": "v1",
+            "deps": {"parsing_chunking": "pc1"},
+        },
+    })
+
+    monkeypatch.setattr(lizard, "get_cheshire_cat", AsyncMock(return_value=cheshire_cat))
+    monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda source, remote: b"content")
+    monkeypatch.setattr(cheshire_cat.file_manager, "list_files", lambda path: [])
+    monkeypatch.setenv("CAT_INGESTION_STATUS_GC_ON_STARTUP", "0")
+    machine_calls = _install_machine_spy(monkeypatch)
+
+    # empty probe: the completed row is fresh, only the crashed row is a candidate
+    probe_calls = []
+    monkeypatch.setattr(
+        cheshire_cat.plugin_manager, "execute_hook",
+        _probe_mock(probe_calls, {}),
+    )
+
+    # the full per-agent pass runs BOTH sweeps
+    await resume._pass_for_agent(lizard, agent_key)
+
+    # only the crashed processing row was handed over (with the boot staleness)
+    assert machine_calls == [("declarative", "crashed.pdf", 60.0)]
+    doc = await get_status(agent_key, "agent", "crashed.pdf")
+    assert doc is not None
+    assert doc["status"] == "completed"
+    # the fresh completed row was probed but never claimed
+    fresh = await get_status(agent_key, "agent", "fresh_done.pdf")
+    assert fresh["status"] == "completed"
+    assert "resume_owner" not in fresh
+
+
+async def test_resume_skips_canceled_agent(cheshire_cat, monkeypatch):
+    """(d) A canceled agent (deletion marker) is skipped by _resume_agent,
+    _pass_for_agent AND _startup_pass — nothing is handed to the machine."""
+    lizard = cheshire_cat.lizard
+    agent_key = cheshire_cat.agent_key
+
+    # seed the stale row BEFORE the marker (set_status refuses canceled agents)
+    old = time.time() - 1000
+    await crud.store(status_key(agent_key, "agent", "canceled.pdf"), {
+        "source": "canceled.pdf",
+        "scope": "agent",
+        "chat_id": None,
+        "type": "file",
+        "status": "processing",
+        "error": None,
+        "error_at": None,
+        "created_at": old,
+        "updated_at": old,
+    })
+    await set_delete_marker(agent_key)
+
+    monkeypatch.setattr(lizard, "get_cheshire_cat", AsyncMock(return_value=cheshire_cat))
+    monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda source, remote: b"content")
+    machine_calls = _install_machine_spy(monkeypatch)
+
+    await resume._resume_agent(lizard, agent_key)
+    assert machine_calls == []
+
+    await resume._pass_for_agent(lizard, agent_key)
+    assert machine_calls == []
+
+    monkeypatch.setattr(
+        "cat.plugins.cat_efficient_ingestion.resume.crud_settings.get_agents_main_keys",
+        AsyncMock(return_value=[agent_key]),
+    )
+    await resume._startup_pass(lizard)
+    assert machine_calls == []
+
+    # the stale row is untouched (still processing, never claimed)
+    doc = await get_status(agent_key, "agent", "canceled.pdf")
+    assert doc is not None
+    assert doc["status"] == "processing"
+    assert "resume_owner" not in doc
+
+    await clear_delete_marker(agent_key)
+
+
+async def test_ghost_agent_does_not_crash_sweep(cheshire_cat, monkeypatch):
+    """(e) A ghost agent (get_cheshire_cat raises CustomNotFoundException) is
+    treated as a skip by _resume_agent, _pass_for_agent and _startup_pass —
+    never a crash."""
+    lizard = cheshire_cat.lizard
+    agent_key = cheshire_cat.agent_key  # master key present -> not canceled
+
+    monkeypatch.setattr(
+        lizard, "get_cheshire_cat",
+        AsyncMock(side_effect=CustomNotFoundException("Agent not found")),
+    )
+    monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda source, remote: b"content")
+    machine_calls = _install_machine_spy(monkeypatch)
+
+    # must not raise
+    await resume._resume_agent(lizard, agent_key)
+    await resume._pass_for_agent(lizard, agent_key)
+
+    monkeypatch.setattr(
+        "cat.plugins.cat_efficient_ingestion.resume.crud_settings.get_agents_main_keys",
+        AsyncMock(return_value=[agent_key]),
+    )
+    await resume._startup_pass(lizard)
+
+    assert machine_calls == []
