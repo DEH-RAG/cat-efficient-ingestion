@@ -24,13 +24,16 @@ from langchain_core.documents import Document
 from cat import hook
 
 from .configs import EfficientIngestionConfiguration
+from .phases import PHASES
 from .registry import (
     PHASE_DOWNLOADING,
     PHASE_PARSING_CHUNKING,
     IngestionStatus,
+    backfill_completed_phases,
     clear_agent,
     delete_status,
     get_status,
+    set_phase,
     set_status,
 )
 from .split import split_oversized
@@ -202,18 +205,69 @@ async def rabbithole_ingestion_processing(source, cat) -> None:
 
 @hook(priority=0)
 async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
-    """Record that the source was stored successfully.
+    """Record that the source was stored successfully (phase-probe gated).
 
-    The hook fires in the ``finally`` block of ``ingest_file``, so it also runs
-    on the error path: never overwrite an already-recorded ERROR state, and
-    ignore the unresolved empty source. The phase diary is cleared on success:
-    a ``completed`` row proves all phases finished, so no phase is pending.
+    The hook fires in the ``finally`` block of ``ingest_file`` and mid-loop
+    from the EffING engine's ``_embed_phase``, so it must NOT write COMPLETED
+    while any work phase is still pending: it probes
+    ``ingestion_phase_pending`` first (clock-free, diary backfilled and
+    converted to the MyGRAPH-compatible ``list[dict]`` shape).
+
+    - **Pending phases**: the row is advanced to the next pending phase via
+      ``set_phase`` and stays PROCESSING — the phase machine (dispatcher)
+      owns the terminal write, and this hook never double-completes.
+    - **Nothing pending**: the ``before_ingestion_status_completed`` gate runs
+      first — a raise forces ERROR, otherwise the row is written COMPLETED
+      with the phase diary cleared. Re-probing first makes any double write
+      harmless (idempotent).
+    - Never overwrites an already-recorded ERROR state, and ignores the
+      unresolved empty source.
     """
     if not source:
         return
     scope, chat_id = _scope_and_chat(cat)
     current = await get_status(cat.agent_key, scope, source)
     if current and current.get("status") == IngestionStatus.ERROR.value:
+        return
+
+    # Clock-free phase probe: backfill the diary, convert to the hook list
+    # shape, thread it into the accumulator and keep only the stale phases.
+    completed = await backfill_completed_phases(current or {}, list(PHASES.keys()))
+    completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
+    pending = await cat.plugin_manager.execute_hook(
+        "ingestion_phase_pending", [], source, completed_as_list, caller=cat
+    )
+    pending = [p for p in (pending or []) if p and p.get("phase")]
+
+    if pending:
+        # A phase is still stale: advance to it and leave the row PROCESSING;
+        # the phase machine owns the terminal COMPLETED write.
+        await set_phase(
+            cat.agent_key,
+            scope,
+            source,
+            pending[0]["phase"],
+            type_=_source_type(source),
+            chat_id=chat_id,
+        )
+        return
+
+    # Nothing pending: final gate, then the terminal state.
+    try:
+        await cat.plugin_manager.execute_hook(
+            "before_ingestion_status_completed", source, caller=cat
+        )
+    except Exception as e:  # noqa: BLE001 - the gate decides the terminal state
+        await set_status(
+            cat.agent_key,
+            scope,
+            source,
+            type_=_source_type(source),
+            status=IngestionStatus.ERROR,
+            chat_id=chat_id,
+            error=str(e),
+            clear_phase=True,
+        )
         return
     await set_status(
         cat.agent_key,

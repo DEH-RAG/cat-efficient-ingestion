@@ -120,17 +120,49 @@ async def test_clear_chat():
 # ---------- lifecycle hooks ----------
 
 
+class _FakePluginManager:
+    """Minimal plugin_manager driving the phase-probe protocol.
+
+    ``pending`` configures what ``ingestion_phase_pending`` reports; when it
+    is ``None`` the default no-op semantics apply (nothing pending). ``gate``
+    may be an exception that ``before_ingestion_status_completed`` raises.
+    """
+
+    def __init__(self, pending=None, gate=None):
+        self.pending = pending if pending is not None else []
+        self.gate = gate
+        self.calls = []
+
+    async def execute_hook(self, hook_name, *args, **kwargs):
+        self.calls.append((hook_name, args, kwargs))
+        if hook_name == "ingestion_phase_pending":
+            return self.pending
+        if hook_name == "before_ingestion_status_completed" and self.gate is not None:
+            raise self.gate
+        return None
+
+
 class FakeCat:
     """Agent-scoped cat (no ``id`` attribute, like CheshireCat)."""
+
     agent_key = agent_id
+
+    def __init__(self, plugin_manager=None):
+        self.plugin_manager = (
+            plugin_manager if plugin_manager is not None else _FakePluginManager()
+        )
 
 
 class FakeStray:
     """Chat-scoped cat (has ``id``, like StrayCat)."""
+
     agent_key = agent_id
 
-    def __init__(self, chat_id="chat_abc"):
+    def __init__(self, chat_id="chat_abc", plugin_manager=None):
         self.id = chat_id
+        self.plugin_manager = (
+            plugin_manager if plugin_manager is not None else _FakePluginManager()
+        )
 
 
 async def test_file_lifecycle():
@@ -281,3 +313,77 @@ async def test_after_stored_ignores_empty_source():
     await ingestion_plugin.after_rabbithole_stored_documents.function("", [], cat)
 
     assert await list_statuses(agent_id) == []
+
+
+# ---------- after_rabbithole_stored_documents phase-probe gating ----------
+
+
+async def test_after_stored_pending_keeps_processing_sets_next_phase():
+    """(a) Pending phases -> the row stays PROCESSING, advanced to the next
+    pending phase; COMPLETED is never written while a phase is pending."""
+    pm = _FakePluginManager(pending=[{"phase": "embedding"}])
+    cat = FakeCat(plugin_manager=pm)
+
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+    await ingestion_plugin.after_rabbithole_stored_documents.function("doc.pdf", [object()], cat)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "processing"
+    assert doc["phase"] == "embedding"
+    # the probe was consulted, and no COMPLETED write happened
+    assert ("ingestion_phase_pending",) == tuple(h for h, *_ in pm.calls)
+
+
+async def test_after_stored_gate_raise_forces_error():
+    """(b) ``before_ingestion_status_completed`` raises -> ERROR, phase cleared."""
+    pm = _FakePluginManager(pending=[], gate=RuntimeError("gate failed"))
+    cat = FakeCat(plugin_manager=pm)
+
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+    await ingestion_plugin.after_rabbithole_stored_documents.function("doc.pdf", [object()], cat)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "error"
+    assert doc["error"] == "gate failed"
+    assert "phase" not in doc
+
+
+async def test_after_stored_empty_probe_completes_and_clears_phase():
+    """(c) Empty probe (nothing pending) -> COMPLETED, phase diary cleared."""
+    pm = _FakePluginManager(pending=[])
+    cat = FakeCat(plugin_manager=pm)
+
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+    await ingestion_plugin.after_rabbithole_stored_documents.function("doc.pdf", [object()], cat)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "completed"
+    assert "phase" not in doc
+    # both probe and gate were consulted
+    hook_names = [h for h, *_ in pm.calls]
+    assert "ingestion_phase_pending" in hook_names
+    assert "before_ingestion_status_completed" in hook_names
+
+
+async def test_after_stored_never_resurrects_error_row():
+    """(d) An ERROR row is never overwritten by the completion hook — the
+    guard short-circuits BEFORE the phase probe even runs."""
+    pm = _FakePluginManager(pending=[], gate=None)
+    cat = FakeCat(plugin_manager=pm)
+
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_error.function("doc.pdf", "store failed", cat)
+    await ingestion_plugin.after_rabbithole_stored_documents.function("doc.pdf", [object()], cat)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "error"
+    assert doc["error"] == "store failed"
+    # the ERROR guard returned before consulting the probe
+    assert pm.calls == []
