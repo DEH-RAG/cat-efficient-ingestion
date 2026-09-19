@@ -44,14 +44,33 @@ The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) �
 
 <h2>🔌 Phase hooks</h2>
 
-The phase machine is extensible through four hooks declared in the plugin itself (`hooks.py`, `@hook(priority=0)`), so external plugins can override them with higher priorities — no MyCAT core change is needed. The `completed_phases` argument threaded through the hooks is a `list[dict]` where every entry carries at least a `"phase"` key (MyGRAPH-compatible), plus optional `marker`/`deps` keys.
+The phase machine is extensible through five hooks declared in the plugin itself (`hooks.py`, `@hook(priority=0)`), so external plugins can override them with higher priorities — no MyCAT core change is needed. The `completed_phases` argument threaded through the hooks is a `list[dict]` where every entry carries at least a `"phase"` key (MyGRAPH-compatible), plus optional `marker`/`deps` keys.
 
 - **`ingestion_phase_pending(pending, source, completed_phases, cat)`** — accumulator of stale phases for a source. Each registrant appends the `{"phase": <id>, ...}` entries it considers stale and returns the extended list. The default is the identity (nothing pending).
 - **`ingestion_phase_run(phase, source, completed_phases, cat)`** — runs one phase with a tri-state contract: return `{"status": "done"}` on success, `{"status": "not_ready", "retry_after": N}` when retriable but not yet runnable (the machine retries after `N` seconds), or raise on permanent failure. The default returns `None`, which the machine treats as fail-hard / unimplemented: a phase with no registrant is an error, never a silent success.
 - **`before_ingestion_status_completed(source, cat)`** — final gate before a source is marked COMPLETED. A registrant raises to force the source to ERROR instead; the default is a no-op.
 - **`ingestion_phase_settings_marker(phase, cat)`** — the plugin-defined material marker for a phase, compared against the recorded diary `marker` to decide whether the phase's settings changed materially. The default returns `None` ("unknown"), which the machine treats conservatively as stale.
+- **`ingestion_phase_specs(specs, cat)`** — accumulator of `PhaseSpec` declarations. Each registrant appends the phases it owns and returns the extended list; EffING merges them into its built-in `PHASES` at probe time (built-ins win on duplicate ids). The default is the identity (no registered phases).
 
-An external phase plugin (e.g. MyGRAPH) registers by overriding `ingestion_phase_pending` to report its phases stale and `ingestion_phase_run` to execute them; the machine dispatches any phase not in its built-in `PHASES` through the run hook and records a minimal diary entry once it reports `done`.
+An external phase plugin (e.g. MyGRAPH) registers by declaring its phases through `ingestion_phase_specs`, providing a material marker through `ingestion_phase_settings_marker`, and executing them through `ingestion_phase_run`; the machine dispatches any phase not in its built-in `PHASES` through the run hook and records a real diary entry once it reports `done`. See the phase-registration API section below.
+
+<h2>📦 Phase-registration API</h2>
+
+External plugins can declare their own ingestion phases without touching the EffING machine. A provider registers through the **`ingestion_phase_specs`** accumulator hook: it appends `PhaseSpec` objects and returns the extended list. EffING merges them into its built-in `PHASES` at probe time via `merged_phases(ccat, cat)` — built-ins win on duplicate ids, malformed output (`None`, non-`PhaseSpec` entries) is skipped, and the built-in `PHASES` dict is never mutated.
+
+A `PhaseSpec` declares three things:
+
+- `id` — the phase id (also the diary key);
+- `settings_category` — the settings category whose `updated_at` is the opaque fast-path token, or `None` for phases with no settings entry (marker-only invalidation);
+- `depends_on` — upstream phase ids whose recorded markers this phase consumed.
+
+A provider only declares a spec + a marker + an execution hook:
+
+- **`ingestion_phase_specs(specs, cat)`** — declares the phase (accumulator);
+- **`ingestion_phase_settings_marker(phase, cat)`** — the material marker compared against the recorded diary `marker` (the provider decides whether a settings rewrite is material);
+- **`ingestion_phase_run(phase, source, completed_phases, cat)`** — executes the phase (tri-state contract).
+
+EffING computes staleness for ALL merged phases (deps by upstream marker identity + marker comparison), so a provider never re-implements the pending probe. Registered phases get REAL diary entries: `_record_phase` writes the marker from `ingestion_phase_settings_marker`, reads `settings_version` only when `settings_category` is set, and copies `deps` from the current diary upstream markers — the same atomic-completion invariant as the built-ins. A registered phase is therefore restartable and re-runs automatically when its upstreams re-run or its marker changes.
 
 <h2>🔁 Probe-driven dispatcher</h2>
 
