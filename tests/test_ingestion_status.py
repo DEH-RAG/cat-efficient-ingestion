@@ -212,6 +212,54 @@ async def test_processing_records_chunker_name():
     assert doc["chunker_name"] == "RecursiveTextChunker"
 
 
+async def test_processing_records_phase_without_diary_or_fingerprint():
+    """Processing start must record only status/phase/chunker_name.
+
+    The clock-free ``completed_phases`` diary is written by the dispatcher on
+    phase COMPLETION, never at processing start: after
+    ``rabbithole_ingestion_processing`` the doc must carry no diary and no
+    marker/settings_version/deps fingerprint (stale-state protection — the
+    hook must never pre-write a diary the dispatcher later owns).
+    """
+    cat = FakeCat()
+    cat.chunker = type("C", (), {"name": "RecursiveTextChunker"})()
+
+    await ingestion_plugin.rabbithole_ingestion_start.function("doc.pdf", {}, False, cat)
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "processing"
+    assert doc["phase"] == PHASE_PARSING_CHUNKING
+    assert doc["chunker_name"] == "RecursiveTextChunker"
+    # no diary, no fingerprint keys at processing start
+    assert "completed_phases" not in doc
+    for fingerprint_key in ("marker", "settings_version", "deps"):
+        assert fingerprint_key not in doc
+
+
+async def test_processing_chunker_resolution_failure_leaves_none():
+    """A chunker-resolution failure must leave chunker_name=None, never raise."""
+    cat = FakeCat()
+
+    # chunker whose ``name`` access blows up mid-resolution
+    def boom():
+        raise RuntimeError("no chunker")
+
+    cat.chunker = type("C", (), {"name": property(boom)})()
+
+    await ingestion_plugin.rabbithole_ingestion_processing.function("doc.pdf", cat)
+
+    doc = await get_status(agent_id, "agent", "doc.pdf")
+    assert doc is not None
+    assert doc["status"] == "processing"
+    assert doc["phase"] == PHASE_PARSING_CHUNKING
+    # failed resolution -> no chunker_name written (reads as None); must not
+    # clobber an engine-written chunker_name, so the key is absent, not None
+    assert doc.get("chunker_name") is None
+    assert "completed_phases" not in doc
+
+
 async def test_chat_scope_lifecycle():
     stray = FakeStray("chat_abc")
 
