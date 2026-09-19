@@ -8,6 +8,7 @@ Covers the ``after_lizard_bootstrap`` hook and the per-agent background pass:
 """
 import asyncio
 import time
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +19,7 @@ from cat.plugins.cat_efficient_ingestion import plugin as ingestion_plugin
 from cat.plugins.cat_efficient_ingestion.reconcile import reconcile_agent
 from cat.plugins.cat_efficient_ingestion.registry import (
     IngestionStatus,
+    get_completed_phases,
     get_status,
     set_status,
     status_key,
@@ -789,19 +791,32 @@ def _stored_source(name):
     return StoredSourceWithMetadata(name=name, path=name, content=None, metadata={})
 
 
-def _stub_reembed_env(monkeypatch, cheshire_cat, existing_points, pending_result):
+def _stub_reembed_env(
+    monkeypatch, cheshire_cat, existing_points,
+    pending_result=None, pending_script=None,
+):
     """Point ``reembed_sources`` at a deterministic environment.
 
     - a fake embedder/chunker so name resolution never hits the real factory;
     - a controlled ``get_all_tenant_points`` (the reuse heuristic reads it);
-    - a fake ``plugin_manager.execute_hook`` that returns ``pending_result``
-      for ``ingestion_phase_pending`` (recording the probe call) and ``[]``
-      for everything else;
-    - a no-op ``_embed_phase`` so the embedding body never touches vectors.
+    - fake ``_parse_and_chunk`` / ``_store_empty_vectors`` / ``_embed_phase``
+      so the phase bodies never touch vectors (calls are counted);
+    - a fake ``plugin_manager.execute_hook``:
+        * ``ingestion_phase_settings_marker`` -> the fixed marker
+          ``"test-marker"`` (so the recorded diary entries are meaningful);
+        * ``ingestion_phase_pending`` -> either a SCRIPTED sequence of results
+          (``pending_script``, consumed one per probe call, then ``[]``) or a
+          DIARY-AWARE simulation of the real registrant (``pending_result``):
+          a phase in ``pending_result`` is reported stale until its diary entry
+          carries marker ``"test-marker"`` — so the re-probe after a phase is
+          recorded returns empty, exactly like the real clock-free registrant.
 
-    Returns a ``{"probe": [(args, kwargs), ...]}`` call record.
+    Returns a call record ``{"probe": [...], "parse_calls": int,
+    "embed_calls": int}``.
     """
     from types import SimpleNamespace
+
+    from langchain_core.documents import Document
 
     monkeypatch.setattr(cheshire_cat, "embedder", AsyncMock(return_value=_FakeEmbedder()))
     monkeypatch.setattr(cheshire_cat, "chunker", SimpleNamespace(name="test-chunker"))
@@ -809,17 +824,49 @@ def _stub_reembed_env(monkeypatch, cheshire_cat, existing_points, pending_result
         cheshire_cat.vector_memory_handler, "get_all_tenant_points",
         AsyncMock(return_value=(existing_points, None)),
     )
+    monkeypatch.setattr(
+        cheshire_cat.vector_memory_handler, "delete_tenant_points",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        cheshire_cat.vector_memory_handler, "add_points_to_tenant",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda source, remote: b"fake content")
+    monkeypatch.setattr(cheshire_cat.file_manager, "remove_file", lambda path: True)
 
-    calls = {"probe": []}
+    calls: dict[str, Any] = {"probe": [], "parse_calls": 0, "embed_calls": 0}
+    script = list(pending_script) if pending_script is not None else None
+    base_pending = list(pending_result or [])
+
+    async def fake_parse_and_chunk(ccat, rabbit_hole, source, file_bytes, content_type, cat):
+        calls["parse_calls"] += 1
+        return [Document(page_content="parsed chunk")], []
+
+    async def fake_embed_phase(*args, **kwargs):
+        calls["embed_calls"] += 1
+        return []
 
     async def fake_execute_hook(name, *args, **kwargs):
         if name == "ingestion_phase_pending":
             calls["probe"].append((args, kwargs))
-            return pending_result
+            if script is not None:
+                return script.pop(0) if script else []
+            # diary-aware: a phase is stale until its marker is recorded
+            completed = args[2]
+            diary = {e["phase"]: e for e in completed if isinstance(e, dict)}
+            return [
+                p for p in base_pending
+                if not isinstance(diary.get(p["phase"]), dict)
+                or diary[p["phase"]].get("marker") != "test-marker"
+            ]
+        if name == "ingestion_phase_settings_marker":
+            return "test-marker"
         return []
 
     monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
-    monkeypatch.setattr(reembed, "_embed_phase", AsyncMock(return_value=[]))
+    monkeypatch.setattr(reembed, "_parse_and_chunk", fake_parse_and_chunk)
+    monkeypatch.setattr(reembed, "_embed_phase", fake_embed_phase)
     return calls
 
 
@@ -864,7 +911,7 @@ async def test_reembed_skips_fresh_completed_without_claiming(cheshire_cat, monk
 
 async def test_reembed_claims_completed_when_embedding_pending(cheshire_cat, monkeypatch):
     """(b) An embedder settings change (probe -> [{"phase": "embedding"}])
-    claims the completed row and hands the machine the embedding phase."""
+    claims the completed row, re-runs the embedding phase and completes it."""
     agent_key = cheshire_cat.agent_key
     source = "needs_reembed.pdf"
     await set_status(
@@ -887,35 +934,47 @@ async def test_reembed_claims_completed_when_embedding_pending(cheshire_cat, mon
 
     await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
 
-    assert len(calls["probe"]) == 1
+    # the serial loop probed twice: the decision probe (embedding stale) and
+    # the re-probe after the embedding was recorded (now empty -> completed)
+    assert len(calls["probe"]) == 2
+    assert calls["embed_calls"] == 1
     doc = await get_status(agent_key, "agent", source)
-    # claimed (processing + owner) and running the embedding phase
+    # claimed (owner) and completed with the work phase cleared
     assert doc is not None
-    assert doc["status"] == "processing"
+    assert doc["status"] == "completed"
     assert doc["resume_owner"] is not None
-    assert doc["phase"] == "embedding"
+    assert "phase" not in doc
+    # the informational labels survive the merge
     assert doc["embedder_name"] == "test-embedder"
+    # the diary gained the embedding entry (marker/deps recorded at completion)
+    diary = get_completed_phases(doc)
+    assert set(diary) == {"parsing_chunking", "embedding"}
+    assert diary["parsing_chunking"]["marker"] == "pc1"  # parsing preserved
+    assert diary["embedding"]["marker"] == "test-marker"
+    assert diary["embedding"]["deps"] == {"parsing_chunking": "pc1"}
 
 
 async def test_reembed_no_doc_fallback_embedding_when_points_exist(cheshire_cat, monkeypatch):
-    """(c) A source with NO status doc has no diary -> no probe is run; the
-    legacy fallback picks ``embedding`` because reusable points exist."""
+    """(c) A source with NO status doc has no diary -> no decision probe is run;
+    the legacy fallback starts ``embedding`` (chunk-reuse) and completes it."""
     agent_key = cheshire_cat.agent_key
     source = "orphan_points.pdf"
     calls = _stub_reembed_env(
         monkeypatch, cheshire_cat,
         existing_points=[_point(source)],
-        pending_result=[],
+        pending_result=[{"phase": "embedding"}],
     )
 
     await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
 
-    # no doc -> the probe is never invoked; the fallback starts the embedding
-    # phase (which writes the processing/embedding row on its way).
-    assert calls["probe"] == []
+    # no doc -> no decision probe; only the loop's post-embedding re-probe ran
+    assert len(calls["probe"]) == 1
+    assert calls["embed_calls"] == 1
     doc = await get_status(agent_key, "agent", source)
     assert doc is not None
-    assert doc["phase"] == "embedding"
+    assert doc["status"] == "completed"
+    assert "phase" not in doc
+    assert doc["embedder_name"] == "test-embedder"
     # no doc -> no claim (claim_source_for_resume only runs with an existing row)
     assert "resume_owner" not in doc
 
@@ -938,7 +997,7 @@ async def test_reembed_malformed_pending_does_not_crash(cheshire_cat, monkeypatc
 
     for malformed in (None, [{"foo": 1}], [None, {"phase": None}]):
         calls = _stub_reembed_env(
-            monkeypatch, cheshire_cat, existing_points=[], pending_result=malformed
+            monkeypatch, cheshire_cat, existing_points=[], pending_script=[malformed]
         )
         await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
         # filtered down to nothing -> skipped without claiming

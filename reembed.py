@@ -56,7 +56,9 @@ from .registry import (
     IngestionStatus,
     backfill_completed_phases,
     claim_source_for_resume,
+    get_completed_phases,
     get_status,
+    record_phase_completed,
     set_phase,
     set_status,
 )
@@ -352,6 +354,199 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
     return points
 
 
+def _should_stop_for_error(doc) -> bool:
+    """True when the status doc is an absorbing ``error`` row.
+
+    The phase machine never advances an ``error`` row: a phase transition must
+    not resurrect it (stale-state protection).
+    """
+    return bool(doc) and doc.get("status") == IngestionStatus.ERROR.value
+
+
+async def _probe_pending(ccat, cat, source_name, doc) -> list:
+    """Clock-free phase probe: diary -> hook list shape -> accumulator.
+
+    Converts the completed-phases diary of ``doc`` (backfilling legacy
+    completed rows) to the ``ingestion_phase_pending`` list shape (every entry
+    carries a ``"phase"`` key), threads it into the accumulator hook and
+    returns the filtered stale phases. Malformed results (None / entries
+    without a ``"phase"`` key) are dropped, never raised on.
+    """
+    completed = await backfill_completed_phases(doc or {}, list(PHASES.keys()))
+    completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
+    pending = await ccat.plugin_manager.execute_hook(
+        "ingestion_phase_pending", [], source_name, completed_as_list, caller=cat
+    )
+    return [p for p in (pending or []) if p and p.get("phase")]
+
+
+async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> dict:
+    """Record the successful completion of one phase in the diary (atomic).
+
+    Computes the CURRENT inputs AT COMPLETION and writes the single diary
+    entry via ``record_phase_completed``:
+
+    - ``marker``: the plugin-defined marker from the
+      ``ingestion_phase_settings_marker`` hook;
+    - ``settings_version``: the OPAQUE ``updated_at`` of the settings entry for
+      ``PHASES[phase].settings_category`` (used only for equality);
+    - ``deps``: ``{upstream: <current diary marker>}`` for each upstream in
+      ``PHASES[phase].depends_on``, copied from the CURRENT diary.
+
+    This is the ONLY diary write for a phase and it happens AFTER the phase
+    body succeeded — NEVER at phase start (atomic-completion invariant): a
+    phase interrupted before this write has no entry and is stale on the next
+    pass, so a restart re-runs it.
+
+    Args:
+        ccat: the CheshireCat.
+        cat: the hook caller (StrayCat/CheshireCat) that issued the pass.
+        scope: ``"agent"`` or a conversation ``chat_id``.
+        source_name: the source being processed.
+        phase: the phase id that just completed (e.g. ``parsing_chunking``).
+        chat_id: the conversation id, when chat-scoped.
+
+    Returns:
+        The stored status doc (``record_phase_completed`` output).
+    """
+    spec = PHASES.get(phase)
+    if spec is None:
+        # unknown (external) phase: no built-in diary entry to write; the
+        # external dispatch owns its own recording (later todo).
+        return await get_status(ccat.agent_key, scope, source_name) or {}
+
+    marker = await ccat.plugin_manager.execute_hook(
+        "ingestion_phase_settings_marker", phase, caller=cat
+    )
+    settings_version = None
+    if spec.settings_category is not None:
+        settings_doc = await crud_settings.get_settings_by_category(
+            getattr(cat, "agent_key", None) or ccat.agent_key, spec.settings_category
+        )
+        if isinstance(settings_doc, dict):
+            settings_version = settings_doc.get("updated_at")
+
+    # deps: upstream markers copied from the CURRENT diary at completion only
+    current = await get_status(ccat.agent_key, scope, source_name) or {}
+    diary = get_completed_phases(current)
+    deps = {}
+    for upstream in spec.depends_on:
+        upstream_entry = diary.get(upstream)
+        deps[upstream] = upstream_entry.get("marker") if isinstance(upstream_entry, dict) else None
+
+    return await record_phase_completed(
+        ccat.agent_key,
+        scope,
+        source_name,
+        phase,
+        marker=marker,
+        settings_version=settings_version,
+        deps=deps,
+    )
+
+
+async def _complete_source(ccat, cat, scope, source_name, chat_id) -> None:
+    """Write the terminal COMPLETED status (dispatcher-owned).
+
+    Runs the ``before_ingestion_status_completed`` gate first: a registrant
+    that raises forces the source to ERROR instead of completing. The caller
+    re-probes with the UPDATED diary before invoking this, so nothing is stale
+    anymore and a double COMPLETED write is harmless (idempotent).
+    ``clear_phase=True`` drops the work phase: a ``completed`` row proves every
+    phase finished, so no phase is pending. Never overwrites an ``error`` row.
+    """
+    try:
+        await ccat.plugin_manager.execute_hook(
+            "before_ingestion_status_completed", source_name, caller=cat
+        )
+    except Exception as e:  # noqa: BLE001 - the gate decides the terminal state
+        log.error(
+            f"Agent id: {ccat._id}. before_ingestion_status_completed gate failed "
+            f"for {source_name}: {e}"
+        )
+        await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
+        return
+    try:
+        await set_status(
+            ccat.agent_key,
+            scope,
+            source_name,
+            type_="url" if is_url(source_name) else "file",
+            status=IngestionStatus.COMPLETED,
+            chat_id=chat_id,
+            clear_phase=True,
+        )
+    except Exception as e:  # noqa: BLE001 - status must never break the re-embed pass
+        log.error(f"Agent id: {ccat._id}. Failed to write ingestion status for {source_name}: {e}")
+
+
+async def _run_parsing_phase(
+    ccat, collection_name, source, source_name, chat_id, cat, rabbit_hole, active_chunker_name,
+):
+    """Run the ``parsing_chunking`` phase body (clean-sweep -> parse -> store).
+
+    Deletes every artifact of this phase and the following ones (text chunk
+    points, image points, saved image files), resolves the source bytes (from
+    the in-memory ``source.content``, a re-downloaded URL, or the persisted
+    file on disk), parses + chunks ALWAYS extracting the images, and stores the
+    text chunks and image points with EMPTY vectors.
+
+    Returns:
+        ``(resolved_source_name, stored_points)`` — the (possibly re-resolved)
+        source name and the stored empty-vector points, which the embedding
+        phase consumes on the next loop iteration.
+    """
+    # 1. clean-sweep: remove every artifact of this phase and the following ones.
+    await _clear_source_artifacts(ccat, collection_name, source_name, chat_id)
+
+    # ensure the rabbit_hole context is wired on the ccat (URL download +
+    # parsing helpers read ``self.cat``)
+    if rabbit_hole.cat is None:
+        await rabbit_hole.setup(ccat)
+
+    # 2. resolve the source bytes: file already on disk (via the resume/upload),
+    #    or a URL to (re)download.
+    if source.content is not None:
+        file_io = source.content
+        file_bytes = file_io.read()
+        content_type, _ = guess_file_type(file_io)
+    elif is_url(source_name):
+        # URL: re-download via the core source resolver.
+        source_name_resolved, file_bytes, content_type, _ = await rabbit_hole._resolve_source_bytes(
+            source_name, source_name, None
+        )
+        if file_bytes is None:
+            raise Exception(f"Something went wrong with the source '{source_name}'")
+        if source_name_resolved:
+            source_name = source_name_resolved
+    else:
+        # re-read from disk (the persisted file)
+        path = ccat.agent_key
+        if chat_id:
+            path = os.path.join(path, str(chat_id))
+        file_bytes = ccat.file_manager.read_file(source_name, path)
+        if file_bytes is None:
+            raise Exception(f"File '{source_name}' not found on disk; cannot re-ingest.")
+        content_type = None
+
+    # 3. parse + chunk + ALWAYS extract images.
+    docs, images = await _parse_and_chunk(
+        ccat, rabbit_hole, source, file_bytes, content_type, cat
+    )
+    if not docs:
+        raise Exception(f"No valid chunks found in the file '{source_name}'.")
+
+    # 4. store text chunks + image points with EMPTY vectors.
+    sha256 = hashlib.sha256()
+    sha256.update(file_bytes or b"")
+    file_hash = sha256.hexdigest()
+    stored = await _store_empty_vectors(
+        ccat, collection_name, source_name, chat_id,
+        docs, images, file_hash=file_hash, metadata=source.metadata or {},
+    )
+    return source_name, stored
+
+
 async def reembed_sources(
     ccat,
     collection_name: VectorMemoryType,
@@ -376,18 +571,26 @@ async def reembed_sources(
         plugin's own plus any external one, e.g. MyGRAPH) compare the diary
         against the CURRENT settings markers/versions and report the stale
         phases. No stale phases -> the source is up to date and is SKIPPED
-        WITHOUT claiming; otherwise the first pending phase is the
-        ``start_phase`` and the row is claimed (``claim_completed=True`` for
-        completed rows) before re-running it.
+        WITHOUT claiming; otherwise the row is claimed
+        (``claim_completed=True`` for completed rows) and the serial dispatch
+        loop below runs the stale phases.
       - no status doc: no diary to probe against -> ``embedding`` if reusable
-        points exist, else ``parsing_chunking`` (legacy heuristic).
+        points exist, else ``parsing_chunking`` (legacy heuristic); the first
+        pending entry is synthesized from that decision.
 
-    For each source that must run ``parsing_chunking``, the source's artifacts
-    (text/image points and saved image files) are FIRST deleted, then the file
-    is parsed and the chunks + images stored with EMPTY vectors; finally the
-    ``embedding`` phase recomputes the vectors and marks the source completed.
-    On a crash between the two phases, the doc records ``embedding`` and the
-    next pass resumes from there (the empty-vector points are still present).
+    Serial probe-driven dispatch (per claimed source): one phase at a time, in
+    probe order. Each phase body runs (``parsing_chunking``: clean-sweep the
+    source's artifacts then parse + chunk + ALWAYS extract the images and store
+    text chunks and image points with EMPTY vectors; ``embedding``: recompute
+    the vectors of the stored points and mark the source completed). After each
+    phase succeeds, its diary entry (``marker`` / ``settings_version`` / ``deps``)
+    is recorded ATOMICALLY at completion — never at phase start — and the probe
+    is re-run against the UPDATED diary. When the re-probe is empty the
+    terminal COMPLETED status is written (after the
+    ``before_ingestion_status_completed`` gate), with the work phase cleared. A
+    phase interrupted before its diary write has NO entry -> stale on the next
+    pass, so a restart re-runs it. An ``error`` row is never advanced nor
+    resurrected to COMPLETED.
     """
     log.info(f"Agent id: {ccat._id}. Embedding stored files to the vector memory")
 
@@ -448,18 +651,14 @@ async def reembed_sources(
             # own (phases.py) plus any external one (e.g. MyGRAPH) — compare it
             # against the CURRENT settings markers/versions and report the stale
             # phases. No timestamps are used for correctness anywhere.
-            completed = await backfill_completed_phases(doc or {}, list(PHASES.keys()))
-            completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-            pending = await ccat.plugin_manager.execute_hook(
-                "ingestion_phase_pending", [], source_name, completed_as_list, caller=cat
-            )
-            pending = [p for p in (pending or []) if p and p.get("phase")]
+            # clock-free phase probe (diary -> hook list shape -> accumulator)
+            pending = await _probe_pending(ccat, cat, source_name, doc)
             if not pending:
                 # every recorded phase is still fresh against the current settings
                 # -> the source is up to date: skip WITHOUT claiming.
                 log.debug(
                     f"Agent id: {ccat._id}. Source {source_name}: no stale phases "
-                    f"(diary {sorted(completed)}), skipping"
+                    f"(diary {sorted(get_completed_phases(doc))}), skipping"
                 )
                 continue
             start_phase = pending[0]["phase"]
@@ -472,6 +671,9 @@ async def reembed_sources(
                 for p in existing_points
             )
             start_phase = PHASE_EMBEDDING if has_points else PHASE_PARSING_CHUNKING
+            # no diary to probe against: synthesize the first pending entry so
+            # the serial dispatcher loop has a single entry point.
+            pending = [{"phase": start_phase}]
 
         # ---- log the phase transition (debug) ----
         log.debug(
@@ -496,116 +698,105 @@ async def reembed_sources(
                 continue
 
         try:
-            # ---- EXECUTE the phase(s), possibly chaining parsing -> embedding ----
-            current_phase = start_phase
+            # ---- SERIAL PROBE-DRIVEN PHASE DISPATCH ----
+            # One phase at a time, in probe order. After each phase body
+            # succeeds its diary entry (marker / settings_version / deps) is
+            # recorded ATOMICALLY and the probe is re-run against the UPDATED
+            # diary. When the re-probe is empty the terminal COMPLETED status
+            # is written (after the ``before_ingestion_status_completed``
+            # gate). A phase interrupted before its diary write has NO entry ->
+            # stale on the next pass, so a restart re-runs it. An ``error`` row
+            # is never advanced nor resurrected.
+            stored_points = None
+            while pending:
+                doc = await get_status(ccat.agent_key, scope, source_name)
+                if _should_stop_for_error(doc):
+                    # ERROR absorbing: never advance a failed row
+                    break
+                entry = pending[0]
+                phase = entry["phase"]
 
-            if current_phase == PHASE_EMBEDDING:
-                # chunks (text) already stored for this source: chunk-reuse path.
-                # For episodic sources, the chat must still exist.
-                if chat_id and not (await ccat._find_stray_cat(str(chat_id))):
-                    log.warning(
-                        f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
+                if phase == PHASE_EMBEDDING:
+                    # chunks (text) already stored for this source: chunk-reuse
+                    # path. For episodic sources, the chat must still exist.
+                    if chat_id and not (await ccat._find_stray_cat(str(chat_id))):
+                        log.warning(
+                            f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
+                        )
+                        await ccat.vector_memory_handler.delete_tenant_points(
+                            str(collection_name), metadata={"source": source_name}
+                        )
+                        await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
+                        break
+
+                    await set_phase(
+                        ccat.agent_key, scope, source_name,
+                        PHASE_EMBEDDING,
+                        embedder_name=active_embedder_name,
+                        type_="url" if is_url(source_name) else "file",
+                        chat_id=chat_id,
                     )
-                    await ccat.vector_memory_handler.delete_tenant_points(
-                        str(collection_name), metadata={"source": source_name}
+                    source_points = stored_points or [
+                        p for p in existing_points
+                        if (p.payload or {}).get("metadata", {}).get("source") == source_name
+                    ]
+                    if source_points:
+                        await _embed_phase(
+                            ccat, collection_name, source_name, source_points,
+                            embedder, chat_id, cat, rabbit_hole,
+                        )
+                        stored_points = None
+                        counter += 1
+                    else:
+                        # no stored points (fresh source / points were cleared):
+                        # fall through to a full re-ingest from parsing_chunking.
+                        phase = PHASE_PARSING_CHUNKING
+                        await set_phase(
+                            ccat.agent_key, scope, source_name,
+                            PHASE_PARSING_CHUNKING,
+                            chunker_name=active_chunker_name,
+                            type_="url" if is_url(source_name) else "file",
+                            chat_id=chat_id,
+                        )
+                        source_name, stored_points = await _run_parsing_phase(
+                            ccat, collection_name, source, source_name, chat_id, cat,
+                            rabbit_hole, active_chunker_name,
+                        )
+                elif phase == PHASE_PARSING_CHUNKING:
+                    # ---- parsing_chunking phase body ----
+                    await set_phase(
+                        ccat.agent_key, scope, source_name,
+                        PHASE_PARSING_CHUNKING,
+                        chunker_name=active_chunker_name,
+                        type_="url" if is_url(source_name) else "file",
+                        chat_id=chat_id,
                     )
-                    await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
-                    continue
-
-                await set_phase(
-                    ccat.agent_key, scope, source_name,
-                    PHASE_EMBEDDING,
-                    embedder_name=active_embedder_name,
-                    type_="url" if is_url(source_name) else "file",
-                    chat_id=chat_id,
-                )
-                source_points = [
-                    p for p in existing_points
-                    if (p.payload or {}).get("metadata", {}).get("source") == source_name
-                ]
-                if source_points:
-                    await _embed_phase(
-                        ccat, collection_name, source_name, source_points,
-                        embedder, chat_id, cat, rabbit_hole,
+                    source_name, stored_points = await _run_parsing_phase(
+                        ccat, collection_name, source, source_name, chat_id, cat,
+                        rabbit_hole, active_chunker_name,
                     )
-                    counter += 1
-                    continue
-                # no stored points -> fall through to parsing_chunking
-                current_phase = PHASE_PARSING_CHUNKING
-
-            if current_phase == PHASE_PARSING_CHUNKING:
-                # ---- parsing_chunking phase ----
-                await set_phase(
-                    ccat.agent_key, scope, source_name,
-                    PHASE_PARSING_CHUNKING,
-                    chunker_name=active_chunker_name,
-                    type_="url" if is_url(source_name) else "file",
-                    chat_id=chat_id,
-                )
-
-                # 1. clean-sweep: remove every artifact of this phase and the
-                #    following ones (text chunk points, image points, image files).
-                await _clear_source_artifacts(ccat, collection_name, source_name, chat_id)
-
-                # ensure the rabbit_hole context is wired on the ccat (URL
-                # download + parsing helpers read ``self.cat``)
-                if rabbit_hole.cat is None:
-                    await rabbit_hole.setup(ccat)
-
-                # 2. resolve the source bytes: file already on disk (via the
-                #    resume/upload), or a URL to (re)download.
-                if source.content is not None:
-                    file_io = source.content
-                    file_bytes = file_io.read()
-                    content_type, _ = guess_file_type(file_io)
-                elif is_url(source_name):
-                    # URL: re-download via the core source resolver.
-                    source_name_resolved, file_bytes, content_type, _ = await rabbit_hole._resolve_source_bytes(
-                        source_name, source_name, None
-                    )
-                    if file_bytes is None:
-                        raise Exception(f"Something went wrong with the source '{source_name}'")
-                    if source_name_resolved:
-                        source_name = source_name_resolved
                 else:
-                    # re-read from disk (the persisted file)
-                    path = ccat.agent_key
-                    if chat_id:
-                        path = os.path.join(path, str(chat_id))
-                    file_bytes = ccat.file_manager.read_file(source_name, path)
-                    if file_bytes is None:
-                        raise Exception(f"File '{source_name}' not found on disk; cannot re-ingest.")
-                    content_type = None
+                    # external phase (e.g. MyGRAPH): dispatched through the
+                    # ``ingestion_phase_run`` hook in a later todo. For now the
+                    # machine does NOT advance (no diary entry, no COMPLETED):
+                    # a phase nobody implements must not be recorded as done.
+                    break
 
-                # 3. parse + chunk + ALWAYS extract images.
-                docs, images = await _parse_and_chunk(
-                    ccat, rabbit_hole, source, file_bytes, content_type, cat
-                )
-                if not docs:
-                    raise Exception(f"No valid chunks found in the file '{source_name}'.")
+                # ---- ATOMIC COMPLETION: record the diary entry (never at
+                # ---- phase start): marker + settings_version + deps ----
+                await _record_phase(ccat, cat, scope, source_name, phase, chat_id=chat_id)
 
-                # 4. store text chunks + image points with EMPTY vectors.
-                sha256 = hashlib.sha256()
-                sha256.update(file_bytes or b"")
-                file_hash = sha256.hexdigest()
-                stored = await _store_empty_vectors(
-                    ccat, collection_name, source_name, chat_id,
-                    docs, images, file_hash=file_hash, metadata=source.metadata or {},
-                )
+                # ---- re-probe with the updated diary ----
+                doc = await get_status(ccat.agent_key, scope, source_name)
+                pending = await _probe_pending(ccat, cat, source_name, doc)
 
-                # 5. transition to the embedding phase and recompute the vectors.
-                await set_phase(
-                    ccat.agent_key, scope, source_name,
-                    PHASE_EMBEDDING,
-                    embedder_name=active_embedder_name,
-                    type_="url" if is_url(source_name) else "file",
-                    chat_id=chat_id,
-                )
-                await _embed_phase(
-                    ccat, collection_name, source_name, stored,
-                    embedder, chat_id, cat, rabbit_hole,
-                )
-                counter += 1
+                # ---- terminal COMPLETED when nothing is stale anymore ----
+                if not pending and not _should_stop_for_error(doc):
+                    await _complete_source(ccat, cat, scope, source_name, chat_id)
+                    break
+                if not pending:
+                    # an error row appeared while recording: never resurrect it
+                    break
 
         except Exception as e:  # noqa: BLE001 - a failing source must not abort the pass
             log.error(f"Agent id: {ccat._id}. Error re-embedding source {source_name}: {e}")
