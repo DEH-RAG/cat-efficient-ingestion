@@ -256,6 +256,43 @@ def get_completed_phases(doc: Optional[Dict]) -> dict:
     return diary if isinstance(diary, dict) else {}
 
 
+async def backfill_completed_phases(doc: Optional[Dict], phase_ids) -> dict:
+    """Return the completed-phases diary, backfilling legacy completed rows.
+
+    Rows completed BEFORE the clock-free ``completed_phases`` diary existed
+    carry no diary. For those rows (status COMPLETED with an absent/empty
+    diary) this returns a SENTINEL diary with every ``phase_ids`` phase present
+    but marked ``marker=None`` / ``settings_version=None`` / ``deps={}``: their
+    settings version is unknown, so the recovery/re-embed path conservatively
+    re-runs each phase exactly once (one-time revalidation).
+
+    Non-completed rows and completed rows that already carry a diary are
+    returned UNCHANGED — the backfill never overwrites an existing diary
+    (stale-state protection).
+
+    Never raises: a ``None`` or malformed ``doc`` yields ``{}``; ``phase_ids``
+    may be ``None``/empty (then the sentinel is empty too).
+
+    Args:
+        doc: The status document (as returned by :func:`get_status`), or None.
+        phase_ids: Iterable of phase ids to backfill (e.g. ``parsing_chunking``,
+            ``embedding``).
+
+    Returns:
+        The diary dict: the sentinel backfill for legacy completed rows, the
+        existing diary when one is present, or ``{}`` otherwise.
+    """
+    diary = get_completed_phases(doc)
+    if diary:
+        return diary
+    if not doc or doc.get("status") != IngestionStatus.COMPLETED.value:
+        return {}
+    return {
+        phase: {"marker": None, "settings_version": None, "deps": {}}
+        for phase in (phase_ids or [])
+    }
+
+
 async def record_phase_completed(
     agent_id: str,
     scope: str,

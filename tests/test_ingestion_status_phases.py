@@ -11,6 +11,7 @@ from cat.plugins.cat_efficient_ingestion.registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
     IngestionStatus,
+    backfill_completed_phases,
     claim_source_for_resume,
     get_completed_phases,
     get_status,
@@ -241,3 +242,82 @@ async def test_set_phase_forwards_completed_phases():
     doc = await get_status("agent_1", "agent", "diary.pdf")
     assert doc["phase"] == PHASE_EMBEDDING
     assert get_completed_phases(doc)[PHASE_PARSING_CHUNKING]["marker"] == "chunker-v1"
+
+
+# ---------------------------------------------------------------------------
+# Legacy backfill (backfill_completed_phases)
+# ---------------------------------------------------------------------------
+
+
+async def test_backfill_completed_phases_sentinel_for_legacy_completed():
+    # a completed row written BEFORE the diary existed carries no diary
+    await set_status(
+        "agent_1", "agent", "legacy.pdf",
+        type_="file", status=IngestionStatus.COMPLETED,
+    )
+    doc = await get_status("agent_1", "agent", "legacy.pdf")
+    assert doc["status"] == IngestionStatus.COMPLETED.value
+    assert get_completed_phases(doc) == {}
+
+    phases = [PHASE_PARSING_CHUNKING, PHASE_EMBEDDING]
+    diary = await backfill_completed_phases(doc, phases)
+    # sentinel: every phase present, markers/versions unknown (None), deps {}
+    assert diary == {
+        phase: {"marker": None, "settings_version": None, "deps": {}}
+        for phase in phases
+    }
+
+
+async def test_backfill_completed_phases_non_completed_returns_empty():
+    # a processing row (in flight) has no diary and gets NO backfill
+    await set_phase("agent_1", "agent", "pending.pdf", PHASE_EMBEDDING, embedder_name="emb-v1")
+    doc = await get_status("agent_1", "agent", "pending.pdf")
+    assert doc["status"] == IngestionStatus.PROCESSING.value
+    assert await backfill_completed_phases(
+        doc, [PHASE_PARSING_CHUNKING, PHASE_EMBEDDING]
+    ) == {}
+
+    # an uploaded row likewise
+    await set_status(
+        "agent_1", "agent", "fresh.pdf",
+        type_="file", status=IngestionStatus.UPLOADED,
+    )
+    doc = await get_status("agent_1", "agent", "fresh.pdf")
+    assert await backfill_completed_phases(
+        doc, [PHASE_PARSING_CHUNKING, PHASE_EMBEDDING]
+    ) == {}
+
+
+async def test_backfill_completed_phases_keeps_existing_diary():
+    # a completed row that ALREADY has a diary must NOT be overwritten by the
+    # sentinel backfill (stale-state protection)
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_PARSING_CHUNKING,
+        marker="chunker-v1", settings_version="t1",
+    )
+    await set_status(
+        "agent_1", "agent", "diary.pdf",
+        type_="file", status=IngestionStatus.COMPLETED,
+    )
+    doc = await get_status("agent_1", "agent", "diary.pdf")
+    assert doc["status"] == IngestionStatus.COMPLETED.value
+    diary = await backfill_completed_phases(
+        doc, [PHASE_PARSING_CHUNKING, PHASE_EMBEDDING]
+    )
+    # unchanged: only the recorded phase, no sentinel for the missing one
+    assert diary == {
+        PHASE_PARSING_CHUNKING: {
+            "marker": "chunker-v1", "settings_version": "t1", "deps": {},
+        }
+    }
+
+
+async def test_backfill_completed_phases_none_doc_is_safe():
+    # adversarial input: doc=None -> {} without raising
+    assert await backfill_completed_phases(None, [PHASE_PARSING_CHUNKING, PHASE_EMBEDDING]) == {}
+
+
+async def test_backfill_completed_phases_malformed_doc_is_safe():
+    # adversarial input: doc without a status -> {} without raising
+    assert await backfill_completed_phases({}, [PHASE_PARSING_CHUNKING, PHASE_EMBEDDING]) == {}
+    assert await backfill_completed_phases({"status": "completed"}, None) == {}
