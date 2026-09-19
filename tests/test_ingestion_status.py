@@ -7,6 +7,8 @@ transitions are observable without booting the full app.
 """
 import hashlib
 
+import pytest
+
 from cat.plugins.cat_efficient_ingestion import plugin as ingestion_plugin
 from cat.plugins.cat_efficient_ingestion.registry import (
     PHASE_DOWNLOADING,
@@ -14,14 +16,33 @@ from cat.plugins.cat_efficient_ingestion.registry import (
     IngestionStatus,
     clear_agent,
     clear_chat,
+    clear_delete_marker,
+    claim_source_for_resume,
+    delete_marker_key,
     delete_status,
     get_status,
+    has_delete_marker,
+    ingestion_canceled,
     list_statuses,
+    set_delete_marker,
     set_status,
     status_key,
 )
+from cat.db import crud
 from cat.db.database import get_async_db
 from tests.utils import agent_id
+
+
+@pytest.fixture(autouse=True)
+async def _ensure_agent_master_key():
+    """The ``ingestion_canceled`` guard makes ``set_status`` a no-op when the
+    agent master key ``agents:<agent_id>:agent`` is absent. These registry
+    tests call ``set_status`` directly, so create the master key first (the
+    production contract: ``set_status`` is only called for existing agents)."""
+    await crud.store(f"agents:{agent_id}:agent", [{"name": "x", "value": 1}])
+    yield
+    await crud.destroy(f"agents:{agent_id}:*")
+
 
 # ---------- registry ----------
 
@@ -115,6 +136,80 @@ async def test_clear_chat():
     assert deleted == 1
     assert await get_status(agent_id, "chat_abc", "chat.pdf") is None
     assert await get_status(agent_id, "agent", "doc.pdf") is not None
+
+
+# ---------- delete marker / ingestion-canceled guards ----------
+
+
+async def test_delete_marker_helpers_roundtrip():
+    key = delete_marker_key(agent_id)
+    assert key == f"agents:{agent_id}:ingestion:delete"
+    assert await has_delete_marker(agent_id) is False
+    assert await ingestion_canceled(agent_id) is False
+
+    await set_delete_marker(agent_id)
+    assert await has_delete_marker(agent_id) is True
+
+    await clear_delete_marker(agent_id)
+    assert await has_delete_marker(agent_id) is False
+
+
+async def test_set_status_and_claim_noop_on_delete_marker():
+    """A canceled agent (marker present) must never get a status write or claim."""
+    await set_status(agent_id, "agent", "doc.pdf", type_="file", status=IngestionStatus.COMPLETED)
+    await set_delete_marker(agent_id)
+
+    # set_status returns {} and writes nothing: the pre-existing row is untouched
+    doc = await set_status(agent_id, "agent", "doc.pdf", type_="file", status=IngestionStatus.UPLOADED)
+    assert doc == {}
+    stored = await get_status(agent_id, "agent", "doc.pdf")
+    assert stored is not None
+    assert stored["status"] == IngestionStatus.COMPLETED
+
+    # claim_source_for_resume returns None even though a stale row exists
+    claimed = await claim_source_for_resume(
+        agent_id, "agent", "doc.pdf", stale_after=0, owner="test-worker",
+    )
+    assert claimed is None
+
+
+async def test_ingestion_canceled_true_when_master_key_absent():
+    """Master key absent (and marker absent) -> canceled (ghost agent)."""
+    await crud.destroy(f"agents:{agent_id}:agent")
+    assert await ingestion_canceled(agent_id) is True
+
+
+async def test_ingestion_canceled_true_when_marker_present_even_with_master():
+    """Marker present -> canceled even if the agent master key still exists."""
+    await crud.store(f"agents:{agent_id}:agent", [{"name": "agent_settings"}])
+    assert await ingestion_canceled(agent_id) is False
+
+    await set_delete_marker(agent_id)
+    assert await ingestion_canceled(agent_id) is True
+
+
+async def test_list_statuses_skips_delete_marker():
+    await set_status(agent_id, "agent", "doc.pdf", type_="file", status=IngestionStatus.COMPLETED)
+    await set_delete_marker(agent_id)
+
+    docs = await list_statuses(agent_id)
+    assert [d["source"] for d in docs] == ["doc.pdf"]
+    assert all(d.get("delete_marker") is not True for d in docs)
+
+
+async def test_clear_agent_preserves_delete_marker():
+    await set_status(agent_id, "agent", "doc.pdf", type_="file", status=IngestionStatus.COMPLETED)
+    await set_delete_marker(agent_id)
+
+    deleted = await clear_agent(agent_id)
+    assert deleted == 1
+    assert await get_status(agent_id, "agent", "doc.pdf") is None
+    assert await has_delete_marker(agent_id) is True
+
+    # the marker is the ONLY remaining key in the agent's ingestion namespace
+    db = get_async_db()
+    remaining = [k async for k in db.scan_iter(f"agents:{agent_id}:ingestion:*")]
+    assert remaining == [delete_marker_key(agent_id)]
 
 
 # ---------- lifecycle hooks ----------

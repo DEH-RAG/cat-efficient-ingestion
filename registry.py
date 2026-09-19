@@ -55,6 +55,58 @@ def status_key(agent_id: str, scope: str, source: str) -> str:
     return f"agents:{agent_id}:ingestion:{scope}:{digest}"
 
 
+#: Key part of the deletion marker, stored INSIDE the ``agents:{agent_id}:ingestion:*``
+#: namespace on purpose: the namespace wipe includes it, and the agent master
+#: keys (``agents:*:agent``) never list it.
+DELETE_MARKER_KEY_PART = "delete"
+
+
+def delete_marker_key(agent_id: str) -> str:
+    """Redis key of the deletion marker for an agent.
+
+    The marker is persistent (no TTL): written by the delete flow, removed
+    ONLY at teardown completion. Invariant: marker present <=> teardown
+    incomplete.
+
+    Args:
+        agent_id: The agent (chatbot) id.
+
+    Returns:
+        ``agents:{agent_id}:ingestion:delete``
+    """
+    return f"agents:{agent_id}:ingestion:{DELETE_MARKER_KEY_PART}"
+
+
+async def set_delete_marker(agent_id: str) -> None:
+    """Write the deletion marker for an agent (idempotent)."""
+    await crud.store(delete_marker_key(agent_id), {"delete_marker": True})
+
+
+async def has_delete_marker(agent_id: str) -> bool:
+    """Whether the deletion marker is present for an agent."""
+    return await crud.read(delete_marker_key(agent_id)) is not None
+
+
+async def clear_delete_marker(agent_id: str) -> None:
+    """Remove the deletion marker for an agent (teardown completion)."""
+    await crud.delete(delete_marker_key(agent_id))
+
+
+async def ingestion_canceled(agent_id: str) -> bool:
+    """Whether ingestion for an agent must self-abort.
+
+    True when the deletion marker is present OR the agent's master key
+    (``agents:{agent_id}:agent``) is absent — the master-key check makes
+    ghost agents (peripheral keys without a master) also "canceled", so no
+    worker ever writes status for a dead agent. Absence is detected through
+    the official ``cat.db.crud`` API (``read(...) is None``), never a raw
+    client.
+    """
+    return await has_delete_marker(agent_id) or (
+        await crud.read(f"agents:{agent_id}:agent")
+    ) is None
+
+
 async def _read_doc(key: str) -> Optional[Dict]:
     """Read a status doc, unwrapping the RedisJSON array wrapper."""
     value = await crud.read(key)
@@ -129,6 +181,9 @@ async def set_status(
     Returns:
         The stored status document.
     """
+    if await ingestion_canceled(agent_id):
+        return {}
+
     key = status_key(agent_id, scope, source)
     now = generate_timestamp()
 
@@ -392,6 +447,9 @@ async def claim_source_for_resume(
     """
     import time
 
+    if await ingestion_canceled(agent_id):
+        return None
+
     key = status_key(agent_id, scope, source)
     lock_pattern = f"ingestion-resume:{agent_id}:{scope}:{source}"
     async with crud.distributed_lock(lock_pattern, timeout=30, blocking_timeout=15):
@@ -472,6 +530,9 @@ async def list_statuses(agent_id: str, chat_id: Optional[str] = None) -> List[Di
         doc = await _read_doc(key)
         if not doc:
             continue
+        if key == delete_marker_key(agent_id):
+            # the deletion-marker doc is not a status entry
+            continue
         scope = doc.get("scope")
         if chat_id is None:
             if scope != "agent":
@@ -485,10 +546,23 @@ async def list_statuses(agent_id: str, chat_id: Optional[str] = None) -> List[Di
 async def clear_agent(agent_id: str) -> int:
     """Delete every ingestion-status key for an agent (all scopes).
 
+    The deletion marker (``agents:{agent_id}:ingestion:delete``) is
+    deliberately PRESERVED: the teardown removes it explicitly as the LAST
+    step, so a wipe here must not clear it.
+
     Returns:
-        The number of keys deleted.
+        The number of keys deleted (marker excluded).
     """
-    return await crud.destroy(f"agents:{agent_id}:ingestion:*")
+    db = get_async_db()
+    marker = delete_marker_key(agent_id)
+    keys = [
+        key
+        async for key in db.scan_iter(f"agents:{agent_id}:ingestion:*")
+        if key != marker
+    ]
+    if keys:
+        await db.delete(*keys)
+    return len(keys)
 
 
 async def clear_chat(agent_id: str, chat_id: str) -> int:
