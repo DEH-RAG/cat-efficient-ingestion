@@ -1,6 +1,6 @@
 """Tests for the EffING phase-machine extension hooks (``hooks.py``).
 
-Covers the four ``@hook(priority=0)`` declarations and their conservative
+Covers the five ``@hook(priority=0)`` declarations and their conservative
 default contracts:
 
 - ``ingestion_phase_pending`` — accumulator identity (returns ``pending``
@@ -8,7 +8,9 @@ default contracts:
 - ``ingestion_phase_run`` — default ``None`` (fail-hard / unimplemented);
 - ``before_ingestion_status_completed`` — default no-op;
 - ``ingestion_phase_settings_marker`` — default ``None`` ("unknown" ->
-  conservative stale).
+  conservative stale);
+- ``ingestion_phase_specs`` — accumulator identity (returns ``specs``
+  unchanged, even when ``None``).
 
 Registration is asserted through the exact mechanism MadHatter uses when
 loading a plugin (``getmembers(module, isinstance(obj, CatHook))`` in
@@ -16,7 +18,7 @@ loading a plugin (``getmembers(module, isinstance(obj, CatHook))`` in
 external plugins can override them.
 
 Import safety is asserted statically (AST): the module's top level contains
-only the four decorated function definitions and the single
+only the five decorated function definitions and the single
 ``from cat import hook`` import — no Redis, no network, no side effects.
 """
 
@@ -27,12 +29,14 @@ from pathlib import Path
 from cat.looking_glass.mad_hatter.decorators.hook import CatHook
 
 from cat.plugins.cat_efficient_ingestion import hooks
+from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
 
 EXPECTED_HOOKS = {
     "ingestion_phase_pending",
     "ingestion_phase_run",
     "before_ingestion_status_completed",
     "ingestion_phase_settings_marker",
+    "ingestion_phase_specs",
 }
 
 HOOKS_FILE = Path(hooks.__file__).resolve()
@@ -46,8 +50,8 @@ def _registered_hooks():
     }
 
 
-def test_all_four_phase_hooks_registered_with_priority_zero():
-    """The four hook names are registered as CatHook instances, priority 0."""
+def test_all_five_phase_hooks_registered_with_priority_zero():
+    """The five hook names are registered as CatHook instances, priority 0."""
     registered = _registered_hooks()
     assert EXPECTED_HOOKS <= set(registered), (
         f"missing hooks: {EXPECTED_HOOKS - set(registered)}"
@@ -89,8 +93,20 @@ def test_ingestion_phase_settings_marker_default_is_none():
     assert hooks.ingestion_phase_settings_marker.function("embedding", None) is None
 
 
+def test_ingestion_phase_specs_default_is_identity():
+    """Default accumulator returns ``specs`` unchanged."""
+    assert hooks.ingestion_phase_specs.function([], None) == []
+    specs = [PhaseSpec("graph_embedding", "graphrag", ("embedding",))]
+    assert hooks.ingestion_phase_specs.function(specs, None) is specs
+
+
+def test_ingestion_phase_specs_handles_none_specs():
+    """Adversarial: ``specs=None`` is returned safely, not crashed on."""
+    assert hooks.ingestion_phase_specs.function(None, None) is None
+
+
 def test_hooks_module_import_has_zero_side_effects():
-    """Top level is only the 4 decorated defs + ``from cat import hook``.
+    """Top level is only the 5 decorated defs + ``from cat import hook``.
 
     No other imports (no Redis, no network, no ``cat.db``), no assignments,
     no calls, no executable statements at import time.

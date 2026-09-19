@@ -1,6 +1,6 @@
 """Phase-machine extension hooks for the efficient-ingestion plugin.
 
-These four hooks define the contract between the EffING phase machine and any
+These five hooks define the contract between the EffING phase machine and any
 external registrant (other plugins, e.g. MyGRAPH) that wants to participate in
 ingestion phases. They are declared here, in the plugin itself, with
 ``@hook(priority=0)`` so that external plugins can override them with higher
@@ -10,7 +10,7 @@ All defaults are conservative no-ops: a phase that nobody implements is
 reported as pending (stale), fails hard when run, and its marker is unknown.
 
 Importing this module has zero side effects: the only top-level statements are
-the four ``@hook`` decorators (which merely wrap the functions in ``CatHook``
+the five ``@hook`` decorators (which merely wrap the functions in ``CatHook``
 instances). No Redis, no network, no filesystem access.
 """
 
@@ -112,3 +112,21 @@ def ingestion_phase_settings_marker(phase, cat):
         hashable/equatable value the plugin defines.
     """
     return None
+
+
+@hook(priority=0)
+def ingestion_phase_specs(specs, cat) -> list:
+    """Accumulator: plugins append PhaseSpec objects to declare their own
+    ingestion phases. EffING merges them into its PHASES at probe time.
+    The default returns `specs` unchanged.
+
+    Args:
+        specs: list of ``PhaseSpec`` objects accumulated so far (may be
+            ``None`` from a caller that did not initialize it; it is returned
+            as-is).
+        cat: the CheshireCat instance (may be ``None`` in unit tests).
+
+    Returns:
+        The extended ``specs`` list.
+    """
+    return specs
