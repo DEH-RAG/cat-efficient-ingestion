@@ -49,10 +49,12 @@ from cat.plugins.cat_multimodal_ingestion.ingestion import (
 )
 
 from .ingestion_executor import run_in_ingestion_executor
+from .phases import PHASES
 from .registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
     IngestionStatus,
+    backfill_completed_phases,
     claim_source_for_resume,
     get_status,
     set_phase,
@@ -366,13 +368,19 @@ async def reembed_sources(
     is needed by the background re-embed/resume passes but would fail for a
     brand-new chat upload).
 
-    Phase decision (per source), from the ingestion-status doc:
-      - ``completed`` + embedder == active + chunker == active  -> skip
-      - ``completed`` + chunker mismatch                         -> ``parsing_chunking``
-      - ``completed`` + embedder mismatch (chunks valid)         -> ``embedding``
-      - in-flight / stale row (``uploaded``/``processing``/``error``/``downloading``/``downloaded``):
-          resumes from the phase recorded in ``doc["phase"]`` (conservative).
-      - no status doc / old row -> ``embedding`` if reusable points exist, else ``parsing_chunking``.
+    Phase decision (per source), clock-free:
+      - status doc present: the ``completed_phases`` diary is read (backfilling
+        legacy completed rows), converted to the hook list shape (each entry
+        carries a ``"phase"`` key) and threaded into the
+        ``ingestion_phase_pending`` accumulator hook. Registrants (this
+        plugin's own plus any external one, e.g. MyGRAPH) compare the diary
+        against the CURRENT settings markers/versions and report the stale
+        phases. No stale phases -> the source is up to date and is SKIPPED
+        WITHOUT claiming; otherwise the first pending phase is the
+        ``start_phase`` and the row is claimed (``claim_completed=True`` for
+        completed rows) before re-running it.
+      - no status doc: no diary to probe against -> ``embedding`` if reusable
+        points exist, else ``parsing_chunking`` (legacy heuristic).
 
     For each source that must run ``parsing_chunking``, the source's artifacts
     (text/image points and saved image files) are FIRST deleted, then the file
@@ -425,46 +433,40 @@ async def reembed_sources(
                 await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
                 continue
 
-        # ---- decide the start phase from the status doc ----
+        # ---- decide the start phase from the status doc + phase probe ----
         doc = await get_status(ccat.agent_key, scope, source_name)
         doc_status = (doc or {}).get("status")
         doc_embedder = (doc or {}).get("embedder_name")
         doc_chunker = (doc or {}).get("chunker_name")
         doc_phase = (doc or {}).get("phase")
 
-        if (
-            doc_status == IngestionStatus.COMPLETED.value
-            and doc_embedder == active_embedder_name
-            and doc_chunker == active_chunker_name
-        ):
-            log.debug(
-                f"Agent id: {ccat._id}. Source {source_name}: already completed with the "
-                f"active embedder/chunker ({active_embedder_name!r}/{active_chunker_name!r}), skipping"
+        if doc is not None:
+            # Clock-free phase probe: read the completed-phases diary (backfilling
+            # legacy completed rows that predate the diary), convert it to the hook
+            # list shape (every entry carries a "phase" key) and let the
+            # ``ingestion_phase_pending`` accumulator registrants — this plugin's
+            # own (phases.py) plus any external one (e.g. MyGRAPH) — compare it
+            # against the CURRENT settings markers/versions and report the stale
+            # phases. No timestamps are used for correctness anywhere.
+            completed = await backfill_completed_phases(doc or {}, list(PHASES.keys()))
+            completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
+            pending = await ccat.plugin_manager.execute_hook(
+                "ingestion_phase_pending", [], source_name, completed_as_list, caller=cat
             )
-            continue
-
-        if doc_status == IngestionStatus.COMPLETED.value:
-            if doc_chunker != active_chunker_name:
-                start_phase = PHASE_PARSING_CHUNKING
-            else:
-                start_phase = PHASE_EMBEDDING
-        elif doc_status in (
-            IngestionStatus.UPLOADED.value,
-            IngestionStatus.PROCESSING.value,
-            IngestionStatus.ERROR.value,
-            IngestionStatus.DOWNLOADING.value,
-            IngestionStatus.DOWNLOADED.value,
-        ):
-            # in-flight / stale: resume from the recorded phase (conservative).
-            # A chunker change invalidates even an embedding-phase row: the stored
-            # chunks were produced by the OLD chunker, so a chunk-reuse would keep
-            # stale chunks -> full re-ingest (parsing_chunking) instead.
-            if doc_chunker != active_chunker_name:
-                start_phase = PHASE_PARSING_CHUNKING
-            else:
-                start_phase = doc_phase if doc_phase in (PHASE_EMBEDDING, PHASE_PARSING_CHUNKING) else PHASE_PARSING_CHUNKING
+            pending = [p for p in (pending or []) if p and p.get("phase")]
+            if not pending:
+                # every recorded phase is still fresh against the current settings
+                # -> the source is up to date: skip WITHOUT claiming.
+                log.debug(
+                    f"Agent id: {ccat._id}. Source {source_name}: no stale phases "
+                    f"(diary {sorted(completed)}), skipping"
+                )
+                continue
+            start_phase = pending[0]["phase"]
         else:
-            # no doc or unknown: embedding if reusable points exist, else full re-ingest
+            # no status doc: no diary, so the probe has nothing to compare against.
+            # Fall back to the legacy heuristic: embedding if reusable points exist
+            # (chunk-reuse), else a full re-ingest from parsing_chunking.
             has_points = any(
                 (p.payload or {}).get("metadata", {}).get("source") == source_name
                 for p in existing_points

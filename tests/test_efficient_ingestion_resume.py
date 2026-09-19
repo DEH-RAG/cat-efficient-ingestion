@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from cat.plugins.cat_efficient_ingestion import reembed
 from cat.plugins.cat_efficient_ingestion import resume
 from cat.plugins.cat_efficient_ingestion import plugin as ingestion_plugin
 from cat.plugins.cat_efficient_ingestion.reconcile import reconcile_agent
@@ -755,3 +756,193 @@ async def test_resume_parsing_phase_reads_file_and_cleans_orphan_images(cheshire
     doc = await get_status(agent_key, "agent", "doc.pdf")
     assert doc is not None
     assert doc["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Phase-machine probe wiring in reembed_sources (phase-configs/timestamps, Todo 5)
+#
+# These tests pin that reembed_sources now decides the start phase through the
+# clock-free ``ingestion_phase_pending`` probe instead of the
+# embedder_name/chunker_name comparison:
+#   (a) a completed row whose diary is fresh (probe returns []) is SKIPPED
+#       without claiming;
+#   (b) an embedder settings change (probe returns [{"phase": "embedding"}])
+#       claims the completed row and re-runs the embedding phase;
+#   (c) a source with NO status doc has no diary to probe -> the legacy
+#       heuristic fallback (embedding when reusable points exist);
+#   (d) malformed probe results (None / entries without "phase") never crash.
+# The probe contract itself (the registrant deciding staleness) is covered in
+# test_ingestion_phase_pending.py; here the hook result is controlled and we
+# pin reembed_sources' use of it: conversion to the list shape, skip-vs-claim
+# and the start_phase hand-off.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEmbedder:
+    name = "test-embedder"
+    size = 384
+
+
+def _stored_source(name):
+    from cat.looking_glass.models import StoredSourceWithMetadata
+
+    return StoredSourceWithMetadata(name=name, path=name, content=None, metadata={})
+
+
+def _stub_reembed_env(monkeypatch, cheshire_cat, existing_points, pending_result):
+    """Point ``reembed_sources`` at a deterministic environment.
+
+    - a fake embedder/chunker so name resolution never hits the real factory;
+    - a controlled ``get_all_tenant_points`` (the reuse heuristic reads it);
+    - a fake ``plugin_manager.execute_hook`` that returns ``pending_result``
+      for ``ingestion_phase_pending`` (recording the probe call) and ``[]``
+      for everything else;
+    - a no-op ``_embed_phase`` so the embedding body never touches vectors.
+
+    Returns a ``{"probe": [(args, kwargs), ...]}`` call record.
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(cheshire_cat, "embedder", AsyncMock(return_value=_FakeEmbedder()))
+    monkeypatch.setattr(cheshire_cat, "chunker", SimpleNamespace(name="test-chunker"))
+    monkeypatch.setattr(
+        cheshire_cat.vector_memory_handler, "get_all_tenant_points",
+        AsyncMock(return_value=(existing_points, None)),
+    )
+
+    calls = {"probe": []}
+
+    async def fake_execute_hook(name, *args, **kwargs):
+        if name == "ingestion_phase_pending":
+            calls["probe"].append((args, kwargs))
+            return pending_result
+        return []
+
+    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
+    monkeypatch.setattr(reembed, "_embed_phase", AsyncMock(return_value=[]))
+    return calls
+
+
+def _point(source_name):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(payload={"metadata": {"source": source_name}})
+
+
+async def test_reembed_skips_fresh_completed_without_claiming(cheshire_cat, monkeypatch):
+    """(a) A completed row whose diary is fresh -> the probe reports nothing
+    pending and the source is skipped WITHOUT being claimed."""
+    agent_key = cheshire_cat.agent_key
+    source = "fresh_done.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases={
+            "parsing_chunking": {"marker": "pc1", "settings_version": "v1", "deps": {}},
+            "embedding": {
+                "marker": "em1", "settings_version": "v1",
+                "deps": {"parsing_chunking": "pc1"},
+            },
+        },
+    )
+
+    calls = _stub_reembed_env(monkeypatch, cheshire_cat, existing_points=[], pending_result=[])
+
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    # the probe ran once, fed with the diary converted to the hook list shape
+    # (every entry carries a "phase" key, in addition to marker/version/deps)
+    assert len(calls["probe"]) == 1
+    completed_as_list = calls["probe"][0][0][2]
+    assert {e["phase"] for e in completed_as_list} == {"parsing_chunking", "embedding"}
+
+    # skipped without claiming: the doc is untouched, no resume_owner marker
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "completed"
+    assert "resume_owner" not in doc
+
+
+async def test_reembed_claims_completed_when_embedding_pending(cheshire_cat, monkeypatch):
+    """(b) An embedder settings change (probe -> [{"phase": "embedding"}])
+    claims the completed row and hands the machine the embedding phase."""
+    agent_key = cheshire_cat.agent_key
+    source = "needs_reembed.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases={
+            "parsing_chunking": {"marker": "pc1", "settings_version": "v1", "deps": {}},
+            "embedding": {
+                # marker differs from the current one -> embedding stale
+                "marker": "em_old", "settings_version": "v1",
+                "deps": {"parsing_chunking": "pc1"},
+            },
+        },
+    )
+
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=[{"phase": "embedding"}],
+    )
+
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    assert len(calls["probe"]) == 1
+    doc = await get_status(agent_key, "agent", source)
+    # claimed (processing + owner) and running the embedding phase
+    assert doc is not None
+    assert doc["status"] == "processing"
+    assert doc["resume_owner"] is not None
+    assert doc["phase"] == "embedding"
+    assert doc["embedder_name"] == "test-embedder"
+
+
+async def test_reembed_no_doc_fallback_embedding_when_points_exist(cheshire_cat, monkeypatch):
+    """(c) A source with NO status doc has no diary -> no probe is run; the
+    legacy fallback picks ``embedding`` because reusable points exist."""
+    agent_key = cheshire_cat.agent_key
+    source = "orphan_points.pdf"
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=[],
+    )
+
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    # no doc -> the probe is never invoked; the fallback starts the embedding
+    # phase (which writes the processing/embedding row on its way).
+    assert calls["probe"] == []
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["phase"] == "embedding"
+    # no doc -> no claim (claim_source_for_resume only runs with an existing row)
+    assert "resume_owner" not in doc
+
+
+async def test_reembed_malformed_pending_does_not_crash(cheshire_cat, monkeypatch):
+    """(d) Adversarial: a probe returning None or entries without a "phase" key
+    is treated as nothing pending -> skip, never a crash."""
+    agent_key = cheshire_cat.agent_key
+    source = "weird_pending.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases={
+            "parsing_chunking": {"marker": "pc1", "settings_version": "v1", "deps": {}},
+            "embedding": {
+                "marker": "em1", "settings_version": "v1",
+                "deps": {"parsing_chunking": "pc1"},
+            },
+        },
+    )
+
+    for malformed in (None, [{"foo": 1}], [None, {"phase": None}]):
+        calls = _stub_reembed_env(
+            monkeypatch, cheshire_cat, existing_points=[], pending_result=malformed
+        )
+        await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+        # filtered down to nothing -> skipped without claiming
+        doc = await get_status(agent_key, "agent", source)
+        assert doc["status"] == "completed"
+        assert "resume_owner" not in doc
+        assert len(calls["probe"]) == 1
