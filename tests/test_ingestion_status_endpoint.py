@@ -256,3 +256,111 @@ async def test_delete_status_not_found(secure_client, secure_client_headers, che
     )
     assert response.status_code == 200
     assert response.json() == {"deleted": False, "reason": "not_found"}
+
+
+# ---------------------------------------------------------------------------
+# /ingestion/settings (engine configuration, SYSTEM READ/WRITE)
+# ---------------------------------------------------------------------------
+
+CONFIG_NAME = "EfficientIngestionConfiguration"
+
+
+async def test_settings_list_returns_defaults(secure_client, secure_client_headers, cheshire_cat):
+    """GET /ingestion/settings lists the allowed engines with scheme and the
+    effective selection; a never-saved engine has an empty value."""
+    response = await secure_client.get("/ingestion/settings", headers=secure_client_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert "settings" in body
+    assert "selected_configuration" in body
+    assert body["selected_configuration"] == CONFIG_NAME
+    names = [s["name"] for s in body["settings"]]
+    assert CONFIG_NAME in names
+    entry = next(s for s in body["settings"] if s["name"] == CONFIG_NAME)
+    assert entry["value"] == {}  # never saved -> defaults
+    assert "scheme" in entry
+    assert entry["scheme"]["title"] == CONFIG_NAME
+
+
+async def test_put_setting_persists_and_round_trips(secure_client, secure_client_headers, cheshire_cat):
+    """PUT persists the config (and selects it); GET after PUT round-trips."""
+    payload = {"ingestion_max_concurrency": 7}
+    response = await secure_client.put(
+        f"/ingestion/settings/{CONFIG_NAME}", json=payload, headers=secure_client_headers
+    )
+    assert response.status_code == 200
+    assert response.json() == {"name": CONFIG_NAME, "value": payload}
+
+    # list reflects the saved value and the selection
+    response = await secure_client.get("/ingestion/settings", headers=secure_client_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_configuration"] == CONFIG_NAME
+    entry = next(s for s in body["settings"] if s["name"] == CONFIG_NAME)
+    assert entry["value"] == payload
+
+    # single-setting GET round-trips the same value
+    response = await secure_client.get(f"/ingestion/settings/{CONFIG_NAME}", headers=secure_client_headers)
+    assert response.status_code == 200
+    single = response.json()
+    assert single["name"] == CONFIG_NAME
+    assert single["value"] == payload
+    assert "scheme" in single
+
+
+async def test_get_setting_unknown_name_rejected(secure_client, secure_client_headers, cheshire_cat):
+    """GET of an unknown engine configuration is rejected (reference behavior:
+    CustomValidationException -> 400)."""
+    response = await secure_client.get("/ingestion/settings/NoSuchEngine", headers=secure_client_headers)
+    assert response.status_code == 400
+    assert "NoSuchEngine" in response.json()["detail"]
+
+
+async def test_put_setting_unknown_name_404(secure_client, secure_client_headers, cheshire_cat):
+    """PUT of an unknown engine configuration -> 404 (CustomNotFoundException)."""
+    response = await secure_client.put(
+        "/ingestion/settings/NoSuchEngine", json={}, headers=secure_client_headers
+    )
+    assert response.status_code == 404
+    assert "NoSuchEngine" in response.json()["detail"]
+
+
+async def test_put_setting_invalid_body_400(secure_client, secure_client_headers, cheshire_cat):
+    """PUT with a type-mismatched field is rejected with 400, no crash."""
+    response = await secure_client.put(
+        f"/ingestion/settings/{CONFIG_NAME}",
+        json={"ingestion_max_concurrency": "not-an-int"},
+        headers=secure_client_headers,
+    )
+    assert response.status_code == 400
+    assert "detail" in response.json()
+
+
+async def test_put_setting_non_dict_body_400(secure_client, secure_client_headers, cheshire_cat):
+    """PUT with a non-object body is rejected with 400 (request validation)."""
+    response = await secure_client.put(
+        f"/ingestion/settings/{CONFIG_NAME}",
+        content='"just a string"',
+        headers=secure_client_headers,
+    )
+    assert response.status_code == 400
+
+
+async def test_settings_forbidden_without_system_permission(
+    secure_client, secure_client_headers, client, cheshire_cat
+):
+    """Default user has only CHAT:WRITE: SYSTEM READ/WRITE endpoints are 403."""
+    data = await create_new_user(secure_client, headers=secure_client_headers)
+    res = await client.post("/auth/token", json={"username": data["username"], "password": new_user_password})
+    received_token = res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {received_token}", "X-Agent-ID": agent_id}
+
+    response = await client.get("/ingestion/settings", headers=headers)
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Forbidden"
+
+    response = await client.put(
+        f"/ingestion/settings/{CONFIG_NAME}", json={}, headers=headers
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Forbidden"
