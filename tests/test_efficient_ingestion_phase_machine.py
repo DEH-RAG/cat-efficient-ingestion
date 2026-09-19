@@ -56,15 +56,22 @@ def _point(source_name):
     return SimpleNamespace(payload={"metadata": {"source": source_name}})
 
 
-def _stub_reembed_env(monkeypatch, cheshire_cat, existing_points, pending_result):
+def _stub_reembed_env(
+    monkeypatch, cheshire_cat, existing_points, pending_result,
+    run_result=None, diary_fresh_phases=None,
+):
     """Point ``reembed_sources`` at a deterministic environment.
 
     The ``ingestion_phase_pending`` probe is DIARY-AWARE: a phase in
     ``pending_result`` is reported stale until its diary entry carries marker
     ``"test-marker"`` (the fixed ``ingestion_phase_settings_marker`` result) —
     exactly like the real clock-free registrant, so the loop re-probe after a
-    recorded phase returns empty without a hand-rolled script. Phase bodies are
-    faked and counted, so the machine never touches vectors.
+    recorded phase returns empty without a hand-rolled script. Phases listed in
+    ``diary_fresh_phases`` are treated as EXTERNAL (no marker): fresh as soon as
+    ANY diary entry exists for them. Phase bodies are faked and counted, so the
+    machine never touches vectors. ``run_result`` (value or callable) is the
+    ``ingestion_phase_run`` result; ``None`` (default) means the hook is
+    unimplemented, exactly like the no-op registrant.
     """
     from types import SimpleNamespace
 
@@ -87,8 +94,9 @@ def _stub_reembed_env(monkeypatch, cheshire_cat, existing_points, pending_result
     monkeypatch.setattr(cheshire_cat.file_manager, "read_file", lambda source, remote: b"fake content")
     monkeypatch.setattr(cheshire_cat.file_manager, "remove_file", lambda path: True)
 
-    calls: dict[str, Any] = {"probe": [], "parse_calls": 0, "embed_calls": 0}
+    calls: dict[str, Any] = {"probe": [], "parse_calls": 0, "embed_calls": 0, "run": []}
     base_pending = list(pending_result or [])
+    diary_fresh = set(diary_fresh_phases or [])
 
     async def fake_parse_and_chunk(ccat, rabbit_hole, source, file_bytes, content_type, cat):
         calls["parse_calls"] += 1
@@ -103,13 +111,23 @@ def _stub_reembed_env(monkeypatch, cheshire_cat, existing_points, pending_result
             calls["probe"].append((args, kwargs))
             completed = args[2]
             diary = {e["phase"]: e for e in completed if isinstance(e, dict)}
-            return [
-                p for p in base_pending
-                if not isinstance(diary.get(p["phase"]), dict)
-                or diary[p["phase"]].get("marker") != "test-marker"
-            ]
+            out = []
+            for p in base_pending:
+                entry = diary.get(p["phase"])
+                if p["phase"] in diary_fresh:
+                    # external phases carry no marker: fresh once recorded
+                    if not isinstance(entry, dict):
+                        out.append(p)
+                elif not isinstance(entry, dict) or entry.get("marker") != "test-marker":
+                    out.append(p)
+            return out
         if name == "ingestion_phase_settings_marker":
             return "test-marker"
+        if name == "ingestion_phase_run":
+            calls["run"].append((args, kwargs))
+            if callable(run_result):
+                return run_result(*args, **kwargs)
+            return run_result
         return []
 
     monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", fake_execute_hook)
@@ -359,3 +377,175 @@ async def test_machine_double_completed_write_is_harmless(cheshire_cat, monkeypa
     assert writes == []
     doc = await get_status(agent_key, "agent", source)
     assert doc["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Todo 7: EXTERNAL phase dispatch through the ``ingestion_phase_run`` hook
+# ---------------------------------------------------------------------------
+# (a) a fake ``ingestion_phase_run`` returning ``{"status": "done"}`` records
+#     the external phase in the diary and the machine proceeds to COMPLETED;
+# (b) ``{"status": "not_ready", "retry_after": 0}`` retries then succeeds;
+# (c) ``not_ready`` beyond the retry bound -> row ERROR (no infinite loop);
+# (d) a raise -> row ERROR (fail-hard, never silent success);
+# (e) an unimplemented external phase (hook returns None) -> ERROR.
+
+
+def _external_pending(phase="graphrag_index"):
+    return [{"phase": phase}]
+
+
+async def test_machine_external_phase_done_records_and_completes(cheshire_cat, monkeypatch):
+    agent_key = cheshire_cat.agent_key
+    source = "external_done.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases=_completed_diary(parsing_marker="pc1", embedding_marker="em1"),
+    )
+
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=_external_pending(),
+        run_result={"status": "done"},
+        diary_fresh_phases={"graphrag_index"},
+    )
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "completed"
+    assert "phase" not in doc  # terminal write cleared the work phase
+
+    # the external phase is recorded in the diary (minimal entry) and the
+    # re-probe emptied -> COMPLETED (stale-state protection)
+    diary = get_completed_phases(doc)
+    assert set(diary) == {"parsing_chunking", "embedding", "graphrag_index"}
+    assert diary["graphrag_index"] == {"marker": None, "settings_version": None, "deps": {}}
+    assert diary["parsing_chunking"]["marker"] == "pc1"  # untouched
+
+    # the run hook was invoked exactly once with (phase, source, completed_list)
+    assert len(calls["run"]) == 1
+    phase_arg, source_arg, completed_list = calls["run"][0][0]
+    assert phase_arg == "graphrag_index"
+    assert source_arg == source
+    assert {e["phase"] for e in completed_list} == {"parsing_chunking", "embedding"}
+
+    # decision probe + re-probe after recording
+    assert len(calls["probe"]) == 2
+
+
+async def test_machine_external_phase_not_ready_retries_then_succeeds(cheshire_cat, monkeypatch):
+    agent_key = cheshire_cat.agent_key
+    source = "external_retry.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases=_completed_diary(parsing_marker="pc1", embedding_marker="em1"),
+    )
+
+    attempts = {"n": 0}
+
+    def flaky_run(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return {"status": "not_ready", "retry_after": 0}
+        return {"status": "done"}
+
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=_external_pending(),
+        run_result=flaky_run,
+        diary_fresh_phases={"graphrag_index"},
+    )
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "completed"
+    assert attempts["n"] == 3  # not_ready twice, done on the third attempt
+    assert "graphrag_index" in get_completed_phases(doc)
+
+
+async def test_machine_external_phase_not_ready_beyond_bound_is_error(cheshire_cat, monkeypatch):
+    agent_key = cheshire_cat.agent_key
+    source = "external_stuck.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases=_completed_diary(parsing_marker="pc1", embedding_marker="em1"),
+    )
+
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=_external_pending(),
+        run_result={"status": "not_ready", "retry_after": 0},
+        diary_fresh_phases={"graphrag_index"},
+    )
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "error"
+    assert "not ready" in doc["error"]
+
+    # bounded: exactly MAX_RETRIES + 1 attempts, no infinite loop
+    assert len(calls["run"]) == reembed._PHASE_RUN_MAX_RETRIES + 1
+
+    # atomic-completion invariant: the never-completed external phase has NO
+    # diary entry
+    assert "graphrag_index" not in get_completed_phases(doc)
+
+
+async def test_machine_external_phase_raise_is_error(cheshire_cat, monkeypatch):
+    agent_key = cheshire_cat.agent_key
+    source = "external_raise.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases=_completed_diary(parsing_marker="pc1", embedding_marker="em1"),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("external boom")
+
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=_external_pending(),
+        run_result=boom,
+        diary_fresh_phases={"graphrag_index"},
+    )
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "error"
+    assert doc["error"] == "external boom"
+    # fail-hard: the phase is NOT recorded, the row is NOT resurrected
+    assert "graphrag_index" not in get_completed_phases(doc)
+    assert len(calls["run"]) == 1  # a raise is a permanent failure, no retry
+
+
+async def test_machine_external_phase_unimplemented_is_error(cheshire_cat, monkeypatch):
+    agent_key = cheshire_cat.agent_key
+    source = "external_none.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases=_completed_diary(parsing_marker="pc1", embedding_marker="em1"),
+    )
+
+    # run_result defaults to None: the hook is unimplemented (no registrant)
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=_external_pending(),
+        diary_fresh_phases={"graphrag_index"},
+    )
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "error"
+    assert "expected a status dict" in doc["error"]
+    # misleading-success guard: None is NEVER treated as success
+    assert "graphrag_index" not in get_completed_phases(doc)
+    assert len(calls["run"]) == 1

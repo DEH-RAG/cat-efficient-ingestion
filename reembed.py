@@ -64,6 +64,11 @@ from .registry import (
 )
 from .split import split_oversized
 
+# Maximum number of ``{"status": "not_ready"}`` retries allowed for ONE
+# external phase before the machine gives up and marks the row ERROR. The
+# bound keeps a stuck external registrant from looping forever.
+_PHASE_RUN_MAX_RETRIES = 5
+
 
 async def _set_status(ccat, source: str, status: IngestionStatus, error: str | None = None, chat_id: str | None = None) -> None:
     """Best-effort status write via the plugin's own registry."""
@@ -380,6 +385,65 @@ async def _probe_pending(ccat, cat, source_name, doc) -> list:
     return [p for p in (pending or []) if p and p.get("phase")]
 
 
+async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> bool:
+    """Dispatch one external (non-``PHASES``) phase through the run hook.
+
+    Handles the tri-state contract of ``ingestion_phase_run`` (hooks.py):
+
+      - ``{"status": "done"}`` -> returns ``True``: the caller records the
+        diary entry and re-probes;
+      - ``{"status": "not_ready", "retry_after": N}`` -> the phase is retried
+        after ``N`` seconds, bounded by ``_PHASE_RUN_MAX_RETRIES`` attempts;
+        exceeding the bound marks the row ERROR and returns ``False``;
+      - ``None``, a raise, or any other return -> FAIL-HARD: the row is marked
+        ERROR and ``False`` is returned. A phase nobody implements is an error,
+        NEVER a silent success (misleading-success guard).
+
+    An ``error`` row is never resurrected: returning ``False`` leaves the
+    absorbing ERROR in place and the caller stops the machine.
+
+    Returns:
+        ``True`` when the phase completed (diary recording is the caller's
+        job); ``False`` when the row was marked ERROR.
+    """
+    doc = await get_status(ccat.agent_key, scope, source_name)
+    completed = await backfill_completed_phases(doc or {}, list(PHASES.keys()))
+    completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
+
+    retries = 0
+    while True:
+        try:
+            result = await ccat.plugin_manager.execute_hook(
+                "ingestion_phase_run", phase, source_name, completed_as_list, caller=cat
+            )
+        except Exception as e:  # noqa: BLE001 - a raising registrant is a permanent failure
+            log.error(
+                f"Agent id: {ccat._id}. External phase {phase} for {source_name} raised: {e}"
+            )
+            await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
+            return False
+
+        if isinstance(result, dict) and result.get("status") == "done":
+            return True
+        if isinstance(result, dict) and result.get("status") == "not_ready":
+            retries += 1
+            if retries > _PHASE_RUN_MAX_RETRIES:
+                msg = f"external phase {phase} not ready after {_PHASE_RUN_MAX_RETRIES} retries"
+                log.error(f"Agent id: {ccat._id}. {msg} for {source_name}")
+                await _set_status(ccat, source_name, IngestionStatus.ERROR, error=msg, chat_id=chat_id)
+                return False
+            retry_after = result.get("retry_after") or 0
+            if retry_after > 0:
+                await asyncio.sleep(retry_after)
+            continue
+
+        # None or any other return: fail-hard (unimplemented / misleading).
+        msg = f"external phase {phase} returned {result!r} (expected a status dict)"
+        log.error(f"Agent id: {ccat._id}. {msg} for {source_name}")
+        await _set_status(ccat, source_name, IngestionStatus.ERROR, error=msg, chat_id=chat_id)
+        return False
+
+
 async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> dict:
     """Record the successful completion of one phase in the diary (atomic).
 
@@ -411,9 +475,15 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
     """
     spec = PHASES.get(phase)
     if spec is None:
-        # unknown (external) phase: no built-in diary entry to write; the
-        # external dispatch owns its own recording (later todo).
-        return await get_status(ccat.agent_key, scope, source_name) or {}
+        # unknown (external) phase: record a minimal diary entry so the
+        # machine can advance past it (no marker / settings version / deps —
+        # the external registrant owns the phase's material inputs). The
+        # atomic-completion invariant still holds: the entry is written ONLY
+        # after the external dispatch reported ``done``.
+        return await record_phase_completed(
+            ccat.agent_key, scope, source_name, phase,
+            marker=None, settings_version=None, deps={},
+        )
 
     marker = await ccat.plugin_manager.execute_hook(
         "ingestion_phase_settings_marker", phase, caller=cat
@@ -777,10 +847,20 @@ async def reembed_sources(
                     )
                 else:
                     # external phase (e.g. MyGRAPH): dispatched through the
-                    # ``ingestion_phase_run`` hook in a later todo. For now the
-                    # machine does NOT advance (no diary entry, no COMPLETED):
-                    # a phase nobody implements must not be recorded as done.
-                    break
+                    # ``ingestion_phase_run`` hook (tri-state, hooks.py).
+                    # A phase nobody implements (hook returns None) fails hard
+                    # — it is an error, never a silent success. A phase that
+                    # reports ``done`` is recorded by the shared ATOMIC
+                    # completion write below and re-probed; ``not_ready`` is
+                    # retried (bounded) and an exceeded bound marks the row
+                    # ERROR. The machine stops on any ERROR (absorbing).
+                    if not await _run_external_phase(
+                        ccat, cat, scope, source_name, phase, chat_id
+                    ):
+                        # the row was marked ERROR (fail-hard / retry bound):
+                        # stop the machine; the ERROR-absorbing check above
+                        # never advances nor resurrects it.
+                        break
 
                 # ---- ATOMIC COMPLETION: record the diary entry (never at
                 # ---- phase start): marker + settings_version + deps ----
