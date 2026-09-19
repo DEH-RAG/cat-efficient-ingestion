@@ -79,6 +79,7 @@ async def set_status(
     chunker_name: str | None = None,
     clear_phase: bool = False,
     extra: Optional[Dict] = None,
+    completed_phases: Optional[Dict] = None,
 ) -> Dict:
     """Write (or update) the ingestion-status doc for a source.
 
@@ -92,6 +93,18 @@ async def set_status(
     never clobber the engine-written phase/embedder/chunker of a row.
     ``clear_phase`` is the explicit way to drop the phase when the source
     reaches a terminal state (e.g. ``completed``).
+
+    **Completed-phases diary**: ``completed_phases`` is a clock-free diary of
+    which work phases completed successfully, keyed by phase id::
+
+        completed_phases: {phase: {"marker": Any, "settings_version": str|None,
+                                   "deps": {upstream_phase: upstream_marker}}}
+
+    It is MERGED by phase: an incoming key replaces only its own entry, every
+    other phase entry is preserved, and a write WITHOUT ``completed_phases``
+    never wipes an existing diary. ``settings_version`` is an OPAQUE copy of
+    the settings entry's ``updated_at``, used only for equality, never as a
+    time; correctness never depends on timestamps.
 
     Args:
         agent_id: The agent (chatbot) id.
@@ -109,6 +122,9 @@ async def set_status(
             only when provided.
         clear_phase: When True, drop the ``phase`` field from the doc.
         extra: Optional extra fields merged into the stored doc.
+        completed_phases: Optional diary updates, merged by phase: each key
+            replaces only its own entry; other phase entries are preserved.
+            Omitted (None) -> the existing diary is left untouched.
 
     Returns:
         The stored status document.
@@ -146,6 +162,15 @@ async def set_status(
         doc.pop("phase", None)
     if extra:
         doc.update(extra)
+    # Completed-phases diary: merge by phase so a re-recorded phase replaces
+    # only its own entry and never clobbers the rest of the diary. The diary
+    # param wins over any legacy `extra` field.
+    if completed_phases:
+        stored = doc.get("completed_phases")
+        diary = dict(stored) if isinstance(stored, dict) else {}
+        for phase_id, entry in completed_phases.items():
+            diary[phase_id] = entry
+        doc["completed_phases"] = diary
     await crud.store(key, doc)
     return doc
 
@@ -160,6 +185,7 @@ async def set_phase(
     chunker_name: str | None = None,
     type_: str = "file",
     chat_id: str | None = None,
+    completed_phases: Optional[Dict] = None,
 ) -> dict:
     """Transition a source into a work phase.
 
@@ -178,6 +204,8 @@ async def set_phase(
         chunker_name: Recorded when provided (used at ``parsing_chunking`` start).
         type_: ``"file"`` or ``"url"``.
         chat_id: The conversation id, when chat-scoped.
+        completed_phases: Optional diary updates, forwarded to
+            :func:`set_status` (merged by phase, see there).
 
     Returns:
         The stored status document.
@@ -192,12 +220,96 @@ async def set_phase(
         phase=phase,
         embedder_name=embedder_name,
         chunker_name=chunker_name,
+        completed_phases=completed_phases,
     )
 
 
 async def get_status(agent_id: str, scope: str, source: str) -> Optional[Dict]:
     """Read the ingestion-status doc for a source, or None if absent."""
     return await _read_doc(status_key(agent_id, scope, source))
+
+
+def get_completed_phases(doc: Optional[Dict]) -> dict:
+    """Return the completed-phases diary of a status doc, or ``{}``.
+
+    Clock-free diary of which work phases completed successfully, keyed by
+    phase id::
+
+        {phase: {"marker": Any, "settings_version": str|None,
+                 "deps": {upstream_phase: upstream_marker}}}
+
+    ``marker`` is the plugin-defined marker of the settings the phase ran
+    with; ``settings_version`` is an OPAQUE copy of the settings entry's
+    ``updated_at`` (used only for equality, never as a time); ``deps`` maps
+    each upstream phase to the marker it ran with. No timestamps are used for
+    correctness.
+
+    Args:
+        doc: The status document (as returned by :func:`get_status`), or None.
+
+    Returns:
+        The diary dict, or ``{}`` when absent or malformed.
+    """
+    if not doc:
+        return {}
+    diary = doc.get("completed_phases")
+    return diary if isinstance(diary, dict) else {}
+
+
+async def record_phase_completed(
+    agent_id: str,
+    scope: str,
+    source: str,
+    phase: str,
+    *,
+    marker: object = None,
+    settings_version: Optional[str] = None,
+    deps: Optional[Dict] = None,
+) -> dict:
+    """Record the successful completion of one work phase in the diary.
+
+    Writes the entry ``{phase: {"marker": marker, "settings_version":
+    settings_version, "deps": deps or {}}}`` into the status doc's
+    ``completed_phases`` diary, merging by phase (re-recording the same phase
+    replaces only its own entry). Uses the plugin-defined ``marker`` only; no
+    full settings fingerprint is stored. ``settings_version`` is an OPAQUE
+    copy of the settings entry's ``updated_at`` used only for equality, never
+    as a time — no timestamps are used for correctness.
+
+    **ATOMIC COMPLETION INVARIANT**: the diary entry is written ONLY on
+    successful completion of the phase, in a single atomic write — NEVER at
+    phase start. A phase interrupted by a restart therefore has no entry and
+    is re-run on recovery.
+
+    Args:
+        agent_id: The agent (chatbot) id.
+        scope: ``"agent"`` or a conversation ``chat_id``.
+        source: The ingested file name or URL.
+        phase: The phase id that completed (e.g. ``parsing_chunking``).
+        marker: The plugin-defined marker of the settings the phase ran with.
+        settings_version: Opaque copy of the settings entry's ``updated_at``.
+        deps: ``{upstream_phase: upstream_marker}`` of the phases this phase
+            consumed. ``None``/missing upstreams are stored as ``{}``.
+
+    Returns:
+        The stored status document. A malformed (missing/invalid) ``phase``
+        is a no-op that never crashes and returns the current doc (or ``{}``).
+    """
+    if not phase or not isinstance(phase, str):
+        return await get_status(agent_id, scope, source) or {}
+    entry = {
+        "marker": marker,
+        "settings_version": settings_version,
+        "deps": deps or {},
+    }
+    return await set_status(
+        agent_id,
+        scope,
+        source,
+        type_="file",
+        status=IngestionStatus.PROCESSING,
+        completed_phases={phase: entry},
+    )
 
 
 async def claim_source_for_resume(

@@ -1,16 +1,20 @@
 """Tests for the phase-aware ingestion-status registry.
 
 Covers ``set_phase``, the merge semantics of ``set_status`` (phase /
-embedder_name / chunker_name are only updated when provided), and the
-``claim_completed`` mode of ``claim_source_for_resume`` (engine re-embed of
-completed rows). Uses the autouse Redis db=1 fixture.
+embedder_name / chunker_name are only updated when provided), the clock-free
+``completed_phases`` diary (``record_phase_completed`` /
+``get_completed_phases``), and the ``claim_completed`` mode of
+``claim_source_for_resume`` (engine re-embed of completed rows). Uses the
+autouse Redis db=1 fixture.
 """
 from cat.plugins.cat_efficient_ingestion.registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
     IngestionStatus,
     claim_source_for_resume,
+    get_completed_phases,
     get_status,
+    record_phase_completed,
     set_phase,
     set_status,
 )
@@ -108,3 +112,132 @@ async def test_claim_completed_does_not_bypass_in_flight_guard():
         "agent_1", "agent", "doc.pdf", stale_after=3600.0, owner="engine", claim_completed=True,
     )
     assert claimed is None
+
+
+# ---------------------------------------------------------------------------
+# Clock-free completed_phases diary (record_phase_completed / get_completed_phases)
+# ---------------------------------------------------------------------------
+
+
+async def test_completed_phases_two_phases_persist():
+    # record parsing_chunking then embedding, with distinct markers + deps
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_PARSING_CHUNKING,
+        marker="chunker-v1", settings_version="t1",
+    )
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_EMBEDDING,
+        marker="emb-v1", settings_version="t2",
+        deps={PHASE_PARSING_CHUNKING: "chunker-v1"},
+    )
+
+    doc = await get_status("agent_1", "agent", "diary.pdf")
+    diary = get_completed_phases(doc)
+    assert set(diary) == {PHASE_PARSING_CHUNKING, PHASE_EMBEDDING}
+    assert diary[PHASE_PARSING_CHUNKING] == {
+        "marker": "chunker-v1", "settings_version": "t1", "deps": {},
+    }
+    assert diary[PHASE_EMBEDDING] == {
+        "marker": "emb-v1", "settings_version": "t2",
+        "deps": {PHASE_PARSING_CHUNKING: "chunker-v1"},
+    }
+
+
+async def test_completed_phases_rerecord_replaces_only_own_entry():
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_PARSING_CHUNKING,
+        marker="chunker-v1", settings_version="t1",
+    )
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_EMBEDDING,
+        marker="emb-v1", settings_version="t2",
+    )
+    # re-record ONLY embedding with a new marker -> its entry is replaced,
+    # parsing_chunking preserved, diary still has exactly two entries
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_EMBEDDING,
+        marker="emb-v2", settings_version="t3",
+    )
+
+    doc = await get_status("agent_1", "agent", "diary.pdf")
+    diary = get_completed_phases(doc)
+    assert set(diary) == {PHASE_PARSING_CHUNKING, PHASE_EMBEDDING}
+    assert diary[PHASE_EMBEDDING]["marker"] == "emb-v2"
+    assert diary[PHASE_EMBEDDING]["settings_version"] == "t3"
+    assert diary[PHASE_PARSING_CHUNKING]["marker"] == "chunker-v1"
+    assert diary[PHASE_PARSING_CHUNKING]["settings_version"] == "t1"
+
+
+async def test_completed_phases_preserved_by_lifecycle_write():
+    # a lifecycle write WITHOUT completed_phases must not wipe the diary
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_PARSING_CHUNKING,
+        marker="chunker-v1", settings_version="t1",
+    )
+    await set_status(
+        "agent_1", "agent", "diary.pdf",
+        type_="file", status=IngestionStatus.COMPLETED,
+    )
+
+    doc = await get_status("agent_1", "agent", "diary.pdf")
+    assert doc["status"] == IngestionStatus.COMPLETED.value
+    diary = get_completed_phases(doc)
+    assert diary == {
+        PHASE_PARSING_CHUNKING: {
+            "marker": "chunker-v1", "settings_version": "t1", "deps": {},
+        }
+    }
+
+
+async def test_completed_phases_survive_clear_phase():
+    # clear_phase only drops `phase`; the diary is a separate field and stays
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_EMBEDDING,
+        marker="emb-v1", settings_version="t2",
+    )
+    await set_status(
+        "agent_1", "agent", "diary.pdf",
+        type_="file", status=IngestionStatus.COMPLETED,
+        clear_phase=True,
+    )
+
+    doc = await get_status("agent_1", "agent", "diary.pdf")
+    assert "phase" not in doc
+    diary = get_completed_phases(doc)
+    assert diary == {
+        PHASE_EMBEDDING: {"marker": "emb-v1", "settings_version": "t2", "deps": {}},
+    }
+
+
+async def test_completed_phases_deps_none_defaults_empty():
+    await record_phase_completed(
+        "agent_1", "agent", "diary.pdf", PHASE_EMBEDDING, marker="emb-v1",
+    )
+    doc = await get_status("agent_1", "agent", "diary.pdf")
+    assert get_completed_phases(doc)[PHASE_EMBEDDING]["deps"] == {}
+
+
+async def test_completed_phases_invalid_phase_is_noop():
+    # missing/invalid phase -> no crash, no entry
+    captured = await record_phase_completed("agent_1", "agent", "diary.pdf", None, marker="x")
+    assert captured == {}
+    assert await get_status("agent_1", "agent", "diary.pdf") is None
+
+    await record_phase_completed("agent_1", "agent", "diary.pdf", "", marker="x")
+    assert await get_status("agent_1", "agent", "diary.pdf") is None
+
+
+async def test_set_phase_forwards_completed_phases():
+    # set_phase accepts and forwards the diary updates
+    await set_phase(
+        "agent_1", "agent", "diary.pdf", PHASE_EMBEDDING,
+        embedder_name="emb-v2",
+        completed_phases={
+            PHASE_PARSING_CHUNKING: {
+                "marker": "chunker-v1", "settings_version": "t1", "deps": {},
+            }
+        },
+    )
+    doc = await get_status("agent_1", "agent", "diary.pdf")
+    assert doc["phase"] == PHASE_EMBEDDING
+    assert get_completed_phases(doc)[PHASE_PARSING_CHUNKING]["marker"] == "chunker-v1"
