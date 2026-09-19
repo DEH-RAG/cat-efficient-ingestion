@@ -19,17 +19,70 @@ Lifecycle states: `uploaded → processing → completed | error`, with `downloa
 
 Sources are claimed under a **per-source distributed lock**, so different sources of the same agent are ingested concurrently while the same source is never processed twice by two workers. A heartbeat keeps the `processing` row fresh while it is being handled, so live work is never stolen by another replica.
 
+<h2>🧭 Clock-free two-level phase invalidation</h2>
+
+The plugin decides whether a source must be re-run with a **clock-free** model: no timestamps are ever used for correctness. Each status document carries a `completed_phases` diary, keyed by phase id:
+
+```
+completed_phases: {phase: {"marker": Any, "settings_version": str|None,
+                           "deps": {upstream_phase: upstream_marker}}}
+```
+
+- `marker` is the plugin-defined marker of the settings the phase ran with;
+- `settings_version` is an **opaque** copy of the settings entry's `updated_at`, used only for equality, never as a time;
+- `deps` maps each upstream phase to the marker it ran with.
+
+A phase is stale when any of these hold:
+
+- **(a) dependency**: an upstream in its `depends_on` is missing from the diary, or the recorded `deps[upstream]` differs from the upstream's current diary `marker` (the upstream re-ran, so this phase must re-run too);
+- **(b) settings fast-path**: the settings entry for the phase's category was **not** rewritten since the phase ran (`settings_version` equals the current entry's `updated_at`, compared as an opaque token) → FRESH, no marker comparison needed;
+- **(c) slow-path**: the plugin-defined marker from `ingestion_phase_settings_marker` differs from the recorded `marker` (the settings entry *was* rewritten; the phase-owning plugin decides whether the change is material).
+
+The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) → `embedding` (depends on the embedder settings **and** the recorded `parsing_chunking` marker). So an embedder-only change re-runs only `embedding`, while a chunker change re-runs `parsing_chunking` first and `embedding` follows on the next probe.
+
+**Atomic-completion invariant**: a phase's diary entry is written **only** on successful completion, in a single atomic write, never at phase start. A phase interrupted by a restart therefore has no entry and is re-run on recovery.
+
+<h2>🔌 Phase hooks</h2>
+
+The phase machine is extensible through four hooks declared in the plugin itself (`hooks.py`, `@hook(priority=0)`), so external plugins can override them with higher priorities — no MyCAT core change is needed. The `completed_phases` argument threaded through the hooks is a `list[dict]` where every entry carries at least a `"phase"` key (MyGRAPH-compatible), plus optional `marker`/`deps` keys.
+
+- **`ingestion_phase_pending(pending, source, completed_phases, cat)`** — accumulator of stale phases for a source. Each registrant appends the `{"phase": <id>, ...}` entries it considers stale and returns the extended list. The default is the identity (nothing pending).
+- **`ingestion_phase_run(phase, source, completed_phases, cat)`** — runs one phase with a tri-state contract: return `{"status": "done"}` on success, `{"status": "not_ready", "retry_after": N}` when retriable but not yet runnable (the machine retries after `N` seconds), or raise on permanent failure. The default returns `None`, which the machine treats as fail-hard / unimplemented: a phase with no registrant is an error, never a silent success.
+- **`before_ingestion_status_completed(source, cat)`** — final gate before a source is marked COMPLETED. A registrant raises to force the source to ERROR instead; the default is a no-op.
+- **`ingestion_phase_settings_marker(phase, cat)`** — the plugin-defined material marker for a phase, compared against the recorded diary `marker` to decide whether the phase's settings changed materially. The default returns `None` ("unknown"), which the machine treats conservatively as stale.
+
+An external phase plugin (e.g. MyGRAPH) registers by overriding `ingestion_phase_pending` to report its phases stale and `ingestion_phase_run` to execute them; the machine dispatches any phase not in its built-in `PHASES` through the run hook and records a minimal diary entry once it reports `done`.
+
+<h2>🔁 Probe-driven dispatcher</h2>
+
+`reembed_sources` is the one probe-driven dispatcher. For each source it reads the `completed_phases` diary (backfilling legacy completed rows), converts it to the hook list shape and threads it into the `ingestion_phase_pending` accumulator. Registrants compare the diary against the current settings markers/versions and report the stale phases:
+
+- **no stale phases** → the source is up to date and is **skipped without claiming**;
+- **stale phases** → the row is claimed (per-source lock) and the stale phases run **serially**, one at a time in probe order.
+
+After each phase succeeds, its diary entry (`marker` / `settings_version` / `deps`) is recorded **atomically at completion** — never at phase start — and the probe is re-run against the updated diary. When the re-probe is empty, the terminal COMPLETED status is written (after the `before_ingestion_status_completed` gate), with the work phase cleared. An `error` row is never advanced nor resurrected to COMPLETED.
+
+<h2>🛡️ Hardening</h2>
+
+- **Delete-marker cancellation**: deleting an agent writes a persistent marker at `agents:{agent_id}:ingestion:delete` (inside the plugin's own namespace, so the teardown wipe includes it). Every status write, claim, list and clear checks `ingestion_canceled` (marker present **or** the agent's master key gone) and self-aborts. The heartbeat checks the marker on every tick, so a long embedding self-aborts within one interval instead of letting the delete's quiesce-wait time out.
+- **Ghost agents**: an agent whose master key is gone (peripheral keys without a master) is treated as canceled; a `CustomNotFoundException` on resolution is a skip, never a crash.
+- **Completed-row revalidation**: the recovery sweep re-runs the `ingestion_phase_pending` probe read-only for every completed row and only claims the rows whose probe comes back non-empty — a genuinely-fresh completed row is never touched.
+
 <h2>🔌 Endpoints</h2>
 
 - `GET /ingestion/status` — the registry, reconciled against the canonical sources (files on disk, URLs in the vector store, existing conversations); pass `?chat_id=<id>` for a conversation scope. In-flight and `error` entries are never purged; only terminal `completed` entries whose source has vanished are removed.
 - `DELETE /ingestion/status?source=<name>[&scope=<chat_id>]` — dismiss one terminal row (`error` or `completed`); an in-flight source is refused, remove the file to abandon it.
+- `GET /ingestion/settings` — list the available ingestion engines with their schemes and the effective choice (SYSTEM READ).
+- `GET /ingestion/settings/{name}` — settings and scheme of one ingestion engine configuration (SYSTEM READ).
+- `PUT /ingestion/settings/{name}` — update one engine configuration and select it as the engine to run (SYSTEM WRITE). The `ingestion` category holds a single setting (the active engine), so upserting the config replaces it.
 
 <h2>♻️ Recovery sweep</h2>
 
 On `after_lizard_bootstrap` the plugin schedules a fire-and-forget pass (per agent, never blocking bootstrap) that:
 
 1. hands every stale `uploaded` / `processing` / `error` entry back to the phase machine, re-reading the file from disk or re-downloading the URL (entries whose file is gone are marked `error` with the reason);
-2. purges the status entries whose source is absent from the canonical lists.
+2. revalidates `completed` rows through the clock-free probe (see Hardening);
+3. purges the status entries whose source is absent from the canonical lists.
 
 The pass is repeated every `CAT_INGESTION_RESUME_INTERVAL_SECONDS`.
 
