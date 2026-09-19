@@ -50,7 +50,7 @@ from cat.plugins.cat_multimodal_ingestion.ingestion import (
 )
 
 from .ingestion_executor import run_in_ingestion_executor
-from .phases import PHASES
+from .phases import merged_phases
 from .registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
@@ -379,7 +379,9 @@ async def _probe_pending(ccat, cat, source_name, doc) -> list:
     returns the filtered stale phases. Malformed results (None / entries
     without a ``"phase"`` key) are dropped, never raised on.
     """
-    completed = await backfill_completed_phases(doc or {}, list(PHASES.keys()))
+    completed = await backfill_completed_phases(
+        doc or {}, list((await merged_phases(ccat, cat)).keys())
+    )
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
     pending = await ccat.plugin_manager.execute_hook(
         "ingestion_phase_pending", [], source_name, completed_as_list, caller=cat
@@ -409,7 +411,9 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
         job); ``False`` when the row was marked ERROR.
     """
     doc = await get_status(ccat.agent_key, scope, source_name)
-    completed = await backfill_completed_phases(doc or {}, list(PHASES.keys()))
+    completed = await backfill_completed_phases(
+        doc or {}, list((await merged_phases(ccat, cat)).keys())
+    )
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
 
     retries = 0
@@ -455,9 +459,17 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
     - ``marker``: the plugin-defined marker from the
       ``ingestion_phase_settings_marker`` hook;
     - ``settings_version``: the OPAQUE ``updated_at`` of the settings entry for
-      ``PHASES[phase].settings_category`` (used only for equality);
+      ``spec.settings_category`` (used only for equality); ``None`` when the
+      phase declares no settings category;
     - ``deps``: ``{upstream: <current diary marker>}`` for each upstream in
-      ``PHASES[phase].depends_on``, copied from the CURRENT diary.
+      ``spec.depends_on``, copied from the CURRENT diary.
+
+    The spec is looked up in the MERGED phase set (:func:`merged_phases`):
+    built-in ``PHASES`` plus every ``PhaseSpec`` registered through the
+    ``ingestion_phase_specs`` hook. A registered phase therefore gets a REAL
+    marker (from the hook) and its declared ``deps``, exactly like a built-in
+    one; only a truly unknown phase (not in the merged set) falls back to the
+    minimal ``{marker: None, settings_version: None, deps: {}}`` entry.
 
     This is the ONLY diary write for a phase and it happens AFTER the phase
     body succeeded — NEVER at phase start (atomic-completion invariant): a
@@ -475,13 +487,13 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
     Returns:
         The stored status doc (``record_phase_completed`` output).
     """
-    spec = PHASES.get(phase)
+    spec = (await merged_phases(ccat, cat)).get(phase)
     if spec is None:
-        # unknown (external) phase: record a minimal diary entry so the
-        # machine can advance past it (no marker / settings version / deps —
-        # the external registrant owns the phase's material inputs). The
-        # atomic-completion invariant still holds: the entry is written ONLY
-        # after the external dispatch reported ``done``.
+        # truly unknown phase (not in the merged built-in + registered set):
+        # record a minimal diary entry so the machine can advance past it (no
+        # marker / settings version / deps — nobody owns the phase's material
+        # inputs). The atomic-completion invariant still holds: the entry is
+        # written ONLY after the phase body reported ``done``.
         return await record_phase_completed(
             ccat.agent_key, scope, source_name, phase,
             marker=None, settings_version=None, deps={},

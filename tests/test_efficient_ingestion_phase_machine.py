@@ -58,7 +58,7 @@ def _point(source_name):
 
 def _stub_reembed_env(
     monkeypatch, cheshire_cat, existing_points, pending_result,
-    run_result=None, diary_fresh_phases=None,
+    run_result=None, diary_fresh_phases=None, specs_result=None,
 ):
     """Point ``reembed_sources`` at a deterministic environment.
 
@@ -68,10 +68,13 @@ def _stub_reembed_env(
     exactly like the real clock-free registrant, so the loop re-probe after a
     recorded phase returns empty without a hand-rolled script. Phases listed in
     ``diary_fresh_phases`` are treated as EXTERNAL (no marker): fresh as soon as
-    ANY diary entry exists for them. Phase bodies are faked and counted, so the
-    machine never touches vectors. ``run_result`` (value or callable) is the
-    ``ingestion_phase_run`` result; ``None`` (default) means the hook is
-    unimplemented, exactly like the no-op registrant.
+    ANY diary entry exists for them. ``specs_result`` (a list of ``PhaseSpec``)
+    is returned by the ``ingestion_phase_specs`` hook, so ``merged_phases``
+    treats those phases as REGISTERED (real marker + declared deps) instead of
+    unknown. Phase bodies are faked and counted, so the machine never touches
+    vectors. ``run_result`` (value or callable) is the ``ingestion_phase_run``
+    result; ``None`` (default) means the hook is unimplemented, exactly like the
+    no-op registrant.
     """
     from types import SimpleNamespace
 
@@ -97,6 +100,7 @@ def _stub_reembed_env(
     calls: dict[str, Any] = {"probe": [], "parse_calls": 0, "embed_calls": 0, "run": []}
     base_pending = list(pending_result or [])
     diary_fresh = set(diary_fresh_phases or [])
+    specs = list(specs_result or [])
 
     async def fake_parse_and_chunk(ccat, rabbit_hole, source, file_bytes, content_type, cat):
         calls["parse_calls"] += 1
@@ -107,6 +111,8 @@ def _stub_reembed_env(
         return []
 
     async def fake_execute_hook(name, *args, **kwargs):
+        if name == "ingestion_phase_specs":
+            return specs
         if name == "ingestion_phase_pending":
             calls["probe"].append((args, kwargs))
             completed = args[2]
@@ -548,4 +554,94 @@ async def test_machine_external_phase_unimplemented_is_error(cheshire_cat, monke
     assert "expected a status dict" in doc["error"]
     # misleading-success guard: None is NEVER treated as success
     assert "graphrag_index" not in get_completed_phases(doc)
+    assert len(calls["run"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# (f) REGISTERED phases (ingestion_phase_specs) get a REAL diary entry
+# ---------------------------------------------------------------------------
+
+
+def _registered_specs(phase="fake_phase", settings_category="fake_settings",
+                      depends_on=("parsing_chunking", "embedding")):
+    from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
+
+    return [PhaseSpec(phase, settings_category, depends_on)]
+
+
+async def test_machine_registered_phase_records_real_marker_and_deps(cheshire_cat, monkeypatch):
+    """A phase registered via ``ingestion_phase_specs`` is recorded like a
+    built-in: REAL marker from ``ingestion_phase_settings_marker`` (not None)
+    and ``deps`` copied from the CURRENT diary upstream markers."""
+    agent_key = cheshire_cat.agent_key
+    source = "registered_done.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases=_completed_diary(parsing_marker="pc1", embedding_marker="em1"),
+    )
+
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=[{"phase": "fake_phase"}],
+        run_result={"status": "done"},
+        specs_result=_registered_specs(),
+    )
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "completed"
+
+    diary = get_completed_phases(doc)
+    assert set(diary) == {"parsing_chunking", "embedding", "fake_phase"}
+    entry = diary["fake_phase"]
+    # REAL marker from the settings-marker hook, NOT the None fallback
+    assert entry["marker"] == "test-marker"
+    # deps reference the upstream markers from the CURRENT diary
+    assert entry["deps"] == {"parsing_chunking": "pc1", "embedding": "em1"}
+    assert "settings_version" in entry
+    # upstream entries untouched
+    assert diary["parsing_chunking"]["marker"] == "pc1"
+    assert diary["embedding"]["marker"] == "em1"
+
+    # the run hook was invoked exactly once with (phase, source, completed_list)
+    assert len(calls["run"]) == 1
+    phase_arg, source_arg, completed_list = calls["run"][0][0]
+    assert phase_arg == "fake_phase"
+    assert source_arg == source
+    assert {e["phase"] for e in completed_list} == {"parsing_chunking", "embedding"}
+
+    # decision probe + re-probe after recording (now empty: marker matches)
+    assert len(calls["probe"]) == 2
+
+
+async def test_machine_registered_phase_without_settings_category_records_none_version(cheshire_cat, monkeypatch):
+    """A registered phase with ``settings_category=None`` records
+    ``settings_version=None`` (no settings entry to fingerprint) but still a
+    REAL marker — the marker-only invalidation path."""
+    agent_key = cheshire_cat.agent_key
+    source = "registered_nocat.pdf"
+    await set_status(
+        agent_key, "agent", source, type_="file", status=IngestionStatus.COMPLETED,
+        completed_phases=_completed_diary(parsing_marker="pc1", embedding_marker="em1"),
+    )
+
+    calls = _stub_reembed_env(
+        monkeypatch, cheshire_cat,
+        existing_points=[_point(source)],
+        pending_result=[{"phase": "fake_phase"}],
+        run_result={"status": "done"},
+        specs_result=_registered_specs(settings_category=None),
+    )
+    await reembed.reembed_sources(cheshire_cat, "declarative", [_stored_source(source)])
+
+    doc = await get_status(agent_key, "agent", source)
+    assert doc is not None
+    assert doc["status"] == "completed"
+
+    entry = get_completed_phases(doc)["fake_phase"]
+    assert entry["marker"] == "test-marker"  # REAL marker, not None
+    assert entry["settings_version"] is None  # no settings category -> None
+    assert entry["deps"] == {"parsing_chunking": "pc1", "embedding": "em1"}
     assert len(calls["run"]) == 1
