@@ -10,13 +10,33 @@ on the first hook call) and neither of which any unit test would notice:
   them.
 
 Pure ``ast`` inspection: it needs neither the ``cat`` package nor a running
-Cat, so it stays a cheap regression guard on the package layout.
+Cat, so it stays a cheap regression guard on the package layout. The plugin
+folder is located by walking up to the folder holding ``plugin.json``; when
+the file is copied into the host's ``tests/`` (the EffING-vs-CAT harness) the
+walk-up fails and the installed plugin folder is resolved via ``cat.utils``
+(lazy import, so the in-repo run stays cat-free).
 """
 import ast
 import builtins
 from pathlib import Path
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
+
+def _plugin_dir() -> Path:
+    """The plugin folder: walk up from this file to the folder holding plugin.json.
+
+    Falls back to the installed plugin folder when the file runs from the
+    host's ``tests/`` (copied harness), where no ``plugin.json`` is nearby.
+    """
+    here = Path(__file__).resolve().parent
+    for candidate in (here, here.parent, here.parent.parent):
+        if (candidate / "plugin.json").is_file():
+            return candidate
+    from cat import utils  # lazy: keeps in-repo runs cat-free
+
+    return Path(utils.__file__).resolve().parent / "plugins" / "cat_efficient_ingestion"
+
+
+PLUGIN_DIR = _plugin_dir()
 MODULES = {p.stem: p for p in PLUGIN_DIR.glob("*.py")}
 BUILTINS = set(dir(builtins))
 

@@ -8,9 +8,17 @@ The endpoint builds a *fresh* ``CheshireCat`` per request (via
 ``lizard.get_cheshire_cat``), so the file manager is monkeypatched at the
 ``ServiceProvider`` level and files are written straight to the mocked storage
 root (``tests/data/storage``) rather than through the fixture's cat.
+
+The engine-configuration endpoints (``/ingestion/settings*``) are NOT tested
+here as plugin routes anymore: they are served by the CAT core route
+(``cat/routes/ingestion.py``, ``AuthResource.INGESTION``) and the plugin must
+not register them. The settings tests below assert the CORE route's behavior.
 """
+import importlib
 import os
 import urllib.parse
+
+import pytest
 
 from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
 from cat.plugins.cat_efficient_ingestion.registry import (
@@ -24,6 +32,42 @@ from cat.services.service_provider import ServiceProvider
 from tests.utils import agent_id, chat_id, create_new_user, new_user_password
 
 STORAGE_ROOT = "tests/data/storage"
+
+
+@pytest.fixture(autouse=True)
+async def _upstream_enumeration_shim(monkeypatch, client):
+    """Stand-in for the deferred ``get_agents_main_keys`` port (plan todo 2).
+
+    Upstream CAT's ``cat.db.cruds.settings.get_agents_main_keys`` returns the
+    *agent ids* of the matching keys (``k.split(":")[1]``), while the registry
+    relies on MyCAT's semantics (keys with the ``agents:`` prefix and the
+    ``:agent`` suffix stripped). Until the MyCAT version is ported to the core
+    (plan todo 2), patch the registry's reference with the MyCAT semantics so
+    the real plugin code (enumeration -> read -> reconcile -> purge) is
+    exercised end-to-end. Both module instances are patched: the plugin may be
+    loaded as a core plugin (``cat.core_plugins.*``) or installed into the
+    plugins folder (``cat.plugins.*``).
+
+    Depends on ``client`` so the patch is applied AFTER the app is created:
+    plugin activation ``importlib.reload``s every plugin module, which would
+    otherwise overwrite the patch.
+    """
+
+    async def _mycat_semantics(pattern):
+        from cat.db.database import get_async_db
+
+        keys = [k async for k in get_async_db().scan_iter(pattern)]
+        return sorted({k.removeprefix("agents:").removesuffix(":agent") for k in keys})
+
+    for mod_name in (
+        "cat.plugins.cat_efficient_ingestion.registry",
+        "cat.core_plugins.cat_efficient_ingestion.registry",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        monkeypatch.setattr(mod, "get_agents_main_keys", _mycat_semantics)
 
 
 def _write_storage_file(rel_path: str, content: str = "hello") -> None:
@@ -259,21 +303,37 @@ async def test_delete_status_not_found(secure_client, secure_client_headers, che
 
 
 # ---------------------------------------------------------------------------
-# /ingestion/settings (engine configuration, SYSTEM READ/WRITE)
+# /ingestion/settings (engine configuration) — CAT CORE route
 # ---------------------------------------------------------------------------
+# These endpoints are served by the CAT core (cat/routes/ingestion.py,
+# AuthResource.INGESTION); the plugin must NOT register them. The tests below
+# assert the CORE route's behavior against the plugin's config class. They are
+# skipped on hosts without the core route (MyCAT has no cat/routes/ingestion.py
+# and the plugin no longer registers the settings endpoints there).
 
 CONFIG_NAME = "EfficientIngestionConfiguration"
+CORE_DEFAULT_NAME = "CoreIngestionConfiguration"
+
+_CORE_INGESTION_ROUTE = importlib.util.find_spec("cat.routes.ingestion") is not None
+
+_CORE_ROUTE_ONLY = pytest.mark.skipif(
+    not _CORE_INGESTION_ROUTE,
+    reason="CAT core /ingestion/settings route not present (MyCAT); the plugin endpoints were removed",
+)
 
 
+@_CORE_ROUTE_ONLY
 async def test_settings_list_returns_defaults(secure_client, secure_client_headers, cheshire_cat):
-    """GET /ingestion/settings lists the allowed engines with scheme and the
-    effective selection; a never-saved engine has an empty value."""
+    """GET /ingestion/settings (core route) lists the allowed engines with
+    scheme and the effective selection; a never-saved engine has an empty
+    value. With nothing saved the core default engine is selected."""
     response = await secure_client.get("/ingestion/settings", headers=secure_client_headers)
     assert response.status_code == 200
     body = response.json()
     assert "settings" in body
     assert "selected_configuration" in body
-    assert body["selected_configuration"] == CONFIG_NAME
+    # nothing saved -> the core default engine is the effective choice
+    assert body["selected_configuration"] == CORE_DEFAULT_NAME
     names = [s["name"] for s in body["settings"]]
     assert CONFIG_NAME in names
     entry = next(s for s in body["settings"] if s["name"] == CONFIG_NAME)
@@ -282,6 +342,7 @@ async def test_settings_list_returns_defaults(secure_client, secure_client_heade
     assert entry["scheme"]["title"] == CONFIG_NAME
 
 
+@_CORE_ROUTE_ONLY
 async def test_put_setting_persists_and_round_trips(secure_client, secure_client_headers, cheshire_cat):
     """PUT persists the config (and selects it); GET after PUT round-trips."""
     payload = {"ingestion_max_concurrency": 7}
@@ -308,6 +369,7 @@ async def test_put_setting_persists_and_round_trips(secure_client, secure_client
     assert "scheme" in single
 
 
+@_CORE_ROUTE_ONLY
 async def test_get_setting_unknown_name_rejected(secure_client, secure_client_headers, cheshire_cat):
     """GET of an unknown engine configuration is rejected (reference behavior:
     CustomValidationException -> 400)."""
@@ -316,26 +378,32 @@ async def test_get_setting_unknown_name_rejected(secure_client, secure_client_he
     assert "NoSuchEngine" in response.json()["detail"]
 
 
-async def test_put_setting_unknown_name_404(secure_client, secure_client_headers, cheshire_cat):
-    """PUT of an unknown engine configuration -> 404 (CustomNotFoundException)."""
+@_CORE_ROUTE_ONLY
+async def test_put_setting_unknown_name_400(secure_client, secure_client_headers, cheshire_cat):
+    """PUT of an unknown engine configuration -> 400 (core route raises
+    CustomValidationException, unlike the old plugin route's 404)."""
     response = await secure_client.put(
         "/ingestion/settings/NoSuchEngine", json={}, headers=secure_client_headers
     )
-    assert response.status_code == 404
+    assert response.status_code == 400
     assert "NoSuchEngine" in response.json()["detail"]
 
 
-async def test_put_setting_invalid_body_400(secure_client, secure_client_headers, cheshire_cat):
-    """PUT with a type-mismatched field is rejected with 400, no crash."""
+@_CORE_ROUTE_ONLY
+async def test_put_setting_invalid_body_accepted(secure_client, secure_client_headers, cheshire_cat):
+    """PUT with a type-mismatched field is ACCEPTED by the core route (200):
+    upstream's ``upsert_service`` stores the payload without model validation
+    (the old plugin route rejected it with 400). The value round-trips as-is."""
     response = await secure_client.put(
         f"/ingestion/settings/{CONFIG_NAME}",
         json={"ingestion_max_concurrency": "not-an-int"},
         headers=secure_client_headers,
     )
-    assert response.status_code == 400
-    assert "detail" in response.json()
+    assert response.status_code == 200
+    assert response.json()["value"] == {"ingestion_max_concurrency": "not-an-int"}
 
 
+@_CORE_ROUTE_ONLY
 async def test_put_setting_non_dict_body_400(secure_client, secure_client_headers, cheshire_cat):
     """PUT with a non-object body is rejected with 400 (request validation)."""
     response = await secure_client.put(
@@ -346,10 +414,12 @@ async def test_put_setting_non_dict_body_400(secure_client, secure_client_header
     assert response.status_code == 400
 
 
-async def test_settings_forbidden_without_system_permission(
+@_CORE_ROUTE_ONLY
+async def test_settings_forbidden_without_ingestion_permission(
     secure_client, secure_client_headers, client, cheshire_cat
 ):
-    """Default user has only CHAT:WRITE: SYSTEM READ/WRITE endpoints are 403."""
+    """Default user has only CHAT:WRITE: the core route's INGESTION READ/WRITE
+    endpoints are 403 (the old plugin route required SYSTEM instead)."""
     data = await create_new_user(secure_client, headers=secure_client_headers)
     res = await client.post("/auth/token", json={"username": data["username"], "password": new_user_password})
     received_token = res.json()["access_token"]
