@@ -35,6 +35,43 @@ from tests.utils import agent_id
 
 
 @pytest.fixture(autouse=True)
+def _upstream_enumeration_shim(monkeypatch):
+    """Stand-in for the deferred ``get_agents_main_keys`` port (plan todo 2).
+
+    Upstream CAT's ``cat.db.cruds.settings.get_agents_main_keys`` returns the
+    *agent ids* of the matching keys (``k.split(":")[1]``), while the registry
+    relies on MyCAT's semantics (keys with the ``agents:`` prefix and the
+    ``:agent`` suffix stripped). Until the MyCAT version is ported to the core
+    (plan todo 2), patch the registry's reference with the MyCAT semantics so
+    the real plugin code (enumeration -> read -> reconcile -> purge) is
+    exercised end-to-end. Both module instances are patched: the plugin may be
+    loaded as a core plugin (``cat.core_plugins.*``) or installed into the
+    plugins folder (``cat.plugins.*``).
+
+    This file never boots the app (registry-level tests), so no ``client``
+    dependency is needed: no plugin ``importlib.reload`` can overwrite the
+    patch here.
+    """
+    import importlib
+
+    async def _mycat_semantics(pattern):
+        from cat.db.database import get_async_db
+
+        keys = [k async for k in get_async_db().scan_iter(pattern)]
+        return sorted({k.removeprefix("agents:").removesuffix(":agent") for k in keys})
+
+    for mod_name in (
+        "cat.plugins.cat_efficient_ingestion.registry",
+        "cat.core_plugins.cat_efficient_ingestion.registry",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        monkeypatch.setattr(mod, "get_agents_main_keys", _mycat_semantics)
+
+
+@pytest.fixture(autouse=True)
 async def _ensure_agent_master_key():
     """The ``ingestion_canceled`` guard makes ``set_status`` a no-op when the
     agent master key ``agents:<agent_id>:agent`` is absent. These registry

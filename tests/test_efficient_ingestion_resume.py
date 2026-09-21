@@ -7,6 +7,7 @@ Covers the ``after_lizard_bootstrap`` hook and the per-agent background pass:
 - Redis-down is logged and skipped, never crashing bootstrap.
 """
 import asyncio
+import importlib
 import time
 from typing import Any
 from unittest.mock import AsyncMock
@@ -29,6 +30,42 @@ from cat.plugins.cat_efficient_ingestion.registry import (
 )
 from cat.db import crud
 from cat.exceptions import CustomNotFoundException
+
+
+@pytest.fixture(autouse=True)
+async def _upstream_enumeration_shim(monkeypatch, cheshire_cat):
+    """Stand-in for the deferred ``get_agents_main_keys`` port (plan todo 2).
+
+    Upstream CAT's ``cat.db.cruds.settings.get_agents_main_keys`` returns the
+    *agent ids* of the matching keys (``k.split(":")[1]``), while the registry
+    relies on MyCAT's semantics (keys with the ``agents:`` prefix and the
+    ``:agent`` suffix stripped). Until the MyCAT version is ported to the core
+    (plan todo 2), patch the registry's reference with the MyCAT semantics so
+    the real plugin code (enumeration -> read -> reconcile -> purge) is
+    exercised end-to-end. Both module instances are patched: the plugin may be
+    loaded as a core plugin (``cat.core_plugins.*``) or installed into the
+    plugins folder (``cat.plugins.*``).
+
+    Depends on ``cheshire_cat`` so the patch is applied AFTER the app is
+    created: plugin activation ``importlib.reload``s every plugin module,
+    which would otherwise overwrite the patch.
+    """
+
+    async def _mycat_semantics(pattern):
+        from cat.db.database import get_async_db
+
+        keys = [k async for k in get_async_db().scan_iter(pattern)]
+        return sorted({k.removeprefix("agents:").removesuffix(":agent") for k in keys})
+
+    for mod_name in (
+        "cat.plugins.cat_efficient_ingestion.registry",
+        "cat.core_plugins.cat_efficient_ingestion.registry",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        monkeypatch.setattr(mod, "get_agents_main_keys", _mycat_semantics)
 
 
 def _install_machine_spy(monkeypatch):
@@ -602,6 +639,22 @@ async def test_periodic_sweep_completes_stale_uploaded(cheshire_cat, monkeypatch
 
     # the recovery hands the source to the ONE phase machine
     machine_calls = _install_machine_spy(monkeypatch)
+
+    # The revalidation pass probes COMPLETED rows with the live
+    # ``ingestion_phase_pending`` hook. The machine spy marks the row
+    # COMPLETED without writing a phase diary, so a live probe would treat it
+    # as a legacy row and hand it to the machine a SECOND time. In production
+    # the machine writes the diary, so the probe is empty. Mock the probe
+    # fresh — exactly like the revalidation tests below do — to keep this
+    # test focused on the sweep completing the stale entry exactly once.
+    real_execute_hook = cheshire_cat.plugin_manager.execute_hook
+
+    async def _fresh_probe(name, *args, **kwargs):
+        if name == "ingestion_phase_pending":
+            return []
+        return await real_execute_hook(name, *args, **kwargs)
+
+    monkeypatch.setattr(cheshire_cat.plugin_manager, "execute_hook", _fresh_probe)
 
     # only this agent is enumerated by the startup pass
     monkeypatch.setattr(
