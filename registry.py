@@ -7,7 +7,7 @@ re-embed flow): ``agents:{agent_id}:ingestion:{scope}:{sha256(source)}`` where
 Every status transition is written as a Redis-JSON document via ``cat.db.crud``
 (no raw Redis client is used here). Enumeration is crud-based too:
 ``list_statuses`` walks the ``agents:{agent_id}:ingestion:*`` namespace through
-the crud-documented pattern scan (``get_agents_main_keys``) and reads every
+the agent-scoped host CRUD API (``get_ingestion_status_keys``) and reads every
 doc via ``crud.read``; ``clear_agent`` wipes the namespace via
 ``crud.destroy`` and re-stores the delete marker. No raw Redis client.
 """
@@ -15,7 +15,7 @@ import hashlib
 from typing import Dict, List, Optional
 
 from cat.db import crud
-from cat.db.cruds.settings import get_agents_main_keys
+from cat.db.cruds import settings as crud_settings
 from cat.db.models import generate_timestamp
 from cat.utils import Enum
 
@@ -84,21 +84,13 @@ def delete_marker_key(agent_id: str) -> str:
 async def _list_status_keys(agent_id: str) -> List[str]:
     """List the agent's ``agents:{agent_id}:ingestion:*`` keys (crud-only).
 
-    ``cat.db.crud`` exposes no non-destructive pattern scan, so enumeration
-    uses the crud-documented scan primitive ``get_agents_main_keys``, which
-    accepts an arbitrary key pattern and returns every matching key with the
-    ``agents:`` prefix stripped (it is primarily used for agent master keys,
-    but the stripping is exact for every key in this namespace — none ends
-    with ``:agent``, so the ``:agent`` suffix-strip is a no-op here). The
-    prefix is re-added to reconstruct the full keys. The function is imported
-    by name so this scan is unaffected by callers mocking the
-    ``crud_settings`` module attribute for their own (agent-key) enumeration.
-    Never a raw client.
+    Enumeration goes through the host CRUD API
+    ``crud_settings.get_ingestion_status_keys``: a read-only, agent-scoped
+    listing that returns the full keys of the agent's ingestion namespace
+    (delete marker included, filtered by the callers) and glob-escapes the
+    agent id. Never a raw client.
     """
-    stripped = await get_agents_main_keys(
-        pattern=f"agents:{agent_id}:ingestion:*"
-    )
-    return ["agents:" + key for key in stripped]
+    return await crud_settings.get_ingestion_status_keys(agent_id)
 
 
 async def set_delete_marker(agent_id: str) -> None:
@@ -549,7 +541,7 @@ async def list_statuses(agent_id: str, chat_id: Optional[str] = None) -> List[Di
     ``chat_id`` only that conversation's entries are returned.
 
     Enumeration is crud-based: the ``agents:{agent_id}:ingestion:*`` namespace
-    is walked through the crud-documented pattern scan and each status doc is
+    is listed through ``get_ingestion_status_keys`` and each status doc is
     read via ``crud.read`` — no raw Redis client. Keys that read as ``None``
     (deleted/never written) are skipped.
     """
