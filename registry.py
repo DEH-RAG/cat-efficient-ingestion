@@ -551,9 +551,18 @@ async def claim_source_for_resume(
             return created if stored is not None else None
 
         status = doc.get("status")
-        if doc.get("resume_created") and status == IngestionStatus.PROCESSING.value:
+        if doc.get("resume_created") and status in (
+            IngestionStatus.UPLOADED.value,
+            IngestionStatus.DOWNLOADING.value,
+            IngestionStatus.DOWNLOADED.value,
+            IngestionStatus.PROCESSING.value,
+        ):
             # Created by the no-doc claim path and still in flight: refuse an
-            # immediate second claim, but never forever. With a positive
+            # immediate second claim, but never forever. The lease must cover
+            # EVERY in-flight status, not just PROCESSING: a URL row created by
+            # this path flips to DOWNLOADING/DOWNLOADED before it returns to
+            # PROCESSING, and with the staleness gate disabled only the lease
+            # keeps a live download from being stolen. With a positive
             # staleness gate the gate itself bounds the refusal; with the gate
             # disabled a time-bounded lease does (the live writer refreshes
             # ``updated_at`` via the heartbeat).

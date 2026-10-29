@@ -23,6 +23,7 @@ runs at import time.
 """
 
 import asyncio
+import copy
 import hashlib
 import io
 import os
@@ -680,11 +681,16 @@ async def _run_parsing_phase(
     await _raise_if_canceled(ccat)
     await _clear_source_artifacts(ccat, collection_name, source_name, chat_id)
 
-    # (Re)point the shared rabbit_hole at the ccat being processed. The lizard
-    # owns ONE RabbitHole for every agent, and ``_split_text`` reads
-    # ``self.cat.chunker``: leaving a stale ``cat`` here makes every agent parse
-    # with the FIRST agent's chunker, so a chunker change is never applied.
-    await rabbit_hole.setup(ccat)
+    # Use a PER-CALL copy of the RabbitHole bound to this ccat. The lizard owns
+    # ONE RabbitHole shared by every agent, and ``_split_text`` reads
+    # ``self.cat.chunker``: mutating the shared instance would let two
+    # concurrent per-agent re-embeds chunk one agent's source with another
+    # agent's chunker (and still mark the phase up to date). The shallow copy
+    # is cheap, matches ``RabbitHole.ingest_memory``'s own pattern, and leaves
+    # the shared object untouched.
+    rabbit_hole = copy.copy(rabbit_hole)
+    rabbit_hole.cat = ccat
+    rabbit_hole.stray = None
 
     # 2. resolve the source bytes: file already on disk (via the resume/upload),
     #    or a URL to (re)download.

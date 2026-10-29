@@ -118,7 +118,7 @@ def _heartbeat_key(agent_id: str, scope: str, source: str) -> str:
     return f"{agent_id}:{scope}:{source}"
 
 
-def _start_heartbeat(
+async def _start_heartbeat(
     agent_id: str,
     scope: str,
     source: str,
@@ -126,11 +126,21 @@ def _start_heartbeat(
     *,
     max_seconds: float | None = None,
 ) -> None:
-    """Spawn (or replace) the heartbeat task for one in-flight row."""
+    """Spawn (or replace) the heartbeat task for one in-flight row.
+
+    Replacing a task AWAITS the cancelled one before installing the new task:
+    a bare ``cancel()`` leaves the old coroutine to unwind at an arbitrary
+    point (possibly on the next event-loop turn, after the new task already
+    wrote the row). Awaiting guarantees the old writer is fully stopped first.
+    """
     key = _heartbeat_key(agent_id, scope, source)
     existing = _heartbeat_tasks.pop(key, None)
     if existing is not None:
         existing.cancel()
+        try:
+            await existing
+        except asyncio.CancelledError:
+            pass
     _heartbeat_tasks[key] = asyncio.ensure_future(
         _heartbeat_status(agent_id, scope, source, interval, max_seconds=max_seconds)
     )
@@ -171,39 +181,50 @@ async def _heartbeat_status(
     started = time.monotonic()
     while True:
         await asyncio.sleep(interval)
-        if max_seconds is not None and time.monotonic() - started >= max_seconds:
-            return
-        if await ingestion_canceled(agent_id):
-            # Agent deleted mid-ingestion: mark the row ERROR and stop. The
-            # ERROR write goes through a DIRECT crud.store because set_status
-            # is itself guarded by ingestion_canceled (it returns {} without
-            # writing when canceled) — the direct store bypasses the guard so
-            # the row ends terminal instead of dangling as in-flight. Only
-            # overwrite a row still in flight (the loop's own invariant).
+        try:
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                return
+            if await ingestion_canceled(agent_id):
+                # Agent deleted mid-ingestion: mark the row ERROR and stop. The
+                # ERROR write goes through a DIRECT crud.store because set_status
+                # is itself guarded by ingestion_canceled (it returns {} without
+                # writing when canceled) — the direct store bypasses the guard so
+                # the row ends terminal instead of dangling as in-flight. Only
+                # overwrite a row still in flight (the loop's own invariant).
+                current = await get_status(agent_id, scope, source)
+                if current and current.get("status") in _IN_FLIGHT_STATUSES:
+                    await crud.store(
+                        status_key(agent_id, scope, source),
+                        {
+                            **current,
+                            "status": IngestionStatus.ERROR.value,
+                            "error": "Agent deleted — ingestion aborted",
+                            "updated_at": generate_timestamp(),
+                        },
+                    )
+                return
             current = await get_status(agent_id, scope, source)
             if current and current.get("status") in _IN_FLIGHT_STATUSES:
-                await crud.store(
-                    status_key(agent_id, scope, source),
-                    {
-                        **current,
-                        "status": IngestionStatus.ERROR.value,
-                        "error": "Agent deleted — ingestion aborted",
-                        "updated_at": generate_timestamp(),
-                    },
+                await set_status(
+                    agent_id,
+                    scope,
+                    source,
+                    type_=current.get("type", "file"),
+                    status=IngestionStatus(current.get("status")),
+                    chat_id=current.get("chat_id"),
                 )
-            return
-        current = await get_status(agent_id, scope, source)
-        if current and current.get("status") in _IN_FLIGHT_STATUSES:
-            await set_status(
-                agent_id,
-                scope,
-                source,
-                type_=current.get("type", "file"),
-                status=IngestionStatus(current.get("status")),
-                chat_id=current.get("chat_id"),
+            else:
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a heartbeat tick must never raise
+            # A transient store/transport error must not kill the heartbeat: a
+            # dead task would let the row age out and be re-claimed while the
+            # work is still running. Log and retry on the next tick.
+            log.warning(
+                f"Agent id: {agent_id}. Ingestion heartbeat tick failed for "
+                f"{source!r}: {e}"
             )
-        else:
-            return
 
 
 @hook(priority=0)
@@ -278,7 +299,7 @@ async def rabbithole_url_downloading(url, filename, cat) -> None:
     # download longer than the resume threshold is never reclaimed and
     # re-downloaded concurrently by the periodic sweep. Bounded so a failed
     # download (no ``completed`` hook) still ages out and becomes resumable.
-    _start_heartbeat(
+    await _start_heartbeat(
         cat.agent_key,
         scope,
         url,
@@ -306,7 +327,7 @@ async def rabbithole_url_download_completed(url, filename, cat) -> None:
         chat_id=chat_id,
         phase=PHASE_DOWNLOADING,
     )
-    _start_heartbeat(cat.agent_key, scope, url, _heartbeat_interval())
+    await _start_heartbeat(cat.agent_key, scope, url, _heartbeat_interval())
 
 
 @hook(priority=0)
@@ -450,14 +471,14 @@ async def rabbithole_ingestion_error(source, error, cat) -> None:
     )
 
 @hook(priority=0)
-def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat) -> None:
+async def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat) -> None:
     """Spawn the heartbeat task that keeps an in-flight row fresh."""
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)
     if not agent_id:
         return
-    _start_heartbeat(agent_id, scope, source, interval)
+    await _start_heartbeat(agent_id, scope, source, interval)
 
 
 @hook(priority=0)

@@ -17,7 +17,7 @@ Every transition is written as a Redis-JSON document under `agents:{agent_id}:in
 
 Lifecycle states: `uploaded → processing → completed | error`, with `downloading → downloaded` inserted for URLs. The document also records the work `phase` (`downloading`, `parsing_chunking`, `embedding`), the `embedder_name` and the `chunker_name` that produced the stored data, plus the timestamps used by the recovery sweep.
 
-Sources are claimed under a **per-source distributed lock**, so different sources of the same agent are ingested concurrently while the same source is never processed twice by two workers. A heartbeat keeps the `processing` row fresh while it is being handled, so live work is never stolen by another replica.
+Sources are claimed under a **per-source distributed lock**, so different sources of the same agent are ingested concurrently while the same source is never processed twice by two workers. A heartbeat keeps every in-flight row (`uploaded`, `downloading`, `downloaded`, `processing`) fresh while a worker handles it, so live work is never stolen by another replica. The download heartbeat is bounded (`CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS`, default `1800`): a download that fails without firing `rabbithole_url_download_completed` stops refreshing and the row ages out, becoming resumable again.
 
 <h2>🧭 Clock-free two-level phase invalidation</h2>
 
