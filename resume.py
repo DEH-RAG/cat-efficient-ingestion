@@ -382,7 +382,7 @@ async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
 async def _startup_pass(lizard: BillTheLizard) -> None:
     """Enumerate agents and run the recovery + GC pass for each."""
     try:
-        agent_ids = await crud_settings.get_agents_main_keys()
+        agent_ids = [a["agent_id"] for a in await crud_settings.get_agents()]
     except Exception as e:
         log.error(f"Ingestion startup pass: failed to enumerate agents: {e}")
         return

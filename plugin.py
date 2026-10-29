@@ -19,11 +19,13 @@ token-budget split).
 
 from typing import List
 import asyncio
+import time
 from langchain_core.documents import Document
 
 from cat import hook
 from cat.db import crud
 from cat.db.models import generate_timestamp
+from cat.env import get_env_int
 from cat.exceptions import CustomHookVetoException
 from cat.log import log
 
@@ -81,9 +83,57 @@ def _chunker_name(cat) -> str | None:
 
 _heartbeat_tasks: dict = {}
 
+#: Statuses that represent work an active worker owns. The heartbeat refreshes
+#: ANY of them, not just ``PROCESSING``: a URL ingestion is ``DOWNLOADING``
+#: first (long HTTP fetch, no processing hooks yet) and can flip back to
+#: ``DOWNLOADING``/``DOWNLOADED`` while a phase machine re-downloads.
+_IN_FLIGHT_STATUSES: tuple[str, ...] = (
+    IngestionStatus.UPLOADED.value,
+    IngestionStatus.DOWNLOADING.value,
+    IngestionStatus.DOWNLOADED.value,
+    IngestionStatus.PROCESSING.value,
+)
+
+
+def _heartbeat_interval() -> float:
+    """Interval (seconds) at which an in-flight ingestion row is refreshed."""
+    value = get_env_int("CAT_INGESTION_HEARTBEAT_SECONDS")
+    return float(value) if value and value > 0 else 30.0
+
+
+def _download_heartbeat_max_seconds() -> float:
+    """Upper bound on the DOWNLOADING heartbeat's lifetime.
+
+    The writer refreshes the row while the HTTP fetch is in flight. A failed
+    download never fires ``rabbithole_url_download_completed``, so without a
+    bound the heartbeat would keep a dead download row fresh forever and the
+    resume sweep could never reclaim it. Once the bound elapses, the row ages
+    out and becomes resumable (a crash, not a permanent lease).
+    """
+    value = get_env_int("CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS")
+    return float(value) if value and value > 0 else 1800.0
+
 
 def _heartbeat_key(agent_id: str, scope: str, source: str) -> str:
     return f"{agent_id}:{scope}:{source}"
+
+
+def _start_heartbeat(
+    agent_id: str,
+    scope: str,
+    source: str,
+    interval: float,
+    *,
+    max_seconds: float | None = None,
+) -> None:
+    """Spawn (or replace) the heartbeat task for one in-flight row."""
+    key = _heartbeat_key(agent_id, scope, source)
+    existing = _heartbeat_tasks.pop(key, None)
+    if existing is not None:
+        existing.cancel()
+    _heartbeat_tasks[key] = asyncio.ensure_future(
+        _heartbeat_status(agent_id, scope, source, interval, max_seconds=max_seconds)
+    )
 
 
 async def _cancel_heartbeat(agent_id: str, scope: str, source: str) -> None:
@@ -97,29 +147,41 @@ async def _cancel_heartbeat(agent_id: str, scope: str, source: str) -> None:
         pass
 
 
-async def _heartbeat_status(agent_id: str, scope: str, source: str, interval: float) -> None:
-    """Periodically bump ``updated_at`` of a PROCESSING row while it is being handled.
+async def _heartbeat_status(
+    agent_id: str,
+    scope: str,
+    source: str,
+    interval: float,
+    *,
+    max_seconds: float | None = None,
+) -> None:
+    """Periodically bump ``updated_at`` of an in-flight row while it is handled.
 
-    A long parse/embed can otherwise make the row look stale and get re-claimed
-    by another worker (see ``claim_source_for_resume``). Stops as soon as the
-    row leaves the PROCESSING state.
+    A long download/parse/embed can otherwise make the row look stale and get
+    re-claimed by another worker (see ``claim_source_for_resume``). Refreshes
+    any of :data:`_IN_FLIGHT_STATUSES`; stops as soon as the row becomes
+    terminal (or was removed), or after ``max_seconds`` (used to bound the
+    download heartbeat so a dead writer is still resumable).
 
     The deletion marker is checked on EVERY tick: this is the fast-abort path
     for long phases (embedding can take minutes), so a deleted agent's worker
     self-aborts within one interval instead of letting the delete's bounded
     quiesce-wait time out.
     """
+    started = time.monotonic()
     while True:
         await asyncio.sleep(interval)
+        if max_seconds is not None and time.monotonic() - started >= max_seconds:
+            return
         if await ingestion_canceled(agent_id):
             # Agent deleted mid-ingestion: mark the row ERROR and stop. The
             # ERROR write goes through a DIRECT crud.store because set_status
             # is itself guarded by ingestion_canceled (it returns {} without
             # writing when canceled) — the direct store bypasses the guard so
-            # the row ends terminal instead of dangling as PROCESSING. Only
-            # overwrite a row still in PROCESSING (the loop's own invariant).
+            # the row ends terminal instead of dangling as in-flight. Only
+            # overwrite a row still in flight (the loop's own invariant).
             current = await get_status(agent_id, scope, source)
-            if current and current.get("status") == IngestionStatus.PROCESSING.value:
+            if current and current.get("status") in _IN_FLIGHT_STATUSES:
                 await crud.store(
                     status_key(agent_id, scope, source),
                     {
@@ -131,13 +193,13 @@ async def _heartbeat_status(agent_id: str, scope: str, source: str, interval: fl
                 )
             return
         current = await get_status(agent_id, scope, source)
-        if current and current.get("status") == IngestionStatus.PROCESSING.value:
+        if current and current.get("status") in _IN_FLIGHT_STATUSES:
             await set_status(
                 agent_id,
                 scope,
                 source,
                 type_=current.get("type", "file"),
-                status=IngestionStatus.PROCESSING,
+                status=IngestionStatus(current.get("status")),
                 chat_id=current.get("chat_id"),
             )
         else:
@@ -211,11 +273,29 @@ async def rabbithole_url_downloading(url, filename, cat) -> None:
         chat_id=chat_id,
         phase=PHASE_DOWNLOADING,
     )
+    # The HTTP fetch happens AFTER this hook and before
+    # ``rabbithole_url_download_completed``; refresh the row while it runs so a
+    # download longer than the resume threshold is never reclaimed and
+    # re-downloaded concurrently by the periodic sweep. Bounded so a failed
+    # download (no ``completed`` hook) still ages out and becomes resumable.
+    _start_heartbeat(
+        cat.agent_key,
+        scope,
+        url,
+        _heartbeat_interval(),
+        max_seconds=_download_heartbeat_max_seconds(),
+    )
 
 
 @hook(priority=0)
 async def rabbithole_url_download_completed(url, filename, cat) -> None:
-    """Record that a URL download completed successfully."""
+    """Record that a URL download completed successfully.
+
+    The download is over, so the bounded download heartbeat is replaced by an
+    unbounded one: a phase machine may keep working on the downloaded bytes for
+    a long time (and may flip the row back to ``downloading`` if it re-fetches
+    a URL mid-phase).
+    """
     scope, chat_id = _scope_and_chat(cat)
     await set_status(
         cat.agent_key,
@@ -226,6 +306,7 @@ async def rabbithole_url_download_completed(url, filename, cat) -> None:
         chat_id=chat_id,
         phase=PHASE_DOWNLOADING,
     )
+    _start_heartbeat(cat.agent_key, scope, url, _heartbeat_interval())
 
 
 @hook(priority=0)
@@ -370,19 +451,13 @@ async def rabbithole_ingestion_error(source, error, cat) -> None:
 
 @hook(priority=0)
 def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat) -> None:
-    """Spawn the heartbeat task that keeps the PROCESSING row fresh."""
+    """Spawn the heartbeat task that keeps an in-flight row fresh."""
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)
     if not agent_id:
         return
-    key = _heartbeat_key(agent_id, scope, source)
-    # safety: stop any pre-existing heartbeat for the same row
-    if key in _heartbeat_tasks:
-        _heartbeat_tasks[key].cancel()
-    _heartbeat_tasks[key] = asyncio.ensure_future(
-        _heartbeat_status(agent_id, scope, source, interval)
-    )
+    _start_heartbeat(agent_id, scope, source, interval)
 
 
 @hook(priority=0)

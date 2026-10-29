@@ -48,8 +48,8 @@ The phase machine is extensible through five hooks declared in the plugin itself
 
 - **`ingestion_phase_pending(pending, source, completed_phases, cat)`** — accumulator of stale phases for a source. Each registrant appends the `{"phase": <id>, ...}` entries it considers stale and returns the extended list. The default is the identity (nothing pending).
 - **`ingestion_phase_run(phase, source, completed_phases, cat)`** — runs one phase with a tri-state contract: return `{"status": "done"}` on success, `{"status": "not_ready", "retry_after": N}` when retriable but not yet runnable (the machine retries after `N` seconds), or raise on permanent failure. The default returns `None`, which the machine treats as fail-hard / unimplemented: a phase with no registrant is an error, never a silent success.
-- **`before_ingestion_status_completed(source, cat)`** — final gate before a source is marked COMPLETED. A registrant raises to force the source to ERROR instead; the default is a no-op.
-- **`ingestion_phase_settings_marker(phase, cat)`** — the plugin-defined material marker for a phase, compared against the recorded diary `marker` to decide whether the phase's settings changed materially. The default returns `None` ("unknown"), which the machine treats conservatively as stale.
+- **`before_ingestion_status_completed(source, cat)`** — final gate before a source is marked COMPLETED. A registrant raises `CustomHookVetoException` to force the source to ERROR instead. The built-in implementation vetoes when the caller exposes a `has_pending_source_tasks(source)` probe and it reports pending work; absent that probe it is a no-op.
+- **`ingestion_phase_settings_marker(phase, cat)`** — the plugin-defined material marker for a phase, compared against the recorded diary `marker` to decide whether the phase's settings changed materially. The built-in phases return a stable JSON fingerprint of their service configuration (`parsing_chunking`: the agent-scoped chunker; `embedding`: the system-scoped embedder). An unknown phase returns `None` ("unknown"), which the machine treats conservatively as stale.
 - **`ingestion_phase_specs(specs, cat)`** — accumulator of `PhaseSpec` declarations. Each registrant appends the phases it owns and returns the extended list; EffING merges them into its built-in `PHASES` at probe time (built-ins win on duplicate ids). The default is the identity (no registered phases).
 
 An external phase plugin (e.g. MyGRAPH) registers by declaring its phases through `ingestion_phase_specs`, providing a material marker through `ingestion_phase_settings_marker`, and executing them through `ingestion_phase_run`; the machine dispatches any phase not in its built-in `PHASES` through the run hook and records a real diary entry once it reports `done`. See the phase-registration API section below.
@@ -125,9 +125,9 @@ On `after_lizard_bootstrap` the plugin schedules a fire-and-forget pass (per age
 2. revalidates `completed` rows through the clock-free probe (see Hardening);
 3. purges the status entries whose source is absent from the canonical lists.
 
-The pass runs once at bootstrap. It is repeated periodically only when
-`CAT_INGESTION_RESUME_INTERVAL_SECONDS` is set to a positive value; unset (the
-default) or `<= 0` disables the recurring sweep.
+The pass runs once at bootstrap and then every
+`CAT_INGESTION_RESUME_INTERVAL_SECONDS` (core default `60`). Set it to `<= 0`
+to run the pass only at bootstrap.
 
 <h2>🔀 Efficient vs classic ingestion (dual flow)</h2>
 
@@ -180,10 +180,11 @@ Settings live in the global `system:agent` store, category `ingestion`:
 | --- | --- | --- |
 | `CAT_INGESTION_WORKERS` | unset (disabled) | Size of the dedicated ingestion thread pool; unset or `<= 0` disables the lane and falls back to the default executor |
 | `CAT_INGESTION_NICENESS` | `5` | `nice` applied to the ingestion worker threads; `<= 0` disables the de-prioritization |
-| `CAT_INGESTION_HEARTBEAT_SECONDS` | `30` | Interval at which a `processing` row is refreshed while being handled |
+| `CAT_INGESTION_HEARTBEAT_SECONDS` | `30` | Interval at which an in-flight row (`uploaded` / `downloading` / `downloaded` / `processing`) is refreshed while a worker handles it |
+| `CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS` | `1800` | Upper bound on the download heartbeat's lifetime; when a download fails without firing `rabbithole_url_download_completed`, the row ages out (becomes resumable) after this bound |
 | `CAT_INGESTION_RESUME_ON_STARTUP` | `true` | Enable the resume part of the sweep |
 | `CAT_INGESTION_STATUS_GC_ON_STARTUP` | `true` | Enable the reconcile (GC) part of the sweep |
-| `CAT_INGESTION_RESUME_INTERVAL_SECONDS` | unset (disabled) | Period of the recurring sweep; unset or `0` runs the pass only at bootstrap |
+| `CAT_INGESTION_RESUME_INTERVAL_SECONDS` | `60` | Period of the recurring sweep; `0` (or `<= 0`) runs the pass only at bootstrap |
 | `CAT_INGESTION_RESUME_STALE_SECONDS` | unset (claim gate disabled; sweep falls back to `300`) | Staleness gate for the per-source re-embed claim; unset or `<= 0` disables the claim gate. The resume sweep reads the same variable and falls back to `300` seconds when it is unset |
 | `CAT_INGESTION_RESUME_BOOT_STALE_SECONDS` | `2 x heartbeat` (min `30`) | Staleness used by the pass right after a restart, so rows left behind by a dead worker are recovered quickly |
 
@@ -206,6 +207,12 @@ CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
 
 The harness covers the registry/lifecycle, the phase diary, the factory and
 the endpoints, plus the RED-baseline tests for the known blockers.
+
+The old plugin-local `tests/` copies were **retired**: they targeted the
+pre-migration plugin module path, monkeypatched core enumeration helpers that
+no longer exist and would import at plugin activation. Do not re-add a
+plugin-local test suite here; add the test to
+`grinning-cat-core/tests/effing/` instead.
 
 <h2>🛠️ Installation:</h2>
 

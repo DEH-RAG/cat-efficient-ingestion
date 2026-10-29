@@ -161,13 +161,48 @@ async def before_ingestion_status_completed(source, cat):
         )
 
 
-#: System-level settings category whose configuration feeds each built-in
-#: phase. Both the chunker and the embedder are resolved from the system key
-#: (``DEFAULT_SYSTEM_KEY``), never from a per-agent key.
+#: Settings category whose configuration feeds each built-in phase.
 _PHASE_SETTINGS_CATEGORY = {
     "parsing_chunking": "chunker",
     "embedding": "embedder",
 }
+
+#: SCOPE of each built-in phase's settings entry. The marker and the
+#: fast-path ``settings_version`` MUST read the same scope the writer uses, or
+#: a real change is invisible:
+#:
+#: - ``chunker`` is an AGENT-scoped service (``CheshireCat.create`` resolves it
+#:   from ``cat.agent_key`` and ``PUT /chunking/settings`` writes it under the
+#:   caller's agent key);
+#: - ``embedder`` is SYSTEM-scoped (``PUT /embedder/settings`` writes it under
+#:   ``DEFAULT_SYSTEM_KEY`` and the re-embed pass resolves it from the system
+#:   lizard).
+#:
+#: Phases not listed here (external ones) default to the caller's agent key.
+_PHASE_SETTINGS_SCOPE = {
+    "parsing_chunking": "agent",
+    "embedding": "system",
+}
+
+
+def phase_settings_key(phase: str, agent_key: str | None) -> str:
+    """Return the settings key the phase's material configuration lives under.
+
+    ``chunker`` markers live under the caller's agent key, ``embedder`` markers
+    under ``DEFAULT_SYSTEM_KEY`` (see :data:`_PHASE_SETTINGS_SCOPE`). External
+    phases default to the caller's agent key; a missing key falls back to the
+    system key so the lookup still resolves.
+
+    Args:
+        phase: the phase id (e.g. ``"parsing_chunking"``).
+        agent_key: the caller's ``agent_key`` (may be ``None``).
+
+    Returns:
+        The settings key to read with ``get_settings_by_category``.
+    """
+    if _PHASE_SETTINGS_SCOPE.get(phase) == "system":
+        return DEFAULT_SYSTEM_KEY
+    return agent_key or DEFAULT_SYSTEM_KEY
 
 
 def _material_settings(value: object) -> dict:
@@ -196,13 +231,13 @@ async def ingestion_phase_settings_marker(phase, cat):
     The machine compares this marker against the one recorded in the
     ``completed_phases`` diary entry to decide whether the phase's settings
     changed materially (clock-free invalidation). For the built-in phases this
-    returns a stable, sorted JSON fingerprint of the **system-level** service
-    configuration:
+    returns a stable, sorted JSON fingerprint of the service configuration,
+    read from the SAME scope the corresponding route writes:
 
-    - ``parsing_chunking`` -> the ``chunker`` category (class/config name plus
-      the chunker fields, e.g. size and overlap);
-    - ``embedding`` -> the ``embedder`` category (class/config name plus the
-      model/name and, when stored, the embedding size).
+    - ``parsing_chunking`` -> the AGENT-scoped ``chunker`` category (class/config
+      name plus the chunker fields, e.g. size and overlap);
+    - ``embedding`` -> the SYSTEM-scoped ``embedder`` category (class/config
+      name plus the model/name and, when stored, the embedding size).
 
     Any unknown phase returns ``None`` ("unknown"), which the machine treats
     conservatively as stale. A known phase whose settings entry is missing
@@ -210,18 +245,19 @@ async def ingestion_phase_settings_marker(phase, cat):
 
     Args:
         phase: the phase id whose marker is requested (e.g. ``"embedding"``).
-        cat: the CheshireCat instance (unused: the services are system-level;
-            accepted for the hook contract and may be ``None``).
+        cat: the caller (CheshireCat/StrayCat/lizard) whose ``agent_key``
+            selects the chunker scope; may be ``None`` in unit tests.
 
     Returns:
         A deterministic ``json.dumps(..., sort_keys=True)`` string, or
-        ``None`` for an unknown phase / missing system settings entry.
+        ``None`` for an unknown phase / missing settings entry.
     """
     category = _PHASE_SETTINGS_CATEGORY.get(phase)
     if category is None:
         return None
 
-    settings_doc = await crud_settings.get_settings_by_category(DEFAULT_SYSTEM_KEY, category)
+    settings_key = phase_settings_key(phase, getattr(cat, "agent_key", None))
+    settings_doc = await crud_settings.get_settings_by_category(settings_key, category)
     if not isinstance(settings_doc, dict):
         return None
 

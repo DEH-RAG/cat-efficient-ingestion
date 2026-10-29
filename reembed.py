@@ -43,13 +43,13 @@ from cat.services.factory.ingestion import BaseIngestionEngine
 from cat.services.memory.models import PointStruct, VectorMemoryType
 from cat.utils import get_nlp_object_name, guess_file_type, is_url
 
-from cat.plugins.cat_multimodal_ingestion.ingestion import (
+from cat.core_plugins.cat_multimodal_ingestion.ingestion import (
     collect_document_images,
     image_file_name,
     strip_image_payload,
 )
 
-from .hooks import execute_phase_hook
+from .hooks import execute_phase_hook, phase_settings_key
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import merged_phases
 from .registry import (
@@ -115,6 +115,53 @@ def _claim_stale_after() -> float:
     """
     value = get_env_int("CAT_INGESTION_RESUME_STALE_SECONDS")
     return float(value) if value and value > 0 else 0.0
+
+
+def _heartbeat_interval() -> float:
+    """Interval (seconds) at which an in-flight ingestion row is refreshed."""
+    value = get_env_int("CAT_INGESTION_HEARTBEAT_SECONDS")
+    return float(value) if value and value > 0 else 30.0
+
+
+async def _start_heartbeat(ccat, source_name: str, scope: str, cat) -> None:
+    """Start refreshing the claimed row while a batch/recovery phase runs.
+
+    ``engine.run`` and the resume sweep call :func:`reembed_sources` directly
+    (not through ``ingest_file``), so without this the row has no heartbeat and
+    a phase longer than the boot-stale threshold (60 s) could be re-claimed by
+    the next periodic sweep. Best-effort: a missing plugin manager (unit tests)
+    or hook never breaks the pass.
+    """
+    plugin_manager = getattr(ccat, "plugin_manager", None)
+    if plugin_manager is None:
+        return
+    try:
+        await plugin_manager.execute_hook(
+            "rabbithole_processing_heartbeat_start",
+            source_name, scope, _heartbeat_interval(), caller=cat,
+        )
+    except Exception as e:  # noqa: BLE001 - a heartbeat must never break ingestion
+        log.warning(
+            f"Agent id: {ccat._id}. Could not start the ingestion heartbeat "
+            f"for {source_name}: {e}"
+        )
+
+
+async def _stop_heartbeat(ccat, source_name: str, scope: str, cat) -> None:
+    """Cancel the heartbeat started by :func:`_start_heartbeat` (best-effort)."""
+    plugin_manager = getattr(ccat, "plugin_manager", None)
+    if plugin_manager is None:
+        return
+    try:
+        await plugin_manager.execute_hook(
+            "rabbithole_processing_heartbeat_stop",
+            source_name, scope, caller=cat,
+        )
+    except Exception as e:  # noqa: BLE001 - stopping must never break the pass
+        log.warning(
+            f"Agent id: {ccat._id}. Could not stop the ingestion heartbeat "
+            f"for {source_name}: {e}"
+        )
 
 
 async def _cleanup_orphan_images(ccat, collection_name, source_name, chat_id) -> None:
@@ -544,8 +591,10 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
     )
     settings_version = None
     if spec.settings_category is not None:
+        agent_key = getattr(cat, "agent_key", None) or ccat.agent_key
+        settings_key = phase_settings_key(spec.id, agent_key)
         settings_doc = await crud_settings.get_settings_by_category(
-            getattr(cat, "agent_key", None) or ccat.agent_key, spec.settings_category
+            settings_key, spec.settings_category
         )
         if isinstance(settings_doc, dict):
             settings_version = settings_doc.get("updated_at")
@@ -631,10 +680,11 @@ async def _run_parsing_phase(
     await _raise_if_canceled(ccat)
     await _clear_source_artifacts(ccat, collection_name, source_name, chat_id)
 
-    # ensure the rabbit_hole context is wired on the ccat (URL download +
-    # parsing helpers read ``self.cat``)
-    if rabbit_hole.cat is None:
-        await rabbit_hole.setup(ccat)
+    # (Re)point the shared rabbit_hole at the ccat being processed. The lizard
+    # owns ONE RabbitHole for every agent, and ``_split_text`` reads
+    # ``self.cat.chunker``: leaving a stale ``cat`` here makes every agent parse
+    # with the FIRST agent's chunker, so a chunker change is never applied.
+    await rabbit_hole.setup(ccat)
 
     # 2. resolve the source bytes: file already on disk (via the resume/upload),
     #    or a URL to (re)download.
@@ -834,6 +884,10 @@ async def reembed_sources(
             # another worker is already (re)processing this source
             continue
 
+        # Batch/recovery passes do not go through ``ingest_file``: keep the
+        # claimed row fresh here, otherwise a phase longer than the boot-stale
+        # threshold could be re-claimed by the next periodic sweep.
+        await _start_heartbeat(ccat, source_name, scope, cat)
         try:
             # ---- SERIAL PROBE-DRIVEN PHASE DISPATCH ----
             # One phase at a time, in probe order. After each phase body
@@ -957,6 +1011,8 @@ async def reembed_sources(
         except Exception as e:  # noqa: BLE001 - a failing source must not abort the pass
             log.error(f"Agent id: {ccat._id}. Error re-embedding source {source_name}: {e}")
             await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
+        finally:
+            await _stop_heartbeat(ccat, source_name, scope, cat)
 
     log.info(f"Agent id: {ccat._id}. Embedded {counter} files to the vector memory")
 
@@ -1072,7 +1128,7 @@ class EfficientIngestionEngine(BaseIngestionEngine):
             embedder_name = embedder.name
             embedder_size = embedder.size
 
-            ccat_ids = await crud_settings.get_agents_main_keys()
+            ccat_ids = [a["agent_id"] for a in await crud_settings.get_agents()]
             stored_files_by_ccat = []
             # first, get all the stored files from all the Cheshire Cats with the
             # metadata stored within the vector memory; nothing is removed from

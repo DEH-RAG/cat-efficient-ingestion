@@ -15,9 +15,11 @@ doc via ``crud.read``; ``clear_agent`` wipes the namespace via
 ``downloading``/``downloaded`` rows are NOT dead ends: :func:`claim_source_for_resume`
 accepts them (like ``uploaded``/``processing``/``error``) so the resume sweep
 reclaims a download that crashed between download and processing and restarts
-it from the URL. The existing ``updated_at`` staleness gate is the age/lease
-threshold: a row actively downloading is kept fresh by its writer and is never
-stolen before the threshold expires. In-flight rows are still never purged by
+it from the URL. The ``updated_at`` staleness gate is the age/lease threshold,
+and the downloading writer keeps the row fresh through a real heartbeat
+(:func:`plugin._heartbeat_status`, started by ``rabbithole_url_downloading``),
+so an active download is never stolen; a failed download's heartbeat is
+time-bounded and the row ages out (becomes resumable). In-flight rows are still never purged by
 the reconcile/DELETE paths (the DELETE endpoint keeps refusing ``uploaded`` /
 ``downloading`` / ``downloaded`` / ``processing``); recovery is the resume
 sweep's job, not the purge path's.
@@ -29,6 +31,7 @@ from cat.db import crud
 from cat.db.crud import escape_glob
 from cat.db.cruds import settings as crud_settings
 from cat.db.models import generate_timestamp
+from cat.env import get_env_int
 from cat.utils import Enum
 
 
@@ -439,6 +442,19 @@ async def record_phase_completed(
     )
 
 
+def _resume_created_lease_seconds() -> float:
+    """Time-bounded lease for the ``resume_created`` guard.
+
+    A row created by the no-doc claim path is refused to a second claim while
+    it is still being worked on. The lease makes that refusal FINITE even when
+    the staleness gate is disabled (``stale_after <= 0``): the live writer keeps
+    ``updated_at`` fresh through the heartbeat, and once the writer stops (crash
+    or completion) the row becomes reclaimable after the lease.
+    """
+    heartbeat = get_env_int("CAT_INGESTION_HEARTBEAT_SECONDS")
+    return float(max(30, 2 * heartbeat)) if heartbeat and heartbeat > 0 else 60.0
+
+
 async def claim_source_for_resume(
     agent_id: str,
     scope: str,
@@ -535,14 +551,19 @@ async def claim_source_for_resume(
             return created if stored is not None else None
 
         status = doc.get("status")
-        if (
-            doc.get("resume_created")
-            and status == IngestionStatus.PROCESSING.value
-            and stale_after <= 0
-        ):
-            # Created by the no-doc claim path and still in flight: only a
-            # positive staleness gate (crash recovery) may reclaim it.
-            return None
+        if doc.get("resume_created") and status == IngestionStatus.PROCESSING.value:
+            # Created by the no-doc claim path and still in flight: refuse an
+            # immediate second claim, but never forever. With a positive
+            # staleness gate the gate itself bounds the refusal; with the gate
+            # disabled a time-bounded lease does (the live writer refreshes
+            # ``updated_at`` via the heartbeat).
+            try:
+                created_updated_at = float(doc.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                created_updated_at = 0
+            lease = stale_after if stale_after > 0 else _resume_created_lease_seconds()
+            if time.time() - created_updated_at < lease:
+                return None
         if status == IngestionStatus.COMPLETED.value:
             # Completed rows are never re-claimed by the resume sweep; the
             # engine may claim them for re-embedding only when it already

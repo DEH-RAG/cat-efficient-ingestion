@@ -58,7 +58,7 @@ from typing import Any
 from cat import hook
 from cat.db.cruds import settings as crud_settings
 
-from .hooks import execute_phase_hook
+from .hooks import execute_phase_hook, phase_settings_key
 from .registry import get_completed_phases
 
 
@@ -264,8 +264,9 @@ async def ingestion_phase_pending(
         current_marker = None
         if cat is not None:
             if spec.settings_category is not None:
+                settings_key = phase_settings_key(spec.id, getattr(cat, "agent_key", None))
                 settings_doc = await crud_settings.get_settings_by_category(
-                    getattr(cat, "agent_key", None), spec.settings_category
+                    settings_key, spec.settings_category
                 )
                 if isinstance(settings_doc, dict):
                     current_settings_updated_at = settings_doc.get("updated_at")
