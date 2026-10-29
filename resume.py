@@ -7,7 +7,7 @@ the ``after_lizard_bootstrap`` hook schedules a fire-and-forget background pass
   (a) resumes stale ``uploaded``/``downloading``/``downloaded``/``processing``/
       ``error`` ingestions by handing each candidate to the SAME phase machine
       used by the re-embed pass
-      (:func:`reembed_sources <cat.plugins.cat_efficient_ingestion.reembed.reembed_sources>`);
+      (:func:`reembed_sources <cat.core_plugins.cat_efficient_ingestion.reembed.reembed_sources>`);
       the machine re-reads the file from disk (or re-downloads the URL), claims
       the per-source work, records the phase, cleans up orphan images and
       performs the full re-ingest;

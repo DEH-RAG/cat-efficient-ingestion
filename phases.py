@@ -33,6 +33,20 @@ built-in ``PHASES`` at probe time — built-ins win on duplicate ids — and the
 phases, so a provider only declares a spec + a marker and never re-implements
 staleness.
 
+**Third-party extension contract.** A plugin exposing a phase must (1) declare
+a dependency on ``cat_efficient_ingestion`` — the FOLDER id with underscores,
+not the hyphenated repo name, because ``Plugin.missing_dependencies`` compares
+against plugin folder names — (2) import :class:`PhaseSpec` from the canonical
+path ``cat.core_plugins.cat_efficient_ingestion.phases`` inside a module-top
+``try/except ImportError``, (3) define its phase hooks (or no-op stand-ins)
+ONLY when that import succeeded, and (4) keep the classic CAT ingestion hooks
+so basic ingestion still works when EffING is absent. The canonical path is
+mandatory: the host loads ``cat/core_plugins/`` in preference to
+``cat/plugins/`` and derives the module name from the folder, so importing the
+same file through another path creates a SECOND module identity and
+:func:`merged_phases`' ``isinstance(spec, PhaseSpec)`` check would silently
+drop the spec.
+
 Import-safe: the only top-level statements are the dataclass, the ``PHASES``
 data structure and the ``@hook`` decorator — no Redis, no network, no
 filesystem access at import time.

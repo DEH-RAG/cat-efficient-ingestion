@@ -72,6 +72,28 @@ A provider only declares a spec + a marker + an execution hook:
 
 EffING computes staleness for ALL merged phases (deps by upstream marker identity + marker comparison), so a provider never re-implements the pending probe. Registered phases get REAL diary entries: `_record_phase` writes the marker from `ingestion_phase_settings_marker`, reads `settings_version` only when `settings_category` is set, and copies `deps` from the current diary upstream markers — the same atomic-completion invariant as the built-ins. A registered phase is therefore restartable and re-runs automatically when its upstreams re-run or its marker changes.
 
+<h2>🧩 Third-party phase-extension contract</h2>
+
+A plugin that exposes an ingestion phase depends on EffING **optionally** and follows this contract:
+
+1. **Declare the dependency by folder id, with underscores.** `plugin.json` `"dependencies"` must list `cat_efficient_ingestion` (the folder id), never the hyphenated repo name `cat-efficient-ingestion`. `Plugin.missing_dependencies` (`cat/looking_glass/mad_hatter/plugin.py:264-274`) compares dependency strings against **plugin folder names**, so the hyphenated form is reported missing and silently blocks the consumer from loading.
+2. **Import `PhaseSpec` from the canonical path inside a guarded import, at module top level:**
+
+   ```python
+   from cat import hook
+
+   try:
+       from cat.core_plugins.cat_efficient_ingestion.phases import PhaseSpec
+   except ImportError:  # EffING not installed: degrade to classic ingestion only
+       PhaseSpec = None
+   ```
+
+   The canonical path is `cat.core_plugins.cat_efficient_ingestion.phases`. The host loads `cat/core_plugins/` in preference to `cat/plugins/` and derives the module name from the folder, so importing the same file through any other path (e.g. `cat.plugins.…`) yields a **second module identity**. `merged_phases` accepts a spec only when `isinstance(spec, PhaseSpec)` — with two identities that is `False` and the spec is silently dropped.
+3. **Define the phase hooks only when the import succeeded** (or make them no-ops when `PhaseSpec is None`): `ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`.
+4. **Keep the classic CAT ingestion hooks** (`rabbithole_ingestion_processing`, the `before_rabbithole_*` hooks, …) unconditionally, so **basic ingestion still works when EffING is absent**.
+
+Never require EffING at import time and never make `PhaseSpec` duck-typed: the strict class identity is what guarantees the spec reaches the phase machine. The host harness pins this contract in `tests/effing/test_phase_extension_contract.py` (fixture plugin `tests/effing/fixtures/phase_consumer/`), covering both the EffING-present and EffING-blocked imports.
+
 <h2>🔁 Probe-driven dispatcher</h2>
 
 `reembed_sources` is the one probe-driven dispatcher. For each source it reads the `completed_phases` diary (backfilling legacy completed rows), converts it to the hook list shape and threads it into the `ingestion_phase_pending` accumulator. Registrants compare the diary against the current settings markers/versions and report the stale phases:
