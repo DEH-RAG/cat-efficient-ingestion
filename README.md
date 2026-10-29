@@ -178,7 +178,7 @@ Settings live in the global `system:agent` store, category `ingestion`:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CAT_INGESTION_WORKERS` | unset (disabled) | Size of the dedicated ingestion thread pool; unset or `<= 0` disables the lane and falls back to the default executor |
+| `CAT_INGESTION_WORKERS` | `2` | Size of the dedicated ingestion thread pool. An explicit value `<= 0` (or an empty/invalid value) disables the lane and falls back to the default executor |
 | `CAT_INGESTION_NICENESS` | `5` | `nice` applied to the ingestion worker threads; `<= 0` disables the de-prioritization |
 | `CAT_INGESTION_HEARTBEAT_SECONDS` | `30` | Interval at which an in-flight row (`uploaded` / `downloading` / `downloaded` / `processing`) is refreshed while a worker handles it |
 | `CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS` | `1800` | Upper bound on the download heartbeat's lifetime; when a download fails without firing `rabbithole_url_download_completed`, the row ages out (becomes resumable) after this bound |
