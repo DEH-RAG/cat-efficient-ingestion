@@ -14,11 +14,13 @@ the five ``@hook`` decorators (which merely wrap the functions in ``CatHook``
 instances). No Redis, no network, no filesystem access.
 """
 
+import inspect
 import json
 
 from cat import hook
 from cat.db.cruds import settings as crud_settings
 from cat.db.database import DEFAULT_SYSTEM_KEY
+from cat.exceptions import CustomHookVetoException
 from cat.utils import SUFFIX_TO_CRYPT
 
 # The ``completed_phases`` argument threaded through the hooks is a
@@ -82,12 +84,19 @@ def ingestion_phase_run(phase, source, completed_phases, cat):
 
 
 @hook(priority=0)
-def before_ingestion_status_completed(source, cat):
+async def before_ingestion_status_completed(source, cat):
     """Final gate before ``source`` is marked COMPLETED.
 
     Called right before the machine writes the COMPLETED status for a source.
-    A registrant raises to force the source to ERROR instead; the default is a
-    no-op (the source is allowed to complete).
+    A registrant that wants to veto the completion raises
+    :class:`cat.exceptions.CustomHookVetoException`; the dispatcher propagates
+    it (unlike ordinary errors, which are logged and swallowed) so the caller
+    marks the source ``error`` with the reason instead of ``completed``.
+
+    The built-in implementation vetoes when the caller exposes pending
+    post-phase work through a ``has_pending_source_tasks(source)`` probe
+    (sync or async, e.g. a graph handler attached to the cat). Without such a
+    probe it is a no-op and the source is allowed to complete.
 
     Args:
         source: the source about to be marked completed (e.g. ``"doc.pdf"``).
@@ -95,8 +104,21 @@ def before_ingestion_status_completed(source, cat):
 
     Returns:
         ``None`` (default).
+
+    Raises:
+        CustomHookVetoException: when the caller reports pending source tasks.
     """
-    return None
+    probe = getattr(cat, "has_pending_source_tasks", None)
+    if probe is None:
+        return
+
+    pending = probe(source)
+    if inspect.isawaitable(pending):
+        pending = await pending
+    if pending:
+        raise CustomHookVetoException(
+            f"Pending ingestion tasks for source '{source}'"
+        )
 
 
 #: System-level settings category whose configuration feeds each built-in

@@ -24,6 +24,7 @@ from langchain_core.documents import Document
 from cat import hook
 from cat.db import crud
 from cat.db.models import generate_timestamp
+from cat.exceptions import CustomHookVetoException
 from cat.log import log
 
 from .configs import EfficientIngestionConfiguration
@@ -309,6 +310,20 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
         await cat.plugin_manager.execute_hook(
             "before_ingestion_status_completed", source, caller=cat
         )
+    except CustomHookVetoException as e:
+        # a hook refused the completion: honour it and record the reason
+        log.warning(f"Ingestion completion vetoed for {source}: {e}")
+        await set_status(
+            cat.agent_key,
+            scope,
+            source,
+            type_=_source_type(source),
+            status=IngestionStatus.ERROR,
+            chat_id=chat_id,
+            error=str(e),
+            clear_phase=True,
+        )
+        return
     except Exception as e:  # noqa: BLE001 - the gate decides the terminal state
         await set_status(
             cat.agent_key,

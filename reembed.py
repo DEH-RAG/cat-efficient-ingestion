@@ -35,7 +35,7 @@ from langchain_core.documents.base import Blob
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
 from cat.db.cruds import settings as crud_settings
 from cat.env import get_env_int
-from cat.exceptions import CustomNotFoundException
+from cat.exceptions import CustomHookVetoException, CustomNotFoundException
 from cat.log import log
 from cat.looking_glass.models import StoredSourceWithMetadata
 from cat.services.factory.embedder import is_multimodal_embedder
@@ -543,6 +543,13 @@ async def _complete_source(ccat, cat, scope, source_name, chat_id) -> None:
         await ccat.plugin_manager.execute_hook(
             "before_ingestion_status_completed", source_name, caller=cat
         )
+    except CustomHookVetoException as e:
+        # a hook refused the completion: honour it and record the reason
+        log.warning(
+            f"Agent id: {ccat._id}. Ingestion completion vetoed for {source_name}: {e}"
+        )
+        await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
+        return
     except Exception as e:  # noqa: BLE001 - the gate decides the terminal state
         log.error(
             f"Agent id: {ccat._id}. before_ingestion_status_completed gate failed "
