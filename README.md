@@ -132,6 +132,26 @@ Settings live in the global `system:agent` store, category `ingestion`:
 | `CAT_INGESTION_RESUME_STALE_SECONDS` | `300` | How old an entry must be to be claimable by the sweep |
 | `CAT_INGESTION_RESUME_BOOT_STALE_SECONDS` | `2 x heartbeat` (min `30`) | Staleness used by the pass right after a restart, so rows left behind by a dead worker are recovered quickly |
 
+<h2>🧪 Tests</h2>
+
+The authoritative test suite for this plugin lives in the host repo at
+`grinning-cat-core/tests/effing/`, not here. The host imports **every** `.py`
+file inside a plugin folder recursively when it activates the plugin, so a
+`conftest.py` (or any module that mutates the environment / boots the app)
+placed under `tests/` would be imported by the running Cat and poison it. The
+host harness is the only place that may own the Redis isolation
+(`CAT_REDIS_DB=1`), the host fixtures (`lizard`, `secure_client`,
+`cheshire_cat`, …) and the Redis connection setup.
+
+Run it from the core checkout:
+
+```bash
+CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
+```
+
+The harness covers the registry/lifecycle, the phase diary, the factory and
+the endpoints, plus the RED-baseline tests for the known blockers.
+
 <h2>🛠️ Installation:</h2>
 
 <p>1. Clone this repo and copy it on cat plugins folder</p>
