@@ -10,6 +10,17 @@ Every status transition is written as a Redis-JSON document via ``cat.db.crud``
 the agent-scoped host CRUD API (``get_ingestion_status_keys``) and reads every
 doc via ``crud.read``; ``clear_agent`` wipes the namespace via
 ``crud.destroy`` and re-stores the delete marker. No raw Redis client.
+
+**Stuck download policy: resumable, never purgeable while in flight.**
+``downloading``/``downloaded`` rows are NOT dead ends: :func:`claim_source_for_resume`
+accepts them (like ``uploaded``/``processing``/``error``) so the resume sweep
+reclaims a download that crashed between download and processing and restarts
+it from the URL. The existing ``updated_at`` staleness gate is the age/lease
+threshold: a row actively downloading is kept fresh by its writer and is never
+stolen before the threshold expires. In-flight rows are still never purged by
+the reconcile/DELETE paths (the DELETE endpoint keeps refusing ``uploaded`` /
+``downloading`` / ``downloaded`` / ``processing``); recovery is the resume
+sweep's job, not the purge path's.
 """
 import hashlib
 from typing import Dict, List, Optional
@@ -437,8 +448,14 @@ async def claim_source_for_resume(
 
     A source is claimable only when its current status allows a (re)start and
     its last update is older than ``stale_after`` (seconds): a fresh
-    ``uploaded``/``processing`` row means another worker is already handling
-    it, so this call returns None instead of double-ingesting.
+    ``uploaded``/``processing``/``downloading`` row means another worker is
+    already handling it, so this call returns None instead of
+    double-ingesting.
+
+    ``downloading``/``downloaded`` are resumable: a crash between the download
+    and the processing phase leaves such a row behind, and the resume sweep
+    must be able to reclaim it. The same ``stale_after`` gate protects a
+    source that is actively downloading from being stolen.
 
     When ``claim_completed`` is True a ``completed`` row is ALSO claimable
     (regardless of staleness): used by the ingestion engine to re-embed a
@@ -482,14 +499,17 @@ async def claim_source_for_resume(
                 return None
         elif status not in (
             IngestionStatus.UPLOADED.value,
+            IngestionStatus.DOWNLOADING.value,
+            IngestionStatus.DOWNLOADED.value,
             IngestionStatus.PROCESSING.value,
             IngestionStatus.ERROR.value,
         ):
             return None
 
-        # Fresh in-flight work (uploaded/processing) is only claimable when
-        # stale; completed rows (engine re-embed) have no in-flight counterpart,
-        # so they bypass the staleness gate: a completed row is never "in flight".
+        # Fresh in-flight work (uploaded/downloading/downloaded/processing) is
+        # only claimable when stale; completed rows (engine re-embed) have no
+        # in-flight counterpart, so they bypass the staleness gate: a
+        # completed row is never "in flight".
         if status != IngestionStatus.COMPLETED.value:
             try:
                 updated_at = float(doc.get("updated_at") or 0)

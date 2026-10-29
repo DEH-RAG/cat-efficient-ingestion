@@ -4,8 +4,9 @@ The recovery loop of the ingestion lifecycle lives ONLY in this plugin:
 the ``after_lizard_bootstrap`` hook schedules a fire-and-forget background pass
 (per agent) that:
 
-  (a) resumes stale ``uploaded``/``processing``/``error`` ingestions by handing
-      each candidate to the SAME phase machine used by the re-embed pass
+  (a) resumes stale ``uploaded``/``downloading``/``downloaded``/``processing``/
+      ``error`` ingestions by handing each candidate to the SAME phase machine
+      used by the re-embed pass
       (:func:`reembed_sources <cat.plugins.cat_efficient_ingestion.reembed.reembed_sources>`);
       the machine re-reads the file from disk (or re-downloads the URL), claims
       the per-source work, records the phase, cleans up orphan images and
@@ -39,6 +40,7 @@ Importing this module has zero side effects: the loop only starts from the
 
 import asyncio
 import os
+import time
 from io import BytesIO
 from typing import Any
 
@@ -161,14 +163,21 @@ def _source_from_entry(ccat, agent_id: str, scope: str, source: str, type_: str 
 async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) -> None:
     """Re-trigger stale ingestions for one agent through the ONE state machine.
 
-    Only entries in ``uploaded``/``processing``/``error`` older than the stale
-    threshold are candidates; each is handed to ``reembed_sources`` (the same
-    phase machine used for re-embed): it decides the phase from the status doc,
-    claims the per-source work atomically (so two workers never double-process),
-    records the phase, cleans up any orphan images and performs the full re-ingest
-    from disk (or URL re-download). Fresh entries and ``completed`` entries are
-    left untouched (completed rows are revalidated by :func:`_revalidate_agent`).
-    A canceled agent (deletion marker or ghost) is skipped entirely.
+    Only entries in ``uploaded``/``downloading``/``downloaded``/``processing``/
+    ``error`` older than the stale threshold are candidates; each is handed to
+    ``reembed_sources`` (the same phase machine used for re-embed): it decides
+    the phase from the status doc, claims the per-source work atomically (so
+    two workers never double-process), records the phase, cleans up any orphan
+    images and performs the full re-ingest from disk (or URL re-download).
+    Fresh entries and ``completed`` entries are left untouched (completed rows
+    are revalidated by :func:`_revalidate_agent`). A canceled agent (deletion
+    marker or ghost) is skipped entirely.
+
+    ``downloading``/``downloaded`` are resumable (a crash between download and
+    processing would otherwise be a permanent dead end). They have no PROCESSING
+    heartbeat, so they are gated by the regular resume threshold
+    (``CAT_INGESTION_RESUME_STALE_SECONDS``, default 300s) — never the shorter
+    boot threshold — so an actively downloading source is not stolen.
     """
     if await ingestion_canceled(agent_id):
         # agent is being deleted (marker) or dead (ghost): never resume it
@@ -183,15 +192,37 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
         return
 
     boot_stale = _boot_stale_seconds()
+    # downloading/downloaded have no heartbeat: use the larger resume threshold
+    # so a live download is never re-claimed before it looks genuinely stale.
+    download_stale = max(boot_stale, float(_stale_seconds()))
+    now = time.time()
     entries = await list_statuses(agent_id)
     for entry in entries:
         status = entry.get("status")
         if status not in (
             IngestionStatus.UPLOADED.value,
+            IngestionStatus.DOWNLOADING.value,
+            IngestionStatus.DOWNLOADED.value,
             IngestionStatus.PROCESSING.value,
             IngestionStatus.ERROR.value,
         ):
             continue
+
+        # A download has no PROCESSING heartbeat: only touch it once it is
+        # older than the download threshold (an active download stays fresh).
+        if status in (
+            IngestionStatus.DOWNLOADING.value,
+            IngestionStatus.DOWNLOADED.value,
+        ):
+            try:
+                updated_at = float(entry.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                updated_at = 0
+            if now - updated_at < download_stale:
+                continue
+            claim_stale = download_stale
+        else:
+            claim_stale = boot_stale
 
         source = entry.get("source")
         scope = entry.get("scope")
@@ -212,11 +243,11 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
             f"Ingestion resume: handing {source} (status {status}, phase {entry.get('phase')!r}) "
             f"to the ingestion phase machine for {agent_id}"
         )
-        # The phase machine claims the per-source work itself, using the boot
-        # staleness so a freshly-crashed row is recoverable at restart.
+        # The phase machine claims the per-source work itself, using the same
+        # staleness budget chosen above for this entry's status.
         await reembed_sources(
             ccat, _collection_for_scope(str(scope)), [source_obj],
-            stale_after=boot_stale,
+            stale_after=claim_stale,
         )
 
 
