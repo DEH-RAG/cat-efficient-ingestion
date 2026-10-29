@@ -21,7 +21,47 @@ from cat import hook
 from cat.db.cruds import settings as crud_settings
 from cat.db.database import DEFAULT_SYSTEM_KEY
 from cat.exceptions import CustomHookVetoException
+from cat.log import log
 from cat.utils import SUFFIX_TO_CRYPT
+
+
+def _hook_missing_from_manager(plugin_manager, hook_name: str) -> bool:
+    """True when ``plugin_manager`` has no registrant for ``hook_name``."""
+    hooks = getattr(plugin_manager, "hooks", None)
+    return isinstance(hooks, dict) and hook_name not in hooks
+
+
+def _is_missing_hook_error(exc: Exception, hook_name: str) -> bool:
+    """True for the dispatcher's "hook not present in any plugin" error only."""
+    return str(exc) == f"Hook {hook_name} not present in any plugin"
+
+
+async def execute_phase_hook(
+    plugin_manager, hook_name: str, *args, default=None, caller=None
+):
+    """Execute a phase hook, degrading when the hook is absent.
+
+    A missing phase hook means "no external phases": the dispatcher exception
+    is swallowed and ``default`` (or ``default()`` when it is a factory, e.g.
+    ``list``) is returned after a warning. Errors raised BY an existing hook
+    are never swallowed — they propagate unchanged.
+    """
+    def _degraded():
+        log.warning(
+            f"Phase hook {hook_name} is not present in any active plugin: "
+            f"treating it as no external phases"
+        )
+        return default() if callable(default) else default
+
+    if _hook_missing_from_manager(plugin_manager, hook_name):
+        return _degraded()
+
+    try:
+        return await plugin_manager.execute_hook(hook_name, *args, caller=caller)
+    except Exception as exc:  # noqa: BLE001 - only the missing-hook error degrades
+        if not _is_missing_hook_error(exc, hook_name):
+            raise
+        return _degraded()
 
 # The ``completed_phases`` argument threaded through the hooks is a
 # ``list[dict]`` where every entry carries at least a ``"phase"`` key

@@ -44,6 +44,7 @@ from typing import Any
 from cat import hook
 from cat.db.cruds import settings as crud_settings
 
+from .hooks import execute_phase_hook
 from .registry import get_completed_phases
 
 
@@ -101,7 +102,9 @@ async def merged_phases(ccat, cat) -> dict[str, PhaseSpec]:
     )
     if plugin_manager is None:
         return merged
-    specs = await plugin_manager.execute_hook("ingestion_phase_specs", [], caller=cat)
+    specs = await execute_phase_hook(
+        plugin_manager, "ingestion_phase_specs", [], default=list, caller=cat
+    )
     if not isinstance(specs, list):
         return merged
     for spec in specs:

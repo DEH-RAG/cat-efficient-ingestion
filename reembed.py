@@ -49,6 +49,7 @@ from cat.plugins.cat_multimodal_ingestion.ingestion import (
     strip_image_payload,
 )
 
+from .hooks import execute_phase_hook
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import merged_phases
 from .registry import (
@@ -383,8 +384,14 @@ async def _probe_pending(ccat, cat, source_name, doc) -> list:
         doc or {}, list((await merged_phases(ccat, cat)).keys())
     )
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-    pending = await ccat.plugin_manager.execute_hook(
-        "ingestion_phase_pending", [], source_name, completed_as_list, caller=cat
+    pending = await execute_phase_hook(
+        ccat.plugin_manager,
+        "ingestion_phase_pending",
+        [],
+        source_name,
+        completed_as_list,
+        default=list,
+        caller=cat,
     )
     return [p for p in (pending or []) if p and p.get("phase")]
 
@@ -419,8 +426,14 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
     retries = 0
     while True:
         try:
-            result = await ccat.plugin_manager.execute_hook(
-                "ingestion_phase_run", phase, source_name, completed_as_list, caller=cat
+            result = await execute_phase_hook(
+                ccat.plugin_manager,
+                "ingestion_phase_run",
+                phase,
+                source_name,
+                completed_as_list,
+                default=None,
+                caller=cat,
             )
         except Exception as e:  # noqa: BLE001 - a raising registrant is a permanent failure
             log.error(

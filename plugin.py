@@ -28,6 +28,7 @@ from cat.exceptions import CustomHookVetoException
 from cat.log import log
 
 from .configs import EfficientIngestionConfiguration
+from .hooks import execute_phase_hook
 from .phases import PHASES
 from .registry import (
     PHASE_DOWNLOADING,
@@ -287,8 +288,14 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
     # shape, thread it into the accumulator and keep only the stale phases.
     completed = await backfill_completed_phases(current or {}, list(PHASES.keys()))
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-    pending = await cat.plugin_manager.execute_hook(
-        "ingestion_phase_pending", [], source, completed_as_list, caller=cat
+    pending = await execute_phase_hook(
+        cat.plugin_manager,
+        "ingestion_phase_pending",
+        [],
+        source,
+        completed_as_list,
+        default=list,
+        caller=cat,
     )
     pending = [p for p in (pending or []) if p and p.get("phase")]
 
