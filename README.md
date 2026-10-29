@@ -125,7 +125,40 @@ On `after_lizard_bootstrap` the plugin schedules a fire-and-forget pass (per age
 2. revalidates `completed` rows through the clock-free probe (see Hardening);
 3. purges the status entries whose source is absent from the canonical lists.
 
-The pass is repeated every `CAT_INGESTION_RESUME_INTERVAL_SECONDS`.
+The pass runs once at bootstrap. It is repeated periodically only when
+`CAT_INGESTION_RESUME_INTERVAL_SECONDS` is set to a positive value; unset (the
+default) or `<= 0` disables the recurring sweep.
+
+<h2>🔀 Efficient vs classic ingestion (dual flow)</h2>
+
+CAT can ingest a source through **one of two flows**, and they are mutually
+exclusive for a given source:
+
+- **Classic ingestion** — the core `RabbitHole` pipeline. It emits
+  `before_rabbithole_stores_documents` before storing and
+  `after_rabbithole_stored_documents` at the end.
+- **Efficient ingestion** — `EfficientIngestionEngine` (this plugin) selected
+  through the `factory_allowed_ingestions` factory. It runs the
+  `parsing_chunking -> embedding` phase machine, stores through its own phase
+  bodies and emits the `ingestion_phase_*` hooks
+  (`ingestion_phase_pending`, `ingestion_phase_run`,
+  `ingestion_phase_settings_marker`, `ingestion_phase_specs`) plus
+  `before_ingestion_status_completed`. It does **not** emit
+  `before_rabbithole_stores_documents` — the phase machine calls the
+  token-budget split directly.
+
+**Mutual-exclusion rule:** a hook handler that must run exactly once per
+source has to pick the flow it belongs to. Do the work on
+`before_rabbithole_stores_documents` for the classic path, or on the
+`ingestion_phase_*` hooks (e.g. `ingestion_phase_run`) for the efficient path —
+never assume both will fire, and never run the same work from both.
+
+**Hard rule:** never use `after_rabbithole_stored_documents` to detect the
+classic path. **BOTH** flows emit it: the core `RabbitHole` at the end of the
+classic pipeline and this plugin after its `embedding` phase replaces the
+points. Anything registered there runs in both flows and cannot tell them
+apart; use `before_rabbithole_stores_documents` (classic only) or the phase
+hooks (efficient only) instead.
 
 <h2>🧵 Ingestion executor lane</h2>
 
@@ -145,13 +178,13 @@ Settings live in the global `system:agent` store, category `ingestion`:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CAT_INGESTION_WORKERS` | `2` | Size of the dedicated ingestion thread pool; `<= 0` disables the lane and falls back to the default executor |
+| `CAT_INGESTION_WORKERS` | unset (disabled) | Size of the dedicated ingestion thread pool; unset or `<= 0` disables the lane and falls back to the default executor |
 | `CAT_INGESTION_NICENESS` | `5` | `nice` applied to the ingestion worker threads; `<= 0` disables the de-prioritization |
 | `CAT_INGESTION_HEARTBEAT_SECONDS` | `30` | Interval at which a `processing` row is refreshed while being handled |
 | `CAT_INGESTION_RESUME_ON_STARTUP` | `true` | Enable the resume part of the sweep |
 | `CAT_INGESTION_STATUS_GC_ON_STARTUP` | `true` | Enable the reconcile (GC) part of the sweep |
-| `CAT_INGESTION_RESUME_INTERVAL_SECONDS` | `60` | Period of the recurring sweep; `0` runs the pass only at bootstrap |
-| `CAT_INGESTION_RESUME_STALE_SECONDS` | `300` | How old an entry must be to be claimable by the sweep |
+| `CAT_INGESTION_RESUME_INTERVAL_SECONDS` | unset (disabled) | Period of the recurring sweep; unset or `0` runs the pass only at bootstrap |
+| `CAT_INGESTION_RESUME_STALE_SECONDS` | unset (claim gate disabled; sweep falls back to `300`) | Staleness gate for the per-source re-embed claim; unset or `<= 0` disables the claim gate. The resume sweep reads the same variable and falls back to `300` seconds when it is unset |
 | `CAT_INGESTION_RESUME_BOOT_STALE_SECONDS` | `2 x heartbeat` (min `30`) | Staleness used by the pass right after a restart, so rows left behind by a dead worker are recovered quickly |
 
 <h2>🧪 Tests</h2>

@@ -5,6 +5,7 @@
     "plugin_url": "https://github.com/DEH-RAG/cat-efficient-ingestion",
     "tags": "core, default, ingestion, re-embed, re-ingestion, embedder, status",
     "thumb": "",
-    "version": "0.0.1",
+    "version": "0.1.0",
+    "min_cat_version": "1.0.0",
     "dependencies": ["cat_multimodal_ingestion"]
 }

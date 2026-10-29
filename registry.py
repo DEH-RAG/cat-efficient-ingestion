@@ -26,6 +26,7 @@ import hashlib
 from typing import Dict, List, Optional
 
 from cat.db import crud
+from cat.db.crud import escape_glob
 from cat.db.cruds import settings as crud_settings
 from cat.db.models import generate_timestamp
 from cat.utils import Enum
@@ -127,7 +128,8 @@ async def ingestion_canceled(agent_id: str) -> bool:
     ghost agents (peripheral keys without a master) also "canceled", so no
     worker ever writes status for a dead agent. Absence is detected through
     the official ``cat.db.crud`` API (``read(...) is None``), never a raw
-    client.
+    client. This is an EXACT-key read (not a glob pattern), so the id is used
+    literally; only the scan/destroy patterns below are glob-escaped.
     """
     return await has_delete_marker(agent_id) or (
         await crud.read(f"agents:{agent_id}:agent")
@@ -242,6 +244,12 @@ async def set_status(
         doc["chunker_name"] = chunker_name
     if clear_phase:
         doc.pop("phase", None)
+    # A row created by the no-doc claim path carries ``resume_created`` so a
+    # second worker cannot immediately re-claim it. Once the row reaches a
+    # terminal state the transient marker is meaningless and must go, otherwise
+    # a later completed-row re-embed claim would be refused.
+    if status in (IngestionStatus.COMPLETED, IngestionStatus.ERROR):
+        doc.pop("resume_created", None)
     if extra:
         doc.update(extra)
     # Completed-phases diary: merge by phase so a re-recorded phase replaces
@@ -439,6 +447,9 @@ async def claim_source_for_resume(
     stale_after: float,
     owner: str,
     claim_completed: bool = False,
+    create_if_missing: bool = False,
+    type_: str = "file",
+    chat_id: Optional[str] = None,
 ) -> Optional[Dict]:
     """Atomically claim a source for (re)ingestion under a per-source lock.
 
@@ -465,6 +476,13 @@ async def claim_source_for_resume(
     On success the row is reset to PROCESSING with ``resume_owner`` /
     ``resume_at`` / bumped ``updated_at`` so other workers see it as taken.
 
+    When no status row exists yet (a legacy stored source) and
+    ``create_if_missing`` is True, the claim CREATES the row atomically with
+    ``crud.store(..., nx=True)``: only one worker can win the create, so two
+    concurrent passes can never process the same untracked source twice. The
+    created row carries ``resume_created``; a second worker that finds it while
+    the work is in flight is refused (see below).
+
     Args:
         agent_id: The agent (chatbot) id.
         scope: ``"agent"`` or a conversation ``chat_id``.
@@ -474,6 +492,11 @@ async def claim_source_for_resume(
         owner: Identifier of the claiming worker (e.g. ``pid``).
         claim_completed: Whether a ``completed`` row may be claimed for
             re-embedding (engine passes True after its own mismatch check).
+        create_if_missing: When True and no row exists, atomically create the
+            PROCESSING row as the claim itself (returns None if another worker
+            won the create).
+        type_: ``"file"`` or ``"url"`` recorded on a created row.
+        chat_id: Conversation id recorded on a created row (chat scope).
 
     Returns:
         The claimed (updated) status doc, or None when not claimable.
@@ -488,9 +511,38 @@ async def claim_source_for_resume(
     async with crud.distributed_lock(lock_pattern, timeout=30, blocking_timeout=15):
         doc = await _read_doc(key)
         if doc is None:
-            return None
+            if not create_if_missing:
+                return None
+            now = generate_timestamp()
+            created = {
+                "source": source,
+                "scope": scope,
+                "chat_id": chat_id,
+                "type": type_,
+                "status": IngestionStatus.PROCESSING.value,
+                "error": None,
+                "error_at": None,
+                "created_at": now,
+                "updated_at": now,
+                "resume_owner": owner,
+                "resume_at": now,
+                # Marker used to refuse an immediate second claim: the create
+                # itself is the acquisition, so a concurrent worker must not
+                # treat the just-created PROCESSING row as fresh-but-claimable.
+                "resume_created": True,
+            }
+            stored = await crud.store(key, created, nx=True)
+            return created if stored is not None else None
 
         status = doc.get("status")
+        if (
+            doc.get("resume_created")
+            and status == IngestionStatus.PROCESSING.value
+            and stale_after <= 0
+        ):
+            # Created by the no-doc claim path and still in flight: only a
+            # positive staleness gate (crash recovery) may reclaim it.
+            return None
         if status == IngestionStatus.COMPLETED.value:
             # Completed rows are never re-claimed by the resume sweep; the
             # engine may claim them for re-embedding only when it already
@@ -530,23 +582,6 @@ async def claim_source_for_resume(
         })
         await crud.store(key, doc)
         return doc
-
-
-async def release_resume_claim(agent_id: str, scope: str, source: str) -> None:
-    """Clear the resume-owner markers after a re-ingestion attempt.
-
-    The lifecycle hooks (``rabbithole_ingestion_start`` etc.) will later
-    overwrite the row with the new state, so clearing is best-effort: it only
-    removes the transient claim markers.
-    """
-    key = status_key(agent_id, scope, source)
-    async with crud.distributed_lock(f"ingestion-resume:{agent_id}:{scope}:{source}", timeout=30, blocking_timeout=15):
-        doc = await _read_doc(key)
-        if doc is None:
-            return
-        doc.pop("resume_owner", None)
-        doc.pop("resume_at", None)
-        await crud.store(key, doc)
 
 
 async def delete_status(agent_id: str, scope: str, source: str) -> None:
@@ -597,7 +632,7 @@ async def clear_agent(agent_id: str) -> int:
     """
     marker_key = delete_marker_key(agent_id)
     marker = await _read_doc(marker_key)
-    deleted = await crud.destroy(f"agents:{agent_id}:ingestion:*")
+    deleted = await crud.destroy(f"agents:{escape_glob(agent_id)}:ingestion:*")
     if marker is not None:
         await crud.store(marker_key, marker)
     # ``crud.destroy`` counted every key in the namespace; the marker
@@ -611,4 +646,4 @@ async def clear_chat(agent_id: str, chat_id: str) -> int:
     Returns:
         The number of keys deleted.
     """
-    return await crud.destroy(f"agents:{agent_id}:ingestion:{chat_id}:*")
+    return await crud.destroy(f"agents:{escape_glob(agent_id)}:ingestion:{escape_glob(chat_id)}:*")

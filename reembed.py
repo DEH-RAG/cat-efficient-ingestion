@@ -73,6 +73,23 @@ from .split import split_oversized
 _PHASE_RUN_MAX_RETRIES = 5
 
 
+class _IngestionCanceled(Exception):
+    """Internal signal: the agent was canceled (deleted) mid-phase.
+
+    Raised by the parse/embed loops as soon as ``ingestion_canceled`` flips, so
+    a long phase stops BEFORE it writes points instead of only at a status
+    boundary. The dispatcher swallows it: a canceled agent gets no further
+    status write (``set_status`` is itself guarded).
+    """
+
+
+async def _raise_if_canceled(ccat) -> None:
+    """Raise :class:`_IngestionCanceled` when the agent must self-abort."""
+    agent_key = getattr(ccat, "agent_key", None)
+    if agent_key is not None and await ingestion_canceled(agent_key):
+        raise _IngestionCanceled(f"agent {agent_key} canceled mid-phase")
+
+
 async def _set_status(ccat, source: str, status: IngestionStatus, error: str | None = None, chat_id: str | None = None) -> None:
     """Best-effort status write via the plugin's own registry."""
     scope = str(chat_id) if chat_id else "agent"
@@ -214,6 +231,8 @@ async def _store_empty_vectors(
     points: list[PointStruct] = []
 
     for doc in docs:
+        # A delete/cancel mid-parse stops before ANY point is written.
+        await _raise_if_canceled(ccat)
         # enrich the metadata as the core store_documents does: source, when,
         # hash (deduped compute) and chat_id for chat-scoped sources.
         doc.metadata = (
@@ -228,6 +247,7 @@ async def _store_empty_vectors(
 
     if images:
         for idx, img in enumerate(images):
+            await _raise_if_canceled(ccat)
             image_bytes = img["image_bytes"]
             mime_type = img["image_mime_type"]
             img_file = image_file_name(source_name, idx, mime_type, image_bytes)
@@ -250,6 +270,9 @@ async def _store_empty_vectors(
                 )
             )
 
+    # Final guard immediately before the write: the marker may have flipped
+    # while the last chunks/images were being prepared.
+    await _raise_if_canceled(ccat)
     await ccat.vector_memory_handler.add_points_to_tenant(
         collection_name=str(collection_name), points=points
     )
@@ -269,6 +292,7 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
     Returns the list of replaced points (with vectors), or None when the
     embedding failed (the source is left for a later pass).
     """
+    await _raise_if_canceled(ccat)
     source_points_text = [p for p in source_points if not (p.payload or {}).get("metadata", {}).get("image")]
     source_points_image = [p for p in source_points if (p.payload or {}).get("metadata", {}).get("image")]
 
@@ -298,6 +322,7 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
         if is_multimodal_embedder(embedder):
             recoverable = []
             for p in source_points_image:
+                await _raise_if_canceled(ccat)
                 meta = (p.payload or {}).get("metadata", {})
                 image_file = meta.get("image_file")
                 root_dir = ccat.agent_key
@@ -347,7 +372,9 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
                 )
 
     # All vectors were computed BEFORE the delete so a failure leaves the old
-    # points intact (compute-before-delete).
+    # points intact (compute-before-delete). A cancel that flipped during the
+    # (possibly long) embedding must stop here, before ANY vector write.
+    await _raise_if_canceled(ccat)
     await ccat.vector_memory_handler.delete_tenant_points(
         str(collection_name), metadata={"source": source_name}
     )
@@ -601,6 +628,7 @@ async def _run_parsing_phase(
         phase consumes on the next loop iteration.
     """
     # 1. clean-sweep: remove every artifact of this phase and the following ones.
+    await _raise_if_canceled(ccat)
     await _clear_source_artifacts(ccat, collection_name, source_name, chat_id)
 
     # ensure the rabbit_hole context is wired on the ccat (URL download +
@@ -788,18 +816,23 @@ async def reembed_sources(
         )
 
         # ---- claim the per-source work (skip if another worker holds it) ----
-        if doc is not None:
-            claimed = await claim_source_for_resume(
-                ccat.agent_key,
-                scope,
-                source_name,
-                stale_after=_claim_stale_after() if stale_after is None else stale_after,
-                owner=owner,
-                claim_completed=(doc_status == IngestionStatus.COMPLETED.value),
-            )
-            if claimed is None:
-                # another worker is already (re)processing this source
-                continue
+        # A tracked source is claimed under its existing row; an UNTRACKED one
+        # (legacy stored source with no status doc) has its row CREATED
+        # atomically by the claim, so two concurrent passes cannot both proceed.
+        claimed = await claim_source_for_resume(
+            ccat.agent_key,
+            scope,
+            source_name,
+            stale_after=_claim_stale_after() if stale_after is None else stale_after,
+            owner=owner,
+            claim_completed=(doc_status == IngestionStatus.COMPLETED.value),
+            create_if_missing=doc is None,
+            type_="url" if is_url(source_name) else "file",
+            chat_id=chat_id,
+        )
+        if claimed is None:
+            # another worker is already (re)processing this source
+            continue
 
         try:
             # ---- SERIAL PROBE-DRIVEN PHASE DISPATCH ----
@@ -912,6 +945,15 @@ async def reembed_sources(
                     # an error row appeared while recording: never resurrect it
                     break
 
+        except _IngestionCanceled:
+            # The agent was deleted mid-phase: stop this source (and the pass)
+            # without writing anything else. set_status is already a no-op for
+            # a canceled agent, so no ERROR write is attempted.
+            log.info(
+                f"Agent id: {ccat._id}. Ingestion canceled while processing "
+                f"{source_name}; stopping"
+            )
+            return
         except Exception as e:  # noqa: BLE001 - a failing source must not abort the pass
             log.error(f"Agent id: {ccat._id}. Error re-embedding source {source_name}: {e}")
             await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
