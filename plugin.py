@@ -247,11 +247,13 @@ async def finalize_oversized_chunks(docs: List[Document], cat) -> List[Document]
 
 @hook(priority=100)
 async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
-    """Apply the token-budget split on the store path of the core engine.
+    """Apply the token-budget split on the document-store path.
 
     Fired by ``RabbitHole.store_documents`` before the embed/store loop (e.g.
-    also covering documents added by other post-chunking hooks): split oversized
-    chunks so the 1:1 embed/store pairing is never broken.
+    also covering documents added by other post-chunking hooks) and ONCE by the
+    efficient phase machine at the end of ``parsing_chunking``, before the first
+    empty-vector store. It is the single split path on the efficient engine, so
+    the chunking step does not run ``finalize_oversized_chunks`` on top of it.
     """
     embedder = await cat.lizard.embedder()
     return split_oversized(docs, embedder)

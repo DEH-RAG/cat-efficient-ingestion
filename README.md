@@ -144,19 +144,28 @@ system level: the ingestion service is a single `system:agent` service in the
   `parsing_chunking -> embedding` phase machine through its own phase bodies
   and emits the `ingestion_phase_*` hooks (`ingestion_phase_pending`,
   `ingestion_phase_run`, `ingestion_phase_settings_marker`,
-  `ingestion_phase_specs`) plus `before_ingestion_status_completed`. It emits
-  `after_rabbithole_stored_documents` once, after its `embedding` phase
-  replaces the points. It does **not** emit
-  `before_rabbithole_stores_documents` — the phase machine calls the
-  token-budget split directly.
+  `ingestion_phase_specs`) plus `before_ingestion_status_completed`. It also
+  emits `before_rabbithole_stores_documents` **exactly once per source**, at
+  the end of the `parsing_chunking` phase (after chunking and before the first,
+  empty-vector store), and `after_rabbithole_stored_documents` once, after its
+  `embedding` phase replaces the points. The `embedding` phase does **not**
+  emit `before_rabbithole_stores_documents` again: it rebuilds the points from
+  the stored payload, so a document transformed or appended by the hook is
+  preserved.
+
+**`before_rabbithole_stores_documents` is now emitted by BOTH engines, EXACTLY
+ONCE per source** (only one engine ingests a given source). Use it for work
+that must happen once regardless of the engine — including transforming or
+appending documents, since the returned list is what gets stored. Use the
+`ingestion_phase_*` hooks only for work that is specific to the efficient phase
+machine.
 
 **`after_rabbithole_stored_documents` is flow-agnostic and fires EXACTLY ONCE
 per source.** Because only one engine ingests a source, the hook fires once
 whichever engine is active; it cannot tell you which flow ran. Use it for work
 that must happen once regardless of the engine. When the work must be
-engine-specific, use `before_rabbithole_stores_documents` (classic only) or the
-`ingestion_phase_*` hooks (efficient only) — never pair a shared handler with a
-flow-specific one that repeats the same work.
+engine-specific, use the `ingestion_phase_*` hooks (efficient only);
+`before_rabbithole_stores_documents` is shared by both engines.
 
 <h2>🔗 Host integration contract</h2>
 

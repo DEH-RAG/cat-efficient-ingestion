@@ -271,6 +271,28 @@ async def _clear_source_artifacts(ccat, collection_name, source_name, chat_id) -
     )
 
 
+async def _chunk_without_finalize(ccat, rabbit_hole, super_docs):
+    """Chunk parsed docs WITHOUT applying the token-budget finalize here.
+
+    The efficient phase applies the token-budget split exactly ONCE through the
+    emitted ``before_rabbithole_stores_documents`` hook (after chunking). The
+    core ``RabbitHole._split_text`` would also run ``finalize_oversized_chunks``,
+    applying the split a second time, so the same chunking steps are invoked
+    directly here (splits hook + chunker + short-chunk merge) and the finalize
+    step is left to the store hook. The caller matches what the copied
+    ``RabbitHole._split_text`` would use (``self.stray or self.cat`` -> ccat).
+    """
+    docs = await ccat.plugin_manager.execute_hook(
+        "before_rabbithole_splits_documents", super_docs, caller=ccat,
+    )
+    docs = await ccat.chunker.split_documents(docs)
+    try:
+        docs = rabbit_hole._merge_short_chunks(docs, ccat.chunker)
+    except Exception as e:  # noqa: BLE001 - mirrors the core fallback
+        log.warning(f"Error merging short chunks: {e}. Proceeding with original chunks.")
+    return docs
+
+
 async def _parse_and_chunk(
     ccat, rabbit_hole, source, file_bytes, content_type, cat
 ):
@@ -300,7 +322,7 @@ async def _parse_and_chunk(
     images = collect_document_images(super_docs)
     strip_image_payload(super_docs)
 
-    docs = await rabbit_hole._split_text(super_docs)
+    docs = await _chunk_without_finalize(ccat, rabbit_hole, super_docs)
     return docs, images
 
 
@@ -404,6 +426,10 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
             for p in source_points_text
         ]
         # Re-chunk only chunks exceeding the current embedder's input limit.
+        # The parsing-phase store hook already applied the token-budget split,
+        # so this is a no-op on a fresh ingest; it is the re-split path when an
+        # embedder-only change re-runs this phase with a smaller window (the
+        # stored payload is reused, the files are not parsed again).
         # Catalogue-card segments are EXEMPT: the phase already split the card
         # into stable, id-bearing segments and marked them, so re-splitting them
         # here (e.g. after an embedder change) would mint a different segment
@@ -820,6 +846,18 @@ async def _run_parsing_phase(
     # 3. parse + chunk + ALWAYS extract images.
     docs, images = await _parse_and_chunk(
         ccat, rabbit_hole, source, file_bytes, content_type, cat
+    )
+    if not docs:
+        raise Exception(f"No valid chunks found in the file '{source_name}'.")
+
+    # 3b. Emit the store hook EXACTLY ONCE for this source, after chunking and
+    #     before the first (empty-vector) store. It is also the SINGLE
+    #     token-budget split path for this engine (EffING's handler), and it
+    #     lets other plugins append or rewrite the documents; the embedding
+    #     phase rebuilds points from the stored payload, so it must NOT emit
+    #     the hook again.
+    docs = await ccat.plugin_manager.execute_hook(
+        "before_rabbithole_stores_documents", docs, caller=cat,
     )
     if not docs:
         raise Exception(f"No valid chunks found in the file '{source_name}'.")
