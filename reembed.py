@@ -305,8 +305,10 @@ async def _store_empty_vectors(
             | {"source": source_name, "when": time.time(), "hash": file_hash}
             | ({"chat_id": chat_id} if chat_id else {})
         )
+        # Honour a document-provided id (e.g. a deterministic card id) so a
+        # re-ingest upserts instead of duplicating; plain chunks keep uuid4.
         points.append(
-            PointStruct(id=uuid.uuid4().hex, payload=doc.model_dump(), vector={})
+            PointStruct(id=doc.id or uuid.uuid4().hex, payload=doc.model_dump(), vector={})
         )
 
     if images:
@@ -366,6 +368,9 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
     if source_points_text:
         docs = [
             Document(
+                # Carry a stored id through the re-embed so an id-bearing point
+                # (e.g. a catalogue card) keeps its identity across passes.
+                id=(p.payload or {}).get("id"),
                 page_content=(p.payload or {}).get("page_content", ""),
                 metadata=dict((p.payload or {}).get("metadata", {})),
             )
@@ -377,7 +382,7 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
             embedder.embed_documents, [d.page_content for d in docs]
         )
         points.extend(
-            PointStruct(id=uuid.uuid4().hex, payload=d.model_dump(), vector=vector)
+            PointStruct(id=d.id or uuid.uuid4().hex, payload=d.model_dump(), vector=vector)
             for d, vector in zip(docs, vectors)
         )
 
