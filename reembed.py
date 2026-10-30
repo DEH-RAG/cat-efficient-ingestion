@@ -20,15 +20,30 @@ phases) and restarts from the beginning of that phase.
 
 Status is written through the plugin's own ``registry``. Import-safe: nothing
 runs at import time.
+
+URL sources are fetched ONCE: the resolved bytes are persisted in the agent's
+file storage under a deterministic, sanitized name derived from the URL, and a
+later run reads that copy back instead of re-downloading. This makes a
+re-ingest deterministic (a URL whose content changes no longer silently changes
+what gets indexed) and lets other components (e.g. CATALOG's card) read the
+original content. The core source resolver remains a FALLBACK when the
+persisted copy is missing (e.g. it was deleted manually), and that fallback is
+logged because the fetched content may have changed.
+
+Retention: the persisted bytes occupy the agent's file storage like any other
+uploaded file. There is NO automatic eviction here — they live until the file is
+deleted (or the agent is removed), so operators should account for their size.
 """
 
 import asyncio
 import copy
 import hashlib
 import io
+import mimetypes
 import os
 import time
 import uuid
+from urllib.parse import urlparse
 
 from langchain_core.documents import Document
 from langchain_core.documents.base import Blob
@@ -41,6 +56,7 @@ from cat.log import log
 from cat.looking_glass.models import StoredSourceWithMetadata
 from cat.services.factory.embedder import is_multimodal_embedder
 from cat.services.factory.ingestion import BaseIngestionEngine
+from cat.routes.routes_utils import sanitize_source_name
 from cat.services.memory.models import PointStruct, VectorMemoryType
 from cat.utils import get_nlp_object_name, guess_file_type, is_url
 
@@ -661,6 +677,24 @@ async def _complete_source(ccat, cat, scope, source_name, chat_id) -> None:
         log.error(f"Agent id: {ccat._id}. Failed to write ingestion status for {source_name}: {e}")
 
 
+def _persisted_url_file_name(source_url: str, root_dir: str) -> str:
+    """Deterministic, sanitized file name for the persisted bytes of a URL.
+
+    The name is derived from the URL itself (so the same URL always maps to the
+    same file) plus its path basename/extension (so the parser can recover the
+    content type on a later run). It is validated with the core
+    ``sanitize_source_name`` to guarantee it cannot escape the agent storage.
+    """
+    parsed = urlparse(source_url)
+    raw_stem = os.path.basename(parsed.path) or "index"
+    stem, ext = os.path.splitext(raw_stem)
+    ext = "".join(ch for ch in ext if ch.isalnum() or ch == ".")[:12]
+    digest = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:16]
+    candidate = f"url_{digest}_{stem[:80]}{ext}"
+    candidate = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in candidate)
+    return sanitize_source_name(candidate, path=root_dir)
+
+
 async def _run_parsing_phase(
     ccat, collection_name, source, source_name, chat_id, cat, rabbit_hole, active_chunker_name,
 ):
@@ -668,8 +702,9 @@ async def _run_parsing_phase(
 
     Deletes every artifact of this phase and the following ones (text chunk
     points, image points, saved image files), resolves the source bytes (from
-    the in-memory ``source.content``, a re-downloaded URL, or the persisted
-    file on disk), parses + chunks ALWAYS extracting the images, and stores the
+    the in-memory ``source.content``, the persisted copy of a previously
+    downloaded URL, the persisted file on disk, or — as a logged fallback — the
+    URL itself), parses + chunks ALWAYS extracting the images, and stores the
     text chunks and image points with EMPTY vectors.
 
     Returns:
@@ -693,20 +728,43 @@ async def _run_parsing_phase(
     rabbit_hole.stray = None
 
     # 2. resolve the source bytes: file already on disk (via the resume/upload),
-    #    or a URL to (re)download.
+    #    a persisted copy of a previously downloaded URL, or a URL to download.
     if source.content is not None:
         file_io = source.content
         file_bytes = file_io.read()
         content_type, _ = guess_file_type(file_io)
     elif is_url(source_name):
-        # URL: re-download via the core source resolver.
-        source_name_resolved, file_bytes, content_type, _ = await rabbit_hole._resolve_source_bytes(
-            source_name, source_name, None
-        )
-        if file_bytes is None:
-            raise Exception(f"Something went wrong with the source '{source_name}'")
-        if source_name_resolved:
-            source_name = source_name_resolved
+        path = ccat.agent_key
+        if chat_id:
+            path = os.path.join(path, str(chat_id))
+        persisted_name = _persisted_url_file_name(source_name, path)
+        # Prefer the bytes fetched on the first ingest: a re-ingest must index
+        # the SAME content even if the URL changed in the meantime.
+        file_bytes = ccat.file_manager.read_file(persisted_name, path)
+        if file_bytes is not None:
+            content_type = mimetypes.guess_type(persisted_name)[0]
+            if content_type is None:
+                content_type, _ = guess_file_type(io.BytesIO(file_bytes))
+        else:
+            # FALLBACK: no persisted copy -> (re)download via the core resolver.
+            # This means the content may have changed since the last ingest.
+            log.warning(
+                f"Agent id: {ccat._id}. No persisted bytes for URL '{source_name}'; "
+                "downloading it now (the content may have changed since the last ingest)."
+            )
+            source_name_resolved, file_bytes, content_type, _ = await rabbit_hole._resolve_source_bytes(
+                source_name, source_name, None
+            )
+            if file_bytes is None:
+                raise Exception(f"Something went wrong with the source '{source_name}'")
+            if source_name_resolved:
+                source_name = source_name_resolved
+            # Persist the fetched bytes so a later run is deterministic.
+            if not ccat.file_manager.write_file(file_bytes, persisted_name, path):
+                log.error(
+                    f"Agent id: {ccat._id}. Could not persist URL bytes for "
+                    f"'{source_name}' at '{persisted_name}'; the next run will re-download."
+                )
     else:
         # re-read from disk (the persisted file)
         path = ccat.agent_key
