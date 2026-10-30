@@ -181,6 +181,30 @@ async def _stop_heartbeat(ccat, source_name: str, scope: str, cat) -> None:
         )
 
 
+def _source_metadata(source_name: str, chat_id) -> dict:
+    """Vector-memory filter for ONE source in ONE scope.
+
+    The same file name can exist in several conversations (and in the agent
+    KB). Every query/delete that targets a source MUST also target its
+    ``chat_id`` when chat-scoped, otherwise ingesting one chat would read or
+    delete another chat's chunks and card.
+    """
+    metadata = {"source": source_name}
+    if chat_id:
+        metadata["chat_id"] = chat_id
+    return metadata
+
+
+def _point_matches_source(point, source_name: str, chat_id) -> bool:
+    """Whether a stored point belongs to ``source_name`` in the given scope."""
+    meta = (point.payload or {}).get("metadata", {}) or {}
+    if meta.get("source") != source_name:
+        return False
+    if chat_id:
+        return str(meta.get("chat_id")) == str(chat_id)
+    return meta.get("chat_id") in (None, "")
+
+
 async def _cleanup_orphan_images(ccat, collection_name, source_name, chat_id) -> None:
     """Remove image points + saved image files of a source before a full re-ingest.
 
@@ -190,10 +214,11 @@ async def _cleanup_orphan_images(ccat, collection_name, source_name, chat_id) ->
     the points in the target first and the files from the agent storage, so the
     re-ingest starts clean and no orphan image file lingers on disk.
     """
+    filter_ = {**_source_metadata(source_name, chat_id), "image": True}
     try:
         points, _ = await ccat.vector_memory_handler.get_all_tenant_points(
             str(collection_name), with_vectors=False,
-            metadata={"source": source_name, "image": True},
+            metadata=filter_,
         )
     except Exception:  # noqa: BLE001 - cleanup must never break the pass
         return
@@ -213,7 +238,7 @@ async def _cleanup_orphan_images(ccat, collection_name, source_name, chat_id) ->
         except Exception:  # noqa: BLE001,S110 - best-effort, cleanup must never break the pass
             pass
     await ccat.vector_memory_handler.delete_tenant_points(
-        str(collection_name), metadata={"source": source_name, "image": True}
+        str(collection_name), metadata=filter_
     )
 
 
@@ -242,7 +267,7 @@ async def _clear_source_artifacts(ccat, collection_name, source_name, chat_id) -
     await _cleanup_orphan_images(ccat, collection_name, source_name, chat_id)
     # then any remaining point (text chunks and any leftover image point)
     await ccat.vector_memory_handler.delete_tenant_points(
-        str(collection_name), metadata={"source": source_name}
+        str(collection_name), metadata=_source_metadata(source_name, chat_id)
     )
 
 
@@ -379,7 +404,17 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
             for p in source_points_text
         ]
         # Re-chunk only chunks exceeding the current embedder's input limit.
-        docs = split_oversized(docs, embedder)
+        # Catalogue-card segments are EXEMPT: the phase already split the card
+        # into stable, id-bearing segments and marked them, so re-splitting them
+        # here (e.g. after an embedder change) would mint a different segment
+        # count and drop the deterministic ``:s<start_index>`` id suffix.
+        kept = []
+        for doc in docs:
+            if doc.metadata.get("is_catalogue_card_segment") is True:
+                kept.append(doc)
+            else:
+                kept.extend(split_oversized([doc], embedder))
+        docs = kept
         vectors = await run_in_ingestion_executor(
             embedder.embed_documents, [d.page_content for d in docs]
         )
@@ -447,7 +482,7 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
     # (possibly long) embedding must stop here, before ANY vector write.
     await _raise_if_canceled(ccat)
     await ccat.vector_memory_handler.delete_tenant_points(
-        str(collection_name), metadata={"source": source_name}
+        str(collection_name), metadata=_source_metadata(source_name, chat_id)
     )
     await ccat.vector_memory_handler.add_points_to_tenant(
         collection_name=str(collection_name), points=points
@@ -884,7 +919,7 @@ async def reembed_sources(
                     f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
                 )
                 await ccat.vector_memory_handler.delete_tenant_points(
-                    str(collection_name), metadata={"source": source_name}
+                    str(collection_name), metadata=_source_metadata(source_name, chat_id)
                 )
                 await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
                 continue
@@ -920,7 +955,7 @@ async def reembed_sources(
             # Fall back to the legacy heuristic: embedding if reusable points exist
             # (chunk-reuse), else a full re-ingest from parsing_chunking.
             has_points = any(
-                (p.payload or {}).get("metadata", {}).get("source") == source_name
+                _point_matches_source(p, source_name, chat_id)
                 for p in existing_points
             )
             start_phase = PHASE_EMBEDDING if has_points else PHASE_PARSING_CHUNKING
@@ -986,7 +1021,7 @@ async def reembed_sources(
                             f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
                         )
                         await ccat.vector_memory_handler.delete_tenant_points(
-                            str(collection_name), metadata={"source": source_name}
+                            str(collection_name), metadata=_source_metadata(source_name, chat_id)
                         )
                         await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
                         break
@@ -1000,7 +1035,7 @@ async def reembed_sources(
                     )
                     source_points = stored_points or [
                         p for p in existing_points
-                        if (p.payload or {}).get("metadata", {}).get("source") == source_name
+                        if _point_matches_source(p, source_name, chat_id)
                     ]
                     if source_points:
                         await _embed_phase(

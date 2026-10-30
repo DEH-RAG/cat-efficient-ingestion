@@ -13,7 +13,7 @@ Because the two phases are separate and recorded, an embedder change only needs 
 
 <h2>🗂️ Ingestion status registry</h2>
 
-Every transition is written as a Redis-JSON document under `agents:{agent_id}:ingestion:{scope}:{sha256(source)}`, where `scope` is `agent` for the agent KB or a conversation `chat_id`.
+Every transition is written as a Redis-JSON document under `agents:{agent_id}:ingestion:{scope}:{sha256(source)}`, where `scope` is `agent` for the agent KB or a conversation `chat_id`. Source-scoped queries and deletes always carry the `chat_id` filter when chat-scoped, so the same file name uploaded in two conversations never reads or removes the other chat's chunks.
 
 Lifecycle states: `uploaded → processing → completed | error`, with `downloading → downloaded` inserted for URLs. The document also records the work `phase` (`downloading`, `parsing_chunking`, `embedding`), the `embedder_name` and the `chunker_name` that produced the stored data, plus the timestamps used by the recovery sweep.
 
@@ -166,7 +166,7 @@ Chunking, embedding and storing are dispatched to a dedicated, low-concurrency `
 
 <h2>✂️ Token-budget split</h2>
 
-The plugin also owns the oversized-chunk split (`finalize_oversized_chunks` and `before_rabbithole_stores_documents` hooks): chunks longer than the active embedder's `max_input_tokens` are split into budget-compliant sub-chunks, measured with the embedder's own tokenizer when available, with the original metadata carried forward. With this plugin disabled the core returns to upstream parity (no split).
+The plugin also owns the oversized-chunk split (`finalize_oversized_chunks` and `before_rabbithole_stores_documents` hooks): chunks longer than the active embedder's `max_input_tokens` are split into budget-compliant sub-chunks, measured with the embedder's own tokenizer when available, with the original metadata carried forward. With this plugin disabled the core returns to upstream parity (no split). Points marked `is_catalogue_card_segment: True` (the catalogue card written by `cat_alog`) are EXEMPT from the re-embed re-split: their id derives from a stable `start_index`, so re-splitting them would mint a different segment count and lose it.
 
 <h2>⚙️ Plugin settings</h2>
 
