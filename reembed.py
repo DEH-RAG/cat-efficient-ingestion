@@ -369,8 +369,10 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
         docs = [
             Document(
                 # Carry a stored id through the re-embed so an id-bearing point
-                # (e.g. a catalogue card) keeps its identity across passes.
-                id=(p.payload or {}).get("id"),
+                # (e.g. a catalogue card) keeps its identity across passes. The
+                # payload id is authoritative; the stored point id is the
+                # fallback for handlers that keep it only at the point level.
+                id=(p.payload or {}).get("id") or getattr(p, "id", None),
                 page_content=(p.payload or {}).get("page_content", ""),
                 metadata=dict((p.payload or {}).get("metadata", {})),
             )
