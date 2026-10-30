@@ -131,34 +131,60 @@ to run the pass only at bootstrap.
 
 <h2>🔀 Efficient vs classic ingestion (dual flow)</h2>
 
-CAT can ingest a source through **one of two flows**, and they are mutually
-exclusive for a given source:
+CAT ingests a source through **one of two engines**, and the engine is unique at
+system level: the ingestion service is a single `system:agent` service in the
+`ingestion` category, so exactly ONE engine — the classic `RabbitHole` or
+`EfficientIngestionEngine` (this plugin) — ingests a given source.
 
 - **Classic ingestion** — the core `RabbitHole` pipeline. It emits
   `before_rabbithole_stores_documents` before storing and
   `after_rabbithole_stored_documents` at the end.
 - **Efficient ingestion** — `EfficientIngestionEngine` (this plugin) selected
   through the `factory_allowed_ingestions` factory. It runs the
-  `parsing_chunking -> embedding` phase machine, stores through its own phase
-  bodies and emits the `ingestion_phase_*` hooks
-  (`ingestion_phase_pending`, `ingestion_phase_run`,
-  `ingestion_phase_settings_marker`, `ingestion_phase_specs`) plus
-  `before_ingestion_status_completed`. It does **not** emit
+  `parsing_chunking -> embedding` phase machine through its own phase bodies
+  and emits the `ingestion_phase_*` hooks (`ingestion_phase_pending`,
+  `ingestion_phase_run`, `ingestion_phase_settings_marker`,
+  `ingestion_phase_specs`) plus `before_ingestion_status_completed`. It emits
+  `after_rabbithole_stored_documents` once, after its `embedding` phase
+  replaces the points. It does **not** emit
   `before_rabbithole_stores_documents` — the phase machine calls the
   token-budget split directly.
 
-**Mutual-exclusion rule:** a hook handler that must run exactly once per
-source has to pick the flow it belongs to. Do the work on
-`before_rabbithole_stores_documents` for the classic path, or on the
-`ingestion_phase_*` hooks (e.g. `ingestion_phase_run`) for the efficient path —
-never assume both will fire, and never run the same work from both.
+**`after_rabbithole_stored_documents` is flow-agnostic and fires EXACTLY ONCE
+per source.** Because only one engine ingests a source, the hook fires once
+whichever engine is active; it cannot tell you which flow ran. Use it for work
+that must happen once regardless of the engine. When the work must be
+engine-specific, use `before_rabbithole_stores_documents` (classic only) or the
+`ingestion_phase_*` hooks (efficient only) — never pair a shared handler with a
+flow-specific one that repeats the same work.
 
-**Hard rule:** never use `after_rabbithole_stored_documents` to detect the
-classic path. **BOTH** flows emit it: the core `RabbitHole` at the end of the
-classic pipeline and this plugin after its `embedding` phase replaces the
-points. Anything registered there runs in both flows and cannot tell them
-apart; use `before_rabbithole_stores_documents` (classic only) or the phase
-hooks (efficient only) instead.
+<h2>🔗 Host integration contract</h2>
+
+- **Built-in phase markers.** The `parsing_chunking` marker is a deterministic
+  JSON fingerprint (`sort_keys=True`) of the class/config name plus the
+  material fields of the **agent-scoped** `chunker` (`encoding_name`,
+  `chunk_size`, `chunk_overlap`); the `embedding` marker is the same fingerprint
+  of the **system-scoped** `embedder` (model/name and, when stored, the
+  embedding size). Credentials (fields matching `SUFFIX_TO_CRYPT`) are excluded:
+  they are re-encrypted with a random IV on every write, so including them
+  would make an unchanged configuration look changed.
+- **Completion veto.** `before_ingestion_status_completed` is the last gate
+  before a source becomes `completed`. A handler raises
+  `CustomHookVetoException` to force `error`; the host's hook dispatcher
+  **re-raises** that exception (it is not logged and swallowed like other hook
+  errors) and short-circuits the remaining hooks, so the veto reaches the
+  caller instead of being silently dropped.
+- **Persisted URL bytes.** On the first ingest of a URL the fetched bytes are
+  written to the agent's file storage under a deterministic, sanitized name
+  derived from the URL; a re-ingest reads that persisted copy instead of
+  re-downloading, so re-indexing the same URL is deterministic even if the
+  remote content changed. The copy is a fallback that keeps the previous
+  content when it is absent.
+- **Status-listing API.** The plugin enumerates an agent's ingestion rows
+  through `cat.db.cruds.settings.get_ingestion_status_keys(agent_id)`: an
+  agent-scoped, **read-only** helper that escapes the (untrusted) agent id and
+  lists `agents:<agent_id>:ingestion:*` without ever writing or deleting
+  anything.
 
 <h2>🧵 Ingestion executor lane</h2>
 
@@ -208,10 +234,8 @@ CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
 The harness covers the registry/lifecycle, the phase diary, the factory and
 the endpoints, plus the RED-baseline tests for the known blockers.
 
-The old plugin-local `tests/` copies were **retired**: they targeted the
-pre-migration plugin module path, monkeypatched core enumeration helpers that
-no longer exist and would import at plugin activation. Do not re-add a
-plugin-local test suite here; add the test to
+Do not add a plugin-local test suite here: a `conftest.py` under the plugin
+would be imported at activation. Add the test to
 `grinning-cat-core/tests/effing/` instead.
 
 <h2>🛠️ Installation:</h2>
