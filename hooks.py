@@ -288,6 +288,8 @@ def ingestion_phase_run(phase, source, completed_phases, cat=None, lizard=None):
       - return ``{"status": "done"}`` on success;
       - return ``{"status": "not_ready", "retry_after": N}`` when the phase is
         retriable but cannot run yet (the machine retries after ``N`` seconds);
+      - return ``{"status": "error", "reason": "..."}`` on a permanent failure
+        (the machine marks the phase ERROR with that reason);
       - raise an exception on permanent failure (the machine marks the phase
         ERROR).
 

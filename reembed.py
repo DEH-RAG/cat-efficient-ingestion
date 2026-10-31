@@ -571,6 +571,8 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
       - ``{"status": "not_ready", "retry_after": N}`` -> the phase is retried
         after ``N`` seconds, bounded by ``_PHASE_RUN_MAX_RETRIES`` attempts;
         exceeding the bound marks the row ERROR and returns ``False``;
+      - ``{"status": "error", "reason": "..."}`` -> FAIL-HARD: the row is
+        marked ERROR with ``reason`` and ``False`` is returned;
       - ``None``, a raise, or any other return -> FAIL-HARD: the row is marked
         ERROR and ``False`` is returned. A phase nobody implements is an error,
         NEVER a silent success (misleading-success guard).
@@ -621,6 +623,12 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
             if retry_after > 0:
                 await asyncio.sleep(retry_after)
             continue
+        if isinstance(result, dict) and result.get("status") == "error":
+            reason = result.get("reason") or f"external phase {phase} reported an error"
+            msg = f"external phase {phase} failed: {reason}"
+            log.error(f"Agent id: {ccat._id}. {msg} for {source_name}")
+            await _set_status(ccat, source_name, IngestionStatus.ERROR, error=reason, chat_id=chat_id)
+            return False
 
         # None or any other return: fail-hard (unimplemented / misleading).
         msg = f"external phase {phase} returned {result!r} (expected a status dict)"
