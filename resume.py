@@ -105,6 +105,36 @@ def _boot_stale_seconds() -> int:
     return 60
 
 
+def _maintenance_marker_key(agent_id: str) -> str:
+    """Redis key shared with the maintenance CLI (``maintenance_agent.py``)."""
+    return f"agents:{agent_id}:ingestion:maintenance"
+
+
+async def _maintenance_marker_active(agent_id: str) -> bool:
+    """Whether a maintenance CLI is currently processing this agent.
+
+    The marker is written by the GraphRAG maintenance CLI through
+    ``cat.db.crud`` with a 2h TTL and deleted at the end of the run. While it
+    is present the periodic sweep MUST NOT touch the agent: it would otherwise
+    steal/retry rows the CLI is actively rebuilding.
+
+    Fail-safe: a read failure is logged and treated as "no marker" so a Redis
+    hiccup cannot block the sweep forever; a crashed CLI's marker expires by
+    its own TTL.
+    """
+    try:
+        value = await crud.read(_maintenance_marker_key(agent_id))
+    except Exception as e:  # noqa: BLE001 - never block the sweep on a read error
+        log.warning(
+            f"Ingestion sweep: could not read the maintenance marker for agent "
+            f"{agent_id}; proceeding: {e}"
+        )
+        return False
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value is not None
+
+
 async def mark_file_missing(agent_id: str, scope: str, source: str) -> None:
     """Mark a source whose file is missing on disk as ``error``.
 
@@ -207,6 +237,12 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
     """
     if await ingestion_canceled(agent_id):
         # agent is being deleted (marker) or dead (ghost): never resume it
+        return
+    if await _maintenance_marker_active(agent_id):
+        # a maintenance CLI owns this agent right now: never steal its rows
+        log.debug(
+            f"Ingestion sweep for agent {agent_id} skipped: maintenance marker present"
+        )
         return
     if ccat is None:
         try:
@@ -316,6 +352,12 @@ async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = No
     if await ingestion_canceled(agent_id):
         # agent is being deleted (marker) or dead (ghost): never revalidate it
         return
+    if await _maintenance_marker_active(agent_id):
+        # a maintenance CLI owns this agent right now: never revalidate it
+        log.debug(
+            f"Ingestion revalidation for agent {agent_id} skipped: maintenance marker present"
+        )
+        return
     if ccat is None:
         try:
             ccat = await lizard.get_cheshire_cat(agent_id)
@@ -393,6 +435,14 @@ async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
     """
     if await ingestion_canceled(agent_id):
         # agent is being deleted (marker) or dead (ghost): never sweep it
+        return
+    if await _maintenance_marker_active(agent_id):
+        # A maintenance CLI owns this agent: skip the whole sweep ONCE per pass
+        # (the inner _resume_agent/_revalidate_agent checks keep direct callers
+        # safe without adding a second log line to the periodic sweep).
+        log.debug(
+            f"Ingestion sweep for agent {agent_id} skipped: maintenance marker present"
+        )
         return
     try:
         async with crud.distributed_lock(f"ingestion-sweep:{agent_id}", timeout=30, blocking_timeout=5):

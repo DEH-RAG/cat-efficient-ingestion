@@ -49,7 +49,7 @@ The phase machine is extensible through five hooks declared in the plugin itself
 EffING is a **system-only core plugin** (`ingestion` is a system-level factory service, like `embedder`): its own phase hooks are dispatched on BillTheLizard's plugin manager (`ccat.lizard.plugin_manager`) and no agent activates it. Phase PROVIDERS stay agent-level plugins: `ingestion_phase_specs` is collected from BOTH the system and the calling agent's manager (deduplicated by phase id, built-ins win), and `ingestion_phase_run` / `ingestion_phase_settings_marker` are dispatched to the manager that owns the phase — the system manager for the built-in phases, the agent manager for external phases such as MyGRAPH and CATALOG. The hooks accept either the `cat=` or the `lizard=` caller keyword, since the two managers use different names for the same caller value.
 
 - **`ingestion_phase_pending(pending, source, completed_phases, cat)`** — accumulator of stale phases for a source. Each registrant appends the `{"phase": <id>, ...}` entries it considers stale and returns the extended list. The default is the identity (nothing pending).
-- **`ingestion_phase_run(phase, source, completed_phases, cat)`** — runs one phase with a tri-state contract: return `{"status": "done"}` on success, `{"status": "not_ready", "retry_after": N}` when retriable but not yet runnable (the machine retries after `N` seconds), or raise on permanent failure. The default returns `None`, which the machine treats as fail-hard / unimplemented: a phase with no registrant is an error, never a silent success.
+- **`ingestion_phase_run(phase, source, completed_phases, cat)`** — runs one phase with a tri-state contract: return `{"status": "done"}` on success, `{"status": "not_ready", "retry_after": N}` when retriable but not yet runnable (the machine keeps the row `processing` and retries after `N` seconds, bounded by the wall-clock budget `CAT_INGESTION_NOT_READY_MAX_SECONDS`, default `3600`; only then does the row become `error`), or raise on permanent failure. The default returns `None`, which the machine treats as fail-hard / unimplemented: a phase with no registrant is an error, never a silent success.
 - **`before_ingestion_status_completed(source, cat)`** — final gate before a source is marked COMPLETED. A registrant raises `CustomHookVetoException` to force the source to ERROR instead. The built-in implementation vetoes when the caller exposes a `has_pending_source_tasks(source)` probe and it reports pending work; absent that probe it is a no-op.
 - **`ingestion_phase_settings_marker(phase, cat)`** — the plugin-defined material marker for a phase, compared against the recorded diary `marker` to decide whether the phase's settings changed materially. The built-in phases return a stable JSON fingerprint of their service configuration (`parsing_chunking`: the agent-scoped chunker; `embedding`: the system-scoped embedder). An unknown phase returns `None` ("unknown"), which the machine treats conservatively as stale.
 - **`ingestion_phase_specs(specs, cat)`** — accumulator of `PhaseSpec` declarations. Each registrant appends the phases it owns and returns the extended list; EffING merges them into its built-in `PHASES` at probe time (built-ins win on duplicate ids). The default is the identity (no registered phases).
@@ -224,6 +224,7 @@ Settings live in the global `system:agent` store, category `ingestion`:
 | `CAT_INGESTION_RESUME_INTERVAL_SECONDS` | `60` | Period of the recurring sweep; `0` (or `<= 0`) runs the pass only at bootstrap |
 | `CAT_INGESTION_RESUME_STALE_SECONDS` | unset (claim gate disabled; sweep falls back to `300`) | Staleness gate for the per-source re-embed claim; unset or `<= 0` disables the claim gate. The resume sweep reads the same variable and falls back to `300` seconds when it is unset |
 | `CAT_INGESTION_RESUME_BOOT_STALE_SECONDS` | `2 x heartbeat` (min `30`) | Staleness used by the pass right after a restart, so rows left behind by a dead worker are recovered quickly |
+| `CAT_INGESTION_NOT_READY_MAX_SECONDS` | `3600` | Wall-clock budget a source may stay `not_ready` (external phase, or an embedding pass with no usable vector) before the row is marked `error`. The row stays `processing` and is retried meanwhile. `0` expires immediately |
 
 <h2>🧪 Tests</h2>
 
@@ -248,6 +249,15 @@ the endpoints, plus the RED-baseline tests for the known blockers.
 Do not add a plugin-local test suite here: a `conftest.py` under the plugin
 would be imported at activation. Add the test to
 `grinning-cat-core/tests/effing/` instead.
+
+The one exception is a fully import-safe standalone harness: its ENTIRE body
+(imports included) lives under `if __name__ == "__main__":`, so importing it
+at activation executes nothing. `test_ingestion_safety_fixes.py` is such a
+harness; run it as a plain script from the core checkout:
+
+```bash
+uv run python /path/to/plugins/cat-efficient-ingestion/test_ingestion_safety_fixes.py
+```
 
 <h2>🛠️ Installation:</h2>
 

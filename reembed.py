@@ -39,6 +39,7 @@ import asyncio
 import copy
 import hashlib
 import io
+import math
 import mimetypes
 import os
 import time
@@ -89,10 +90,160 @@ from .registry import (
 )
 from .split import split_oversized
 
-# Maximum number of ``{"status": "not_ready"}`` retries allowed for ONE
-# external phase before the machine gives up and marks the row ERROR. The
-# bound keeps a stuck external registrant from looping forever.
-_PHASE_RUN_MAX_RETRIES = 5
+# Time budget for one external phase to report ``{"status": "not_ready"}``.
+# Unlike a retry COUNT, this is a wall-clock bound: a phase that is legitimately
+# waiting for upstream work (e.g. the MyGRAPH extraction phase waiting for the
+# embedded chunks to land) may legitimately stay pending for minutes. Only a
+# row still not ready after this generous bound is marked ERROR. Overridable
+# with ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` (default 3600).
+_NOT_READY_MAX_SECONDS_DEFAULT = 3600.0
+_NOT_READY_RETRY_SECONDS_DEFAULT = 5.0
+
+#: Status of a row the machine must never rewrite.
+_TERMINAL_STATUSES = (IngestionStatus.COMPLETED.value, IngestionStatus.ERROR.value)
+
+
+class _NothingStored(Exception):
+    """Signal that a phase body produced no storeable chunk.
+
+    Raised BEFORE any destructive write so old points stay intact. The
+    dispatcher treats it exactly like an external ``not_ready`` response:
+    the row stays non-terminal and is retried until the time budget expires.
+    """
+
+    def __init__(self, reason: str, retry_after: float = _NOT_READY_RETRY_SECONDS_DEFAULT):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
+
+def _not_ready_max_seconds() -> float:
+    """Wall-clock budget a row may stay ``not_ready`` before it becomes ERROR.
+
+    ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` (default 3600). An explicit ``0``
+    means "expire immediately" (used by tests); unset/negative falls back to
+    the default.
+    """
+    value = get_env_int("CAT_INGESTION_NOT_READY_MAX_SECONDS")
+    if value is not None and value >= 0:
+        return float(value)
+    return _NOT_READY_MAX_SECONDS_DEFAULT
+
+
+def _not_ready_retry_after(result) -> float:
+    """Delay before re-running a not-ready phase (from the hook's ``retry_after``)."""
+    value = (result or {}).get("retry_after") if isinstance(result, dict) else None
+    try:
+        retry = float(value)
+    except (TypeError, ValueError):
+        retry = _NOT_READY_RETRY_SECONDS_DEFAULT
+    return retry if retry > 0 else _NOT_READY_RETRY_SECONDS_DEFAULT
+
+
+async def _wait_not_ready(
+    ccat,
+    scope: str,
+    source_name: str,
+    phase: str,
+    chat_id,
+    reason: str,
+    retry_after: float,
+) -> bool:
+    """Keep a not-ready row NON-TERMINAL and bounded by wall-clock time.
+
+    Refreshes the row's ``phase_retry`` hint (``status`` stays ``processing``,
+    ``phase`` unchanged) so the sweep can resume it, and only marks ERROR once
+    the elapsed time since the FIRST wait exceeds the configured budget. Logs
+    INFO on the first wait and WARNING exactly when the bound is exceeded.
+
+    Returns ``True`` when the caller should wait and retry, ``False`` when the
+    row is terminal (never rewritten) or has just been marked ERROR.
+    """
+    doc = await get_status(ccat.agent_key, scope, source_name)
+    if doc is not None and doc.get("status") in _TERMINAL_STATUSES:
+        # never overwrite a terminal row (e.g. another worker finished it)
+        return False
+
+    now = time.time()
+    hint = (doc or {}).get("phase_retry") if isinstance(doc, dict) else None
+    hint = hint if isinstance(hint, dict) else {}
+    try:
+        since = float(hint.get("since"))
+    except (TypeError, ValueError):
+        since = None
+    first_wait = hint.get("phase") != phase or since is None
+    if first_wait:
+        # first wait for THIS phase: restart the clock and log once
+        since = now
+        attempts = 1
+        log.info(
+            f"Agent id: {ccat._id}. Phase {phase} for {source_name} is not ready; "
+            f"keeping it pending (retry every {retry_after:.0f}s, max "
+            f"{_not_ready_max_seconds():.0f}s)"
+        )
+    else:
+        try:
+            attempts = int(hint.get("attempts") or 0) + 1
+        except (TypeError, ValueError):
+            attempts = 1
+
+    elapsed = max(0.0, now - since)
+    bound = _not_ready_max_seconds()
+    if elapsed >= bound:
+        msg = (
+            f"phase {phase} not ready after {elapsed:.0f}s (max {bound:.0f}s): {reason}"
+        )
+        log.warning(f"Agent id: {ccat._id}. Source {source_name}: {msg}")
+        await _set_status(ccat, source_name, IngestionStatus.ERROR, error=msg, chat_id=chat_id)
+        return False
+
+    try:
+        await set_status(
+            ccat.agent_key,
+            scope,
+            source_name,
+            type_="url" if is_url(source_name) else "file",
+            status=IngestionStatus.PROCESSING,
+            chat_id=chat_id,
+            phase=phase,
+            extra={
+                "phase_retry": {
+                    "phase": phase,
+                    "since": since,
+                    "attempts": attempts,
+                    "retry_after": retry_after,
+                    "reason": reason,
+                }
+            },
+        )
+    except Exception as e:  # noqa: BLE001 - a hint write must never break the machine
+        log.warning(
+            f"Agent id: {ccat._id}. Could not refresh the not-ready hint for "
+            f"{source_name}: {e}"
+        )
+    return True
+
+
+def _is_valid_embedding_vector(vector) -> bool:
+    """Whether a vector is a non-empty, finite, non-zero L2-norm sequence.
+
+    Mirrors the vector-handler guard: dense stores drop zero/non-finite vectors
+    silently, so the embedding phase must detect them BEFORE the destructive
+    replace and keep the source non-terminal when nothing valid remains.
+    An empty mapping ``{}`` is the intentional payload-only vector and is NOT
+    considered here (callers only pass vectors they actually computed).
+    """
+    if vector is None or isinstance(vector, dict):
+        return False
+    try:
+        values = [float(v) for v in vector]
+    except (TypeError, ValueError):
+        return False
+    if not values:
+        return False
+    if not all(math.isfinite(v) for v in values):
+        return False
+    return math.sqrt(sum(v * v for v in values)) > 1e-12
 
 
 class _IngestionCanceled(Exception):
@@ -419,7 +570,10 @@ async def _store_empty_vectors(
     return points
 
 
-async def _embed_phase(ccat, collection_name, source_name, source_points, embedder, chat_id, cat, rabbit_hole):
+async def _embed_phase(
+    ccat, collection_name, source_name, source_points, embedder, chat_id, cat, rabbit_hole,
+    zero_norm_summary: dict | None = None,
+):
     """Recompute the embeddings of the stored points and mark the source completed.
 
     Phase ``embedding``: rebuild LangChain docs from the stored text points and
@@ -429,6 +583,12 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
     ``after_rabbithole_stored_documents`` so analytics and the other listeners
     are informed, then returns the stored points.
 
+    Zero/non-finite L2-norm vectors are counted and logged at WARNING with the
+    source and chunk ids (dense stores would otherwise drop them silently). If
+    a source would end up with NO valid chunk at all, :class:`_NothingStored`
+    is raised BEFORE the destructive replace, so the caller keeps the row
+    non-terminal and retries later instead of marking an empty source complete.
+
     Returns the list of replaced points (with vectors), or None when the
     embedding failed (the source is left for a later pass).
     """
@@ -437,6 +597,12 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
     source_points_image = [p for p in source_points if (p.payload or {}).get("metadata", {}).get("image")]
 
     points: list[PointStruct] = []
+    # Per-source counters for the run summary: a silently empty source must be
+    # visible, not only a per-chunk warning buried in the log.
+    zero_norm_count = 0
+    zero_norm_ids: list[str] = []
+    intended_vectors = 0
+    valid_vectors = 0
 
     # --- text points: recompute the vector from the stored page_content ---
     if source_points_text:
@@ -471,6 +637,13 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
         vectors = await run_in_ingestion_executor(
             embedder.embed_documents, [d.page_content for d in docs]
         )
+        intended_vectors += len(docs)
+        for index, (doc, vector) in enumerate(zip(docs, vectors)):
+            if _is_valid_embedding_vector(vector):
+                valid_vectors += 1
+            else:
+                zero_norm_count += 1
+                zero_norm_ids.append(str(doc.id or f"#{index}"))
         points.extend(
             PointStruct(id=d.id or uuid.uuid4().hex, payload=d.model_dump(), vector=vector)
             for d, vector in zip(docs, vectors)
@@ -511,6 +684,14 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
                     )
                 for (p, _b), vector in zip(recoverable, image_vectors):
                     meta = dict((p.payload or {}).get("metadata", {}))
+                    intended_vectors += 1
+                    if _is_valid_embedding_vector(vector):
+                        valid_vectors += 1
+                    else:
+                        zero_norm_count += 1
+                        zero_norm_ids.append(
+                            str((p.payload or {}).get("id") or meta.get("image_file") or p.id)
+                        )
                     points.append(
                         PointStruct(
                             id=uuid.uuid4().hex,
@@ -529,6 +710,33 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
                         vector={},
                     )
                 )
+
+    if zero_norm_count:
+        sample = ", ".join(zero_norm_ids[:10])
+        more = "" if len(zero_norm_ids) <= 10 else f" (+{len(zero_norm_ids) - 10} more)"
+        log.warning(
+            f"Agent id: {ccat._id}. Source {source_name}: {zero_norm_count} chunk(s) "
+            f"have zero/non-finite L2-norm and will be dropped by the vector store "
+            f"(ids: {sample}{more})"
+        )
+        if zero_norm_summary is not None:
+            zero_norm_summary[source_name] = {
+                "count": zero_norm_count,
+                "ids": list(zero_norm_ids),
+                "valid": valid_vectors,
+                "intended": intended_vectors,
+            }
+
+    if intended_vectors and not valid_vectors:
+        # EVERY computed vector is unusable: storing these points would leave
+        # the source with NO embedding at all (dense stores drop zero vectors
+        # silently). Abort BEFORE the destructive replace so the previous
+        # points/vectors stay intact and the dispatcher can retry the phase.
+        raise _NothingStored(
+            f"embedding phase produced 0 valid vectors for {intended_vectors} "
+            f"chunk(s): all have zero/non-finite L2-norm",
+            retry_after=_not_ready_retry_after(None),
+        )
 
     # All vectors were computed BEFORE the delete so a failure leaves the old
     # points intact (compute-before-delete). A cancel that flipped during the
@@ -589,8 +797,10 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
       - ``{"status": "done"}`` -> returns ``True``: the caller records the
         diary entry and re-probes;
       - ``{"status": "not_ready", "retry_after": N}`` -> the phase is retried
-        after ``N`` seconds, bounded by ``_PHASE_RUN_MAX_RETRIES`` attempts;
-        exceeding the bound marks the row ERROR and returns ``False``;
+        after ``N`` seconds, keeping the row NON-TERMINAL (status
+        ``processing``, phase unchanged) until the wall-clock budget
+        ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` (default 3600) is exceeded;
+        only then is the row marked ERROR with the phase and elapsed time;
       - ``{"status": "error", "reason": "..."}`` -> FAIL-HARD: the row is
         marked ERROR with ``reason`` and ``False`` is returned;
       - ``None``, a raise, or any other return -> FAIL-HARD: the row is marked
@@ -610,7 +820,6 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
     )
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
 
-    retries = 0
     while True:
         try:
             result = await execute_phase_on_owner(
@@ -633,15 +842,13 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
         if isinstance(result, dict) and result.get("status") == "done":
             return True
         if isinstance(result, dict) and result.get("status") == "not_ready":
-            retries += 1
-            if retries > _PHASE_RUN_MAX_RETRIES:
-                msg = f"external phase {phase} not ready after {_PHASE_RUN_MAX_RETRIES} retries"
-                log.error(f"Agent id: {ccat._id}. {msg} for {source_name}")
-                await _set_status(ccat, source_name, IngestionStatus.ERROR, error=msg, chat_id=chat_id)
+            retry_after = _not_ready_retry_after(result)
+            reason = result.get("reason") or "external phase is not ready"
+            if not await _wait_not_ready(
+                ccat, scope, source_name, phase, chat_id, reason, retry_after
+            ):
                 return False
-            retry_after = result.get("retry_after") or 0
-            if retry_after > 0:
-                await asyncio.sleep(retry_after)
+            await asyncio.sleep(retry_after)
             continue
         if isinstance(result, dict) and result.get("status") == "error":
             reason = result.get("reason") or f"external phase {phase} reported an error"
@@ -978,6 +1185,9 @@ async def reembed_sources(
     )
     owner = f"reembed-{os.getpid()}"
     counter = 0
+    # Per-source zero/non-finite vector counts, reported in the run summary so
+    # a source that ended up empty is visible even when each drop was logged.
+    zero_norm_summary: dict = {}
 
     for source in stored_sources:
         source_name = source.name
@@ -1137,10 +1347,24 @@ async def reembed_sources(
                         if _point_matches_source(p, source_name, chat_id)
                     ]
                     if source_points:
-                        await _embed_phase(
-                            ccat, collection_name, source_name, source_points,
-                            embedder, chat_id, cat, rabbit_hole,
-                        )
+                        try:
+                            await _embed_phase(
+                                ccat, collection_name, source_name, source_points,
+                                embedder, chat_id, cat, rabbit_hole,
+                                zero_norm_summary=zero_norm_summary,
+                            )
+                        except _NothingStored as exc:
+                            # No valid vector at all: keep the row non-terminal
+                            # and retry the SAME phase until the time budget
+                            # expires (old points were NOT deleted). This is the
+                            # not_ready path, never a silent empty completion.
+                            if not await _wait_not_ready(
+                                ccat, scope, source_name, PHASE_EMBEDDING,
+                                chat_id, exc.reason, exc.retry_after,
+                            ):
+                                break
+                            await asyncio.sleep(exc.retry_after)
+                            continue
                         stored_points = None
                         counter += 1
                     else:
@@ -1220,6 +1444,12 @@ async def reembed_sources(
             await _stop_heartbeat(ccat, source_name, scope, cat)
 
     log.info(f"Agent id: {ccat._id}. Embedded {counter} files to the vector memory")
+    for source_name, info in zero_norm_summary.items():
+        log.warning(
+            f"Agent id: {ccat._id}. Run summary: source {source_name} had "
+            f"{info['count']} zero/non-finite vector chunk(s) "
+            f"({info['valid']}/{info['intended']} valid)"
+        )
 
 
 class EfficientIngestionEngine(BaseIngestionEngine):
