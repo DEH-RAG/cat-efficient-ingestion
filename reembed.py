@@ -621,7 +621,7 @@ async def _store_empty_vectors(
 
 async def _embed_phase(
     ccat, collection_name, source_name, source_points, embedder, chat_id, cat, rabbit_hole,
-    zero_norm_summary: dict | None = None,
+    zero_norm_summary: dict | None = None, counts: dict | None = None,
 ):
     """Recompute the embeddings of the stored points and mark the source completed.
 
@@ -802,6 +802,13 @@ async def _embed_phase(
     await execute_shared_hook(
         cat, "after_rabbithole_stored_documents", source_name, points,
     )
+    if counts is not None:
+        # expected: the stored chunks that needed vectors for this source;
+        # processed: how many items were actually embedded/stored (a re-split
+        # may produce more stored points than input chunks — all input chunks
+        # were nevertheless processed).
+        counts["expected"] = len(source_points)
+        counts["processed"] = len(points)
     return points
 
 
@@ -1019,16 +1026,69 @@ async def _mark_phase_running(ccat, scope, source_name, phase, chat_id, type_) -
     )
 
 
+def _phase_count(value):
+    """Return ``value`` when it is a genuine integer count, else ``None``.
+
+    ``bool`` is an ``int`` subclass but is never a count; a non-integer
+    (missing, string, float, ...) means the phase did not report it.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _unpack_parsing_result(result):
+    """Unpack a ``_run_parsing_phase`` result, tolerating legacy 2-tuples.
+
+    The real body returns ``(source_name, stored_points, expected, processed)``.
+    A test/external double returning the legacy ``(source_name, stored_points)``
+    (or a 3-tuple) is accepted with the counts unknown, preserving behaviour.
+    """
+    if len(result) == 4:
+        return result
+    if len(result) == 3:
+        source_name, stored_points, expected = result
+        return source_name, stored_points, expected, None
+    source_name, stored_points = result
+    return source_name, stored_points, None, None
+
+
 async def _finish_phase(
-    ccat, cat, scope, source_name, phase, chat_id, products
+    ccat, cat, scope, source_name, phase, chat_id, products,
+    expected=None, processed=None,
 ) -> bool:
-    """Record ``state: complete`` ONLY when the body produced products.
+    """Record ``state: complete`` according to the phase's expected/processed counts.
+
+    ``expected`` / ``processed`` are the counts the phase body REPORTED:
+
+    - both known: complete iff ``processed == expected``. ``0 == 0`` is a
+      legitimate completion (an empty source must not stay ``running``); any
+      mismatch (in particular ``processed < expected``) logs a WARNING naming
+      both numbers and leaves the entry ``running``;
+    - unknown (either count is ``None``): legacy behaviour — a non-empty/
+      truthy ``products`` means complete, an empty/falsy one means "the phase
+      wrote nothing" and leaves it ``running``. A DEBUG line records that the
+      counts were unavailable.
 
     ``products`` is the phase body's stored output (a non-empty list of points
     for the built-ins, or True for an external phase that reported ``done``).
-    An empty/falsy value means "the phase wrote nothing": the entry stays
-    ``running``, nothing is marked complete, and the caller stops this source.
     """
+    counts_known = expected is not None and processed is not None
+    if counts_known:
+        if processed == expected:
+            await _record_phase(ccat, cat, scope, source_name, phase, chat_id=chat_id)
+            return True
+        log.warning(
+            f"Agent id: {ccat._id}. Phase {phase} for {source_name} processed "
+            f"{processed} of {expected} expected item(s); leaving it running "
+            f"(NOT marked complete)"
+        )
+        return False
+
+    log.debug(
+        f"Agent id: {ccat._id}. Phase {phase} for {source_name}: expected/"
+        "processed counts unavailable; falling back to product-presence check"
+    )
     if not products:
         log.warning(
             f"Agent id: {ccat._id}. Phase {phase} for {source_name} produced "
@@ -1039,13 +1099,19 @@ async def _finish_phase(
     return True
 
 
-async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> bool:
+async def _run_external_phase(
+    ccat, cat, scope, source_name, phase, chat_id, counts=None
+) -> bool:
     """Dispatch one external (non-``PHASES``) phase through the run hook.
 
     Handles the tri-state contract of ``ingestion_phase_run`` (hooks.py):
 
       - ``{"status": "done"}`` -> returns ``True``: the caller records the
-        diary entry and re-probes;
+        diary entry and re-probes. The optional ``processed`` / ``expected``
+        fields, when both are integers, are copied into ``counts`` so the
+        caller can enforce the exact completion predicate; a bare
+        ``{"status": "done"}`` leaves both as ``None`` (counts unknown, legacy
+        behaviour preserved);
       - ``{"status": "not_ready", "retry_after": N}`` -> the phase is retried
         after ``N`` seconds, keeping the row NON-TERMINAL (status
         ``processing``, phase unchanged) until the wall-clock budget
@@ -1090,6 +1156,11 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
             return False
 
         if isinstance(result, dict) and result.get("status") == "done":
+            if counts is not None:
+                # Only an integer pair is a usable report; anything else keeps
+                # the legacy "expected unknown" behaviour.
+                counts["expected"] = _phase_count(result.get("expected"))
+                counts["processed"] = _phase_count(result.get("processed"))
             return True
         if isinstance(result, dict) and result.get("status") == "not_ready":
             retry_after = _not_ready_retry_after(result)
@@ -1275,9 +1346,11 @@ async def _run_parsing_phase(
     text chunks and image points with EMPTY vectors.
 
     Returns:
-        ``(resolved_source_name, stored_points)`` — the (possibly re-resolved)
-        source name and the stored empty-vector points, which the embedding
-        phase consumes on the next loop iteration.
+        ``(resolved_source_name, stored_points, expected, processed)`` — the
+        (possibly re-resolved) source name, the stored empty-vector points
+        (which the embedding phase consumes on the next loop iteration), the
+        number of text chunks the parser produced (``expected``) and the number
+        of those chunks actually stored (``processed``).
     """
     # 1. clean-sweep: remove every artifact of this phase and the following ones.
     await _raise_if_canceled(ccat)
@@ -1371,7 +1444,14 @@ async def _run_parsing_phase(
         ccat, collection_name, source_name, chat_id,
         docs, images, file_hash=file_hash, metadata=source.metadata or {},
     )
-    return source_name, stored
+    # Report the phase counts for the completion predicate: the parser produced
+    # ``len(docs)`` text chunks; ``processed`` is how many of those text chunks
+    # were actually stored (image points are not chunks and are excluded from
+    # both sides).
+    chunks_stored = sum(
+        1 for p in stored if not (p.payload or {}).get("metadata", {}).get("image")
+    )
+    return source_name, stored, len(docs), chunks_stored
 
 
 async def reembed_sources(
@@ -1621,6 +1701,10 @@ async def reembed_sources(
                 entry = pending[0]
                 phase = entry["phase"]
                 phase_products = True
+                # Counts REPORTED by the phase body for the completion
+                # predicate; None means "expected unknown" (legacy behaviour).
+                phase_expected = None
+                phase_processed = None
 
                 if phase == PHASE_EMBEDDING:
                     # chunks (text) already stored for this source: chunk-reuse
@@ -1655,11 +1739,15 @@ async def reembed_sources(
                             "url" if is_url(source_name) else "file",
                         )
                         try:
+                            embed_counts: dict = {}
                             phase_products = await _embed_phase(
                                 ccat, collection_name, source_name, source_points,
                                 embedder, chat_id, cat, rabbit_hole,
                                 zero_norm_summary=zero_norm_summary,
+                                counts=embed_counts,
                             )
+                            phase_expected = embed_counts.get("expected")
+                            phase_processed = embed_counts.get("processed")
                         except _NothingStored as exc:
                             # No valid vector at all: keep the row non-terminal
                             # and retry the SAME phase until the time budget
@@ -1689,9 +1777,13 @@ async def reembed_sources(
                             ccat, scope, source_name, PHASE_PARSING_CHUNKING, chat_id,
                             "url" if is_url(source_name) else "file",
                         )
-                        source_name, stored_points = await _run_parsing_phase(
-                            ccat, collection_name, source, source_name, chat_id, cat,
-                            rabbit_hole, active_chunker_name,
+                        source_name, stored_points, phase_expected, phase_processed = (
+                            _unpack_parsing_result(
+                                await _run_parsing_phase(
+                                    ccat, collection_name, source, source_name,
+                                    chat_id, cat, rabbit_hole, active_chunker_name,
+                                )
+                            )
                         )
                         phase_products = stored_points
                 elif phase == PHASE_PARSING_CHUNKING:
@@ -1707,9 +1799,13 @@ async def reembed_sources(
                         ccat, scope, source_name, PHASE_PARSING_CHUNKING, chat_id,
                         "url" if is_url(source_name) else "file",
                     )
-                    source_name, stored_points = await _run_parsing_phase(
-                        ccat, collection_name, source, source_name, chat_id, cat,
-                        rabbit_hole, active_chunker_name,
+                    source_name, stored_points, phase_expected, phase_processed = (
+                        _unpack_parsing_result(
+                            await _run_parsing_phase(
+                                ccat, collection_name, source, source_name,
+                                chat_id, cat, rabbit_hole, active_chunker_name,
+                            )
+                        )
                     )
                     phase_products = stored_points
                 else:
@@ -1730,21 +1826,26 @@ async def reembed_sources(
                         ccat, scope, source_name, phase, chat_id,
                         "url" if is_url(source_name) else "file",
                     )
+                    external_counts: dict = {}
                     if not await _run_external_phase(
-                        ccat, cat, scope, source_name, phase, chat_id
+                        ccat, cat, scope, source_name, phase, chat_id,
+                        counts=external_counts,
                     ):
                         # the row was marked ERROR (fail-hard / retry bound):
                         # stop the machine; the ERROR-absorbing check above
                         # never advances nor resurrects it.
                         break
                     phase_products = True
+                    phase_expected = external_counts.get("expected")
+                    phase_processed = external_counts.get("processed")
 
                 # ---- ATOMIC COMPLETION: record ``state: complete`` ONLY when
-                # ---- the body produced products (never at phase start) ----
+                # ---- the body met its expected/processed predicate ----
                 if not await _finish_phase(
-                    ccat, cat, scope, source_name, phase, chat_id, phase_products
+                    ccat, cat, scope, source_name, phase, chat_id, phase_products,
+                    expected=phase_expected, processed=phase_processed,
                 ):
-                    # nothing was written: leave the running entry in place
+                    # predicate not met / nothing written: leave running
                     break
 
                 # ---- re-probe with the updated diary ----

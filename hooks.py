@@ -285,7 +285,12 @@ def ingestion_phase_run(phase, source, completed_phases, cat=None, lizard=None):
     """Run one phase for ``source``; tri-state contract.
 
     A registrant that implements ``phase`` must either:
-      - return ``{"status": "done"}`` on success;
+      - return ``{"status": "done"}`` on success. Optionally include
+        ``"processed": N`` and ``"expected": M`` (both integers) to let the
+        machine enforce the exact completion predicate (complete iff
+        ``processed == expected``, including ``0 == 0``). Omitting them — or a
+        bare ``{"status": "done"}`` — keeps the legacy behaviour ("expected
+        unknown": a truthy result completes the phase);
       - return ``{"status": "not_ready", "retry_after": N}`` when the phase is
         retriable but cannot run yet (the machine retries after ``N`` seconds);
       - return ``{"status": "error", "reason": "..."}`` on a permanent failure
