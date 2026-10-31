@@ -100,7 +100,7 @@ Never require EffING at import time and never make `PhaseSpec` duck-typed: the s
 
 `reembed_sources` is the one probe-driven dispatcher. For each source it reads the `completed_phases` diary (backfilling legacy completed rows), converts it to the hook list shape and threads it into the `ingestion_phase_pending` accumulator. Registrants compare the diary against the current settings markers/versions and report the stale phases:
 
-- **no stale phases** → the source is up to date and is **skipped without claiming**;
+- **no stale phases** → the source is up to date: it is **skipped without claiming** when it is already terminal (`completed`/`error`); a non-terminal row left behind (e.g. an interrupted run that recorded every phase but never wrote `completed`) is **terminalized to `completed`** here, in one pass, so the sweep never re-hands it forever;
 - **stale phases** → the row is claimed (per-source lock) and the stale phases run **serially**, one at a time in probe order.
 
 After each phase succeeds, its diary entry (`marker` / `settings_version` / `deps`) is recorded **atomically at completion** — never at phase start — and the probe is re-run against the updated diary. When the re-probe is empty, the terminal COMPLETED status is written (after the `before_ingestion_status_completed` gate), with the work phase cleared. An `error` row is never advanced nor resurrected to COMPLETED.
@@ -123,7 +123,7 @@ After each phase succeeds, its diary entry (`marker` / `settings_version` / `dep
 
 On `after_lizard_bootstrap` the plugin schedules a fire-and-forget pass (per agent, never blocking bootstrap) that:
 
-1. hands every stale `uploaded` / `processing` / `error` entry back to the phase machine, re-reading the file from disk or re-downloading the URL (entries whose file is gone are marked `error` with the reason);
+1. hands every stale `uploaded` / `processing` / `error` entry back to the phase machine, re-reading the file from disk or re-downloading the URL (entries whose file is gone are marked `error` with the reason). An `error` row is retried only while its diary still shows a stale phase, so a fresh `error` row is terminal and never re-handed;
 2. revalidates `completed` rows through the clock-free probe (see Hardening);
 3. purges the status entries whose source is absent from the canonical lists.
 

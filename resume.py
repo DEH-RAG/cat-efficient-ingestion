@@ -129,6 +129,28 @@ def _collection_for_scope(scope: str) -> VectorMemoryType:
     return VectorMemoryType.DECLARATIVE if scope == "agent" else VectorMemoryType.EPISODIC
 
 
+async def _pending_phases(ccat, entry: dict) -> list:
+    """READ-ONLY phase probe for one status entry.
+
+    Backfills the completed-phases diary (legacy completed rows get a sentinel so
+    they are conservatively stale once), converts it to the hook list shape and
+    lets the ``ingestion_phase_pending`` accumulator registrants report which
+    phases must be re-run against the CURRENT settings. Returns the filtered
+    stale-phase list; an empty list means the row is genuinely up to date.
+    """
+    completed = await backfill_completed_phases(entry, list(PHASES.keys()))
+    completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
+    pending = await execute_phase_accumulator(
+        ccat,
+        "ingestion_phase_pending",
+        [],
+        entry.get("source"),
+        completed_as_list,
+        default=list,
+    )
+    return [p for p in (pending or []) if p and p.get("phase")]
+
+
 def _source_from_entry(ccat, agent_id: str, scope: str, source: str, type_: str = "file"):
     """Build a ``StoredSourceWithMetadata`` for an in-flight entry, re-reading the file.
 
@@ -170,6 +192,9 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
     the phase from the status doc, claims the per-source work atomically (so
     two workers never double-process), records the phase, cleans up any orphan
     images and performs the full re-ingest from disk (or URL re-download).
+    An ``error`` row is retried ONLY while its diary still shows a stale phase,
+    and the phase machine terminalizes an up-to-date ``processing`` row on its
+    first pass, so a fully-processed row is never re-handed.
     Fresh entries and ``completed`` entries are left untouched (completed rows
     are revalidated by :func:`_revalidate_agent`). A canceled agent (deletion
     marker or ghost) is skipped entirely.
@@ -208,6 +233,22 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
             IngestionStatus.ERROR.value,
         ):
             continue
+
+        # An ``error`` row is terminal unless its diary still shows a stale
+        # phase: retrying it while every phase is fresh would resurrect a row the
+        # machine already exhausted (and re-hand it forever without any
+        # progress). A failed phase leaves its diary entry missing, so a genuinely
+        # retryable error still probes as stale and is handed below.
+        if status == IngestionStatus.ERROR.value:
+            try:
+                if not await _pending_phases(ccat, entry):
+                    continue
+            except Exception as e:  # noqa: BLE001 - a probe failure must not resurrect
+                log.warning(
+                    f"Ingestion resume: could not probe stale phases for {entry.get('source')} "
+                    f"(agent {agent_id}); leaving it error: {e}"
+                )
+                continue
 
         # A download has no PROCESSING heartbeat: only touch it once it is
         # older than the download threshold (an active download stays fresh).
@@ -300,17 +341,7 @@ async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = No
             # list shape (every entry carries a "phase" key) and let the
             # accumulator registrants report the stale phases. A non-empty
             # result means at least one phase must be re-run.
-            completed = await backfill_completed_phases(entry, list(PHASES.keys()))
-            completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-            pending = await execute_phase_accumulator(
-                ccat,
-                "ingestion_phase_pending",
-                [],
-                source,
-                completed_as_list,
-                default=list,
-            )
-            pending = [p for p in (pending or []) if p and p.get("phase")]
+            pending = await _pending_phases(ccat, entry)
             if not pending:
                 # probe empty: the row is genuinely complete — never claim it
                 continue

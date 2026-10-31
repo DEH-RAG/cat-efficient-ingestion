@@ -1026,10 +1026,27 @@ async def reembed_sources(
             if not pending:
                 # every recorded phase is still fresh against the current settings
                 # -> the source is up to date: skip WITHOUT claiming.
-                log.debug(
-                    f"Agent id: {ccat._id}. Source {source_name}: no stale phases "
-                    f"(diary {sorted(get_completed_phases(doc))}), skipping"
-                )
+                # A non-terminal row whose diary is already complete (e.g. left
+                # ``processing`` by a run interrupted between the last diary
+                # write and the terminal write) must be terminalized here, or
+                # the sweep would re-hand it forever without ever advancing it.
+                # Terminal rows are left untouched: an ``error`` row is never
+                # resurrected and a ``completed`` row needs no write (no churn).
+                if doc_status not in (
+                    IngestionStatus.COMPLETED.value,
+                    IngestionStatus.ERROR.value,
+                ):
+                    log.info(
+                        f"Agent id: {ccat._id}. Source {source_name}: every phase is "
+                        f"already complete (status {doc_status!r}); writing terminal "
+                        f"COMPLETED"
+                    )
+                    await _complete_source(ccat, cat, scope, source_name, chat_id)
+                else:
+                    log.debug(
+                        f"Agent id: {ccat._id}. Source {source_name}: no stale phases "
+                        f"(status {doc_status!r}, diary {sorted(get_completed_phases(doc))}), skipping"
+                    )
                 continue
             start_phase = pending[0]["phase"]
         else:
