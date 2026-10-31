@@ -112,6 +112,26 @@ async def _raise_if_canceled(ccat) -> None:
         raise _IngestionCanceled(f"agent {agent_key} canceled mid-phase")
 
 
+async def _resolve_rabbit_hole(ccat):
+    """Return a RabbitHole bound to ``ccat``, creating one when none exists.
+
+    The app creates ``lizard.rabbit_hole`` during ``BillTheLizard.bootstrap``.
+    A process that builds a CheshireCat outside the app (e.g. the maintenance
+    CLI in a fresh ``docker exec``) only discovers the plugins, so
+    ``ccat.rabbit_hole`` stays ``None``. Create a per-call instance instead of
+    touching the shared singleton, which keeps concurrent per-agent parsing
+    isolated (``_run_parsing_phase`` still copies it per call).
+    """
+    rabbit_hole = getattr(ccat, "rabbit_hole", None)
+    if rabbit_hole is not None:
+        return rabbit_hole
+    from cat.rabbit_hole import RabbitHole
+
+    rabbit_hole = RabbitHole()
+    await rabbit_hole.setup(ccat)
+    return rabbit_hole
+
+
 async def _set_status(ccat, source: str, status: IngestionStatus, error: str | None = None, chat_id: str | None = None) -> None:
     """Best-effort status write via the plugin's own registry."""
     scope = str(chat_id) if chat_id else "agent"
@@ -813,6 +833,8 @@ async def _run_parsing_phase(
     # agent's chunker (and still mark the phase up to date). The shallow copy
     # is cheap, matches ``RabbitHole.ingest_memory``'s own pattern, and leaves
     # the shared object untouched.
+    if rabbit_hole is None:
+        rabbit_hole = await _resolve_rabbit_hole(ccat)
     rabbit_hole = copy.copy(rabbit_hole)
     rabbit_hole.cat = ccat
     rabbit_hole.stray = None
@@ -946,7 +968,7 @@ async def reembed_sources(
         str(collection_name), with_vectors=False
     )
 
-    rabbit_hole = ccat.rabbit_hole
+    rabbit_hole = await _resolve_rabbit_hole(ccat)
     embedder = await ccat.embedder()
     active_embedder_name = getattr(embedder, "name", None) or get_nlp_object_name(embedder, "default_embedder")
     chunker = getattr(ccat, "chunker", None)
