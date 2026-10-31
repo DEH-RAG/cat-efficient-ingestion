@@ -1,6 +1,6 @@
 """Phase-machine extension hooks for the efficient-ingestion plugin.
 
-These five hooks define the contract between the EffING phase machine and any
+These hooks define the contract between the EffING phase machine and any
 external registrant (other plugins, e.g. MyGRAPH) that wants to participate in
 ingestion phases. They are declared here, in the plugin itself, with
 ``@hook(priority=0)`` so that external plugins can override them with higher
@@ -10,7 +10,7 @@ All defaults are conservative no-ops: a phase that nobody implements is
 reported as pending (stale), fails hard when run, and its marker is unknown.
 
 Importing this module has zero side effects: the only top-level statements are
-the five ``@hook`` decorators (which merely wrap the functions in ``CatHook``
+the ``@hook`` decorators (which merely wrap the functions in ``CatHook``
 instances). No Redis, no network, no filesystem access.
 """
 
@@ -306,6 +306,33 @@ def ingestion_phase_run(phase, source, completed_phases, cat=None, lizard=None):
 
     Returns:
         ``None`` (default), or a status dict per the contract above.
+    """
+    return None
+
+
+@hook(priority=0)
+async def ingestion_phase_purge(phase, source, cat=None, lizard=None):
+    """Purge the products of one external phase for ONE source.
+
+    Recovery contract: when a ``running`` diary entry's lease expired, the
+    machine calls this hook for the abandoned phase (and any completed later
+    phase, in REVERSE execution order) before re-running it. A registrant must
+    delete ONLY the artifacts THAT phase produced for THAT source.
+
+    The default is a no-op returning ``None``, which the dispatcher reads as
+    "this phase has NO purge implementation": it does NOT delete anything
+    blindly, logs a WARNING naming the phase/source and leaves the entry
+    ``running`` (visible, not re-run, not completed). A real implementation
+    must return a truthy value (e.g. ``{"status": "done"}``) after purging.
+
+    Args:
+        phase: the phase id whose products must be purged.
+        source: the source whose phase artifacts must be removed.
+        cat: the CheshireCat instance (may be ``None`` in unit tests).
+
+    Returns:
+        ``None`` when the phase has no purge implementation, else a truthy
+        result once the source-scoped purge completed.
     """
     return None
 

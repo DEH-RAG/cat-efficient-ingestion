@@ -25,6 +25,9 @@ the reconcile/DELETE paths (the DELETE endpoint keeps refusing ``uploaded`` /
 sweep's job, not the purge path's.
 """
 import hashlib
+import os
+import socket
+import time
 from typing import Dict, List, Optional
 
 from cat.db import crud
@@ -57,6 +60,66 @@ class IngestionStatus(Enum):
 PHASE_DOWNLOADING = "downloading"
 PHASE_PARSING_CHUNKING = "parsing_chunking"
 PHASE_EMBEDDING = "embedding"
+
+#: Per-(source, phase) diary state machine. Every diary entry carries a
+#: ``state``: ``running`` is written BEFORE the phase body starts (with
+#: ``started_at`` / ``attempt`` / ``owner``), ``complete`` only AFTER the body
+#: finished and its products were stored. An entry written by an older release
+#: has no ``state`` and is treated as ``complete`` (backward compatible).
+PHASE_STATE_RUNNING = "running"
+PHASE_STATE_COMPLETE = "complete"
+
+#: Lease of a ``running`` diary entry, in seconds (env-overridable). A
+#: ``running`` entry older than this is considered abandoned: its phase is
+#: purged and re-run from scratch. Default 30 minutes.
+PHASE_LEASE_SECONDS_DEFAULT = 1800
+
+
+def phase_lease_seconds() -> float:
+    """Lease duration of a ``running`` phase entry (env-overridable)."""
+    value = get_env_int("CAT_INGESTION_PHASE_LEASE_SECONDS")
+    return float(value) if value is not None and value > 0 else float(PHASE_LEASE_SECONDS_DEFAULT)
+
+
+def current_phase_owner() -> Dict[str, object]:
+    """Identity of the process writing a ``running`` entry (pid + hostname)."""
+    return {"pid": os.getpid(), "hostname": socket.gethostname()}
+
+
+def _entry_started_at(entry: Dict) -> Optional[float]:
+    try:
+        return float(entry.get("started_at"))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_phase_lease_expired(entry: Optional[Dict], now: Optional[float] = None) -> bool:
+    """Whether a ``running`` diary entry's lease is expired.
+
+    Both contract conditions are evaluated explicitly:
+
+    - ``started_at`` is older than ``phase_lease_seconds()`` (or missing /
+      malformed -> expired: an entry with no clock cannot be trusted) OR
+    - the recorded ``owner`` is NOT the current process and the entry is older
+      than the same threshold.
+
+    A non-``running`` entry (``complete`` or legacy no-state) never expires:
+    expiry only applies to the ``running`` state machine.
+    """
+    if not isinstance(entry, dict) or entry.get("state") != PHASE_STATE_RUNNING:
+        return False
+    now = time.time() if now is None else now
+    lease = phase_lease_seconds()
+
+    started_at = _entry_started_at(entry)
+    age = None if started_at is None else now - started_at
+    started_expired = age is None or age > lease
+
+    owner = entry.get("owner")
+    owner_is_current = isinstance(owner, dict) and owner == current_phase_owner()
+    owner_expired = (not owner_is_current) and age is not None and age > lease
+
+    return started_expired or owner_expired
 
 
 def status_key(agent_id: str, scope: str, source: str) -> str:
@@ -427,11 +490,18 @@ async def record_phase_completed(
     """
     if not phase or not isinstance(phase, str):
         return await get_status(agent_id, scope, source) or {}
+    previous = get_completed_phases(
+        await get_status(agent_id, scope, source)
+    ).get(phase)
     entry = {
+        "state": PHASE_STATE_COMPLETE,
         "marker": marker,
         "settings_version": settings_version,
         "deps": deps or {},
     }
+    # Keep the attempt counter of the run that produced the products.
+    if isinstance(previous, dict) and previous.get("attempt") is not None:
+        entry["attempt"] = previous.get("attempt")
     return await set_status(
         agent_id,
         scope,
@@ -440,6 +510,84 @@ async def record_phase_completed(
         status=IngestionStatus.PROCESSING,
         completed_phases={phase: entry},
     )
+
+
+async def record_phase_running(
+    agent_id: str,
+    scope: str,
+    source: str,
+    phase: str,
+    *,
+    type_: str = "file",
+    chat_id: Optional[str] = None,
+    started_at: Optional[float] = None,
+) -> dict:
+    """Mark a phase ``running`` BEFORE its body starts (state machine start).
+
+    Writes the diary entry::
+
+        {phase: {"state": "running", "started_at": <epoch float>,
+                 "attempt": <n>, "owner": {"pid": <pid>,
+                                           "hostname": "<host>"}}}
+
+    replacing any previous entry for that phase (a stale ``complete`` or an
+    abandoned ``running`` one). ``attempt`` is the previous attempt count + 1,
+    or 1 for a fresh phase, so a recovery re-run is visible in the diary.
+
+    The atomic-completion invariant is preserved: a ``running`` entry is NOT
+    proof the phase completed. Only :func:`record_phase_completed` writes
+    ``state: "complete"``, and it does so only after the products are stored.
+    """
+    if not phase or not isinstance(phase, str):
+        return await get_status(agent_id, scope, source) or {}
+    previous = get_completed_phases(
+        await get_status(agent_id, scope, source)
+    ).get(phase)
+    try:
+        attempt = int(previous.get("attempt") or 0) + 1 if isinstance(previous, dict) else 1
+    except (TypeError, ValueError):
+        attempt = 1
+    entry = {
+        "state": PHASE_STATE_RUNNING,
+        "started_at": generate_timestamp() if started_at is None else float(started_at),
+        "attempt": attempt,
+        "owner": current_phase_owner(),
+    }
+    return await set_status(
+        agent_id,
+        scope,
+        source,
+        type_=type_,
+        status=IngestionStatus.PROCESSING,
+        chat_id=chat_id,
+        completed_phases={phase: entry},
+    )
+
+
+async def reset_phase_entries(
+    agent_id: str, scope: str, source: str, phases
+) -> dict:
+    """Remove the diary entries of ``phases`` for a source (purge reset).
+
+    Used by the abandoned-lease recovery: after the phase products were
+    purged, the entries are dropped so the phases are stale again and re-run
+    from scratch. A missing row/doc/diary is a no-op (returns ``{}``).
+    """
+    phases = set(phases or [])
+    if not phases:
+        return await get_status(agent_id, scope, source) or {}
+    key = status_key(agent_id, scope, source)
+    doc = await _read_doc(key)
+    if not isinstance(doc, dict):
+        return {}
+    diary = doc.get("completed_phases")
+    if not isinstance(diary, dict):
+        return doc
+    for phase in phases:
+        diary.pop(phase, None)
+    doc["completed_phases"] = diary
+    await crud.store(key, doc)
+    return doc
 
 
 def _resume_created_lease_seconds() -> float:

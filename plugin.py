@@ -35,7 +35,7 @@ from .hooks import (
     execute_phase_accumulator,
     execute_phase_hook_on_all,
 )
-from .phases import PHASES
+from .phases import PHASES, has_live_running_phase
 from .registry import (
     PHASE_DOWNLOADING,
     PHASE_PARSING_CHUNKING,
@@ -423,6 +423,11 @@ async def after_rabbithole_stored_documents(source, stored_points, cat=None, liz
             type_=_source_type(source),
             chat_id=chat_id,
         )
+        return
+
+    # A live ``running`` lease means the phase body is still in flight: never
+    # terminalize the row mid-phase (the machine owns the terminal write).
+    if has_live_running_phase(completed):
         return
 
     # Nothing pending: final gate, then the terminal state. The gate runs on

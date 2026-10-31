@@ -63,7 +63,11 @@ from .hooks import (
     phase_managers,
     phase_settings_key,
 )
-from .registry import get_completed_phases
+from .registry import (
+    PHASE_STATE_RUNNING,
+    get_completed_phases,
+    is_phase_lease_expired,
+)
 
 
 @dataclass(frozen=True)
@@ -269,6 +273,13 @@ def is_phase_stale(
     if not isinstance(entry, dict):
         return True
 
+    # (state machine) A phase whose last entry is ``running`` is stale only
+    # when its lease expired: an abandoned run must be purged and re-run from
+    # scratch, while a LIVE run (another worker, or this process still inside
+    # the phase body) is left alone.
+    if entry.get("state") == PHASE_STATE_RUNNING:
+        return is_phase_lease_expired(entry)
+
     # (a) dependency: upstream marker identity, never timestamps
     for upstream in spec.depends_on:
         upstream_entry = completed_phases.get(upstream)
@@ -286,6 +297,22 @@ def is_phase_stale(
 
     # (c) slow-path: plugin marker comparison
     return entry.get("marker") != current_marker
+
+
+def has_live_running_phase(completed_phases: Any) -> bool:
+    """Whether the diary holds a ``running`` entry with a LIVE lease.
+
+    Such a source is being worked on by another worker (or by this process,
+    earlier in the same pass): the machine must leave it alone and must NOT
+    write a terminal COMPLETED while the lease is live.
+    """
+    diary = _diary_from_completed_phases(completed_phases)
+    return any(
+        isinstance(entry, dict)
+        and entry.get("state") == PHASE_STATE_RUNNING
+        and not is_phase_lease_expired(entry)
+        for entry in diary.values()
+    )
 
 
 @hook(priority=0)

@@ -74,17 +74,25 @@ from .hooks import (
     phase_settings_key,
 )
 from .ingestion_executor import run_in_ingestion_executor
-from .phases import execute_phase_on_owner, merged_phases
+from .phases import (
+    execute_phase_on_owner,
+    has_live_running_phase,
+    merged_phases,
+)
 from .registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
     IngestionStatus,
     backfill_completed_phases,
     claim_source_for_resume,
+    PHASE_STATE_RUNNING,
     get_completed_phases,
     get_status,
     ingestion_canceled,
+    is_phase_lease_expired,
     record_phase_completed,
+    record_phase_running,
+    reset_phase_entries,
     set_phase,
     set_status,
 )
@@ -830,6 +838,207 @@ async def _probe_pending(ccat, cat, source_name, doc) -> list:
     return [p for p in (pending or []) if p and p.get("phase")]
 
 
+def _point_id(record):
+    """Best-effort id of a stored point record (handler or payload)."""
+    value = getattr(record, "id", None) or (record.payload or {}).get("id")
+    return value
+
+
+def _point_meta(record) -> dict:
+    return (record.payload or {}).get("metadata", {}) or {}
+
+
+async def _purge_parsing_phase(ccat, collection_name, source_name, chat_id) -> int:
+    """PURGE ``parsing_chunking``: the source's staging/chunk artifacts only.
+
+    Deletes every stored point of THIS source in THIS collection EXCEPT the
+    catalogue-card segments (``is_catalogue_card``), which are another phase's
+    product. Image points/files are parsing products too, so the saved image
+    files are cleaned up first. Never touches other sources.
+    """
+    handler = ccat.vector_memory_handler
+    await _cleanup_orphan_images(ccat, collection_name, source_name, chat_id)
+    records, _ = await handler.get_all_tenant_points(
+        str(collection_name),
+        metadata=_source_metadata(source_name, chat_id),
+        with_vectors=True,
+    )
+    ids = []
+    for record in records or []:
+        if _point_meta(record).get("is_catalogue_card") is True:
+            continue
+        point_id = _point_id(record)
+        if point_id is not None:
+            ids.append(point_id)
+    if ids:
+        await handler.delete_tenant_points_by_ids(str(collection_name), ids)
+    return len(ids)
+
+
+async def _purge_embedding_phase(ccat, collection_name, source_name, chat_id) -> int:
+    """PURGE ``embedding``: ONLY the source's points with a REAL vector.
+
+    A staging point carries ``vector={}`` (payload only) and MUST survive: it
+    is parsing's product and the parsing purge cleans it. Graph artifacts are
+    not vector points and are never touched here.
+    """
+    handler = ccat.vector_memory_handler
+    records, _ = await handler.get_all_tenant_points(
+        str(collection_name),
+        metadata=_source_metadata(source_name, chat_id),
+        with_vectors=True,
+    )
+    ids = []
+    for record in records or []:
+        if not _is_valid_embedding_vector(getattr(record, "vector", None)):
+            continue
+        point_id = _point_id(record)
+        if point_id is not None:
+            ids.append(point_id)
+    if ids:
+        await handler.delete_tenant_points_by_ids(str(collection_name), ids)
+    return len(ids)
+
+
+async def _purge_external_phase(ccat, cat, source_name, phase) -> bool:
+    """PURGE an external phase via ``ingestion_phase_purge`` on its owner.
+
+    Returns False (and logs a WARNING naming phase/source) when the phase has
+    no purge implementation: recovery must then leave the entry ``running``,
+    not delete anything blindly, not re-run and not mark it complete.
+    """
+    result = await execute_phase_on_owner(
+        cat if cat is not None else ccat,
+        "ingestion_phase_purge",
+        phase,
+        phase,
+        source_name,
+        default=None,
+        caller=cat,
+    )
+    if result is None:
+        log.warning(
+            f"Agent id: {ccat._id}. Phase {phase} for {source_name} has no "
+            f"purge implementation; leaving its running entry in place "
+            f"(not re-running, not completing)"
+        )
+        return False
+    return True
+
+
+async def _purge_phase(ccat, cat, collection_name, scope, source_name, chat_id, phase) -> bool:
+    """Dispatch the PURGE for one phase, source-scoped.
+
+    Built-in phases have an explicit product boundary; everything else goes
+    through the external hook. Returns False when no purge implementation
+    exists (the caller must leave the running entry untouched).
+    """
+    if phase == PHASE_PARSING_CHUNKING:
+        count = await _purge_parsing_phase(ccat, collection_name, source_name, chat_id)
+        log.info(
+            f"Agent id: {ccat._id}. Purged parsing_chunking artifacts for "
+            f"{source_name}: {count} staging/chunk point(s)"
+        )
+        return True
+    if phase == PHASE_EMBEDDING:
+        count = await _purge_embedding_phase(ccat, collection_name, source_name, chat_id)
+        log.info(
+            f"Agent id: {ccat._id}. Purged embedding artifacts for "
+            f"{source_name}: {count} real-vector point(s)"
+        )
+        return True
+    return await _purge_external_phase(ccat, cat, source_name, phase)
+
+
+async def _recover_abandoned_phases(
+    ccat, cat, collection_name, scope, source_name, chat_id, doc
+) -> bool | None:
+    """Purge + reset every abandoned (expired-lease) running phase.
+
+    Called from the SAME dispatch loop where the periodic probe runs
+    (``reembed_sources``), BEFORE the pending phase is re-run. The earliest
+    expired ``running`` entry in execution order is the abandoned phase; every
+    later phase that has a diary entry (its downstream products) is purged
+    with it, in REVERSE execution order (later phases first). The purged
+    entries are then reset so the phases are stale again and re-run from
+    scratch.
+
+    Returns:
+        ``None`` when nothing is abandoned (normal path), ``True`` after a
+        successful purge+reset, ``False`` when a phase has no purge
+        implementation (its WARNING was logged; the caller must stop this
+        source and leave the entry running).
+    """
+    diary = get_completed_phases(doc)
+    if not diary:
+        return None
+    merged = await merged_phases(ccat, cat)
+    order = list(merged.keys())
+    expired = [
+        phase for phase in order
+        if isinstance(diary.get(phase), dict)
+        and diary[phase].get("state") == PHASE_STATE_RUNNING
+        and is_phase_lease_expired(diary[phase])
+    ]
+    if not expired:
+        return None
+
+    first = expired[0]
+    try:
+        start = order.index(first)
+    except ValueError:
+        order.append(first)
+        start = len(order) - 1
+    # Only phases that actually have an entry (ran at least once) are purged:
+    # a later phase that never started has no products to remove.
+    to_purge = [
+        phase for phase in order[start:]
+        if isinstance(diary.get(phase), dict)
+    ]
+
+    for phase in reversed(to_purge):
+        if not await _purge_phase(
+            ccat, cat, collection_name, scope, source_name, chat_id, phase
+        ):
+            # No purge implementation: do NOT delete blindly and do NOT
+            # re-run; the abandoned entry stays ``running`` and visible.
+            return False
+
+    await reset_phase_entries(ccat.agent_key, scope, source_name, to_purge)
+    log.warning(
+        f"Agent id: {ccat._id}. Abandoned phase {first} for {source_name} "
+        f"(expired lease); purged {list(reversed(to_purge))} and re-running it"
+    )
+    return True
+
+
+async def _mark_phase_running(ccat, scope, source_name, phase, chat_id, type_) -> None:
+    """Write ``state: running`` BEFORE the phase body starts."""
+    await record_phase_running(
+        ccat.agent_key, scope, source_name, phase, type_=type_, chat_id=chat_id
+    )
+
+
+async def _finish_phase(
+    ccat, cat, scope, source_name, phase, chat_id, products
+) -> bool:
+    """Record ``state: complete`` ONLY when the body produced products.
+
+    ``products`` is the phase body's stored output (a non-empty list of points
+    for the built-ins, or True for an external phase that reported ``done``).
+    An empty/falsy value means "the phase wrote nothing": the entry stays
+    ``running``, nothing is marked complete, and the caller stops this source.
+    """
+    if not products:
+        log.warning(
+            f"Agent id: {ccat._id}. Phase {phase} for {source_name} produced "
+            f"no products; leaving it running (NOT marked complete)"
+        )
+        return False
+    await _record_phase(ccat, cat, scope, source_name, phase, chat_id=chat_id)
+    return True
+
+
 async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> bool:
     """Dispatch one external (non-``PHASES``) phase through the run hook.
 
@@ -1299,6 +1508,15 @@ async def reembed_sources(
                 ]
                 store_empty_forced = True
             if not pending:
+                # A ``running`` entry with a LIVE lease means another worker
+                # (or this process) is still inside the phase body: leave the
+                # source alone, never terminalize it mid-phase.
+                if has_live_running_phase(doc):
+                    log.debug(
+                        f"Agent id: {ccat._id}. Source {source_name}: a live "
+                        f"running phase lease is held; leaving it alone"
+                    )
+                    continue
                 # every recorded phase is still fresh against the current settings
                 # -> the source is up to date: skip WITHOUT claiming.
                 # A non-terminal row whose diary is already complete (e.g. left
@@ -1384,8 +1602,25 @@ async def reembed_sources(
                 if _should_stop_for_error(doc):
                     # ERROR absorbing: never advance a failed row
                     break
+                # ---- RECOVERY: the same place the periodic probe runs ----
+                # An expired ``running`` entry is abandoned: purge its
+                # products (later phases first) and reset the entries BEFORE
+                # the phase is re-run from scratch below. ``False`` means a
+                # phase has no purge implementation: leave it running, do not
+                # re-run, stop this source.
+                recovered = await _recover_abandoned_phases(
+                    ccat, cat, collection_name, scope, source_name, chat_id, doc
+                )
+                if recovered is False:
+                    break
+                if recovered is True:
+                    doc = await get_status(ccat.agent_key, scope, source_name)
+                    pending = await _probe_pending(ccat, cat, source_name, doc)
+                    if not pending:
+                        break
                 entry = pending[0]
                 phase = entry["phase"]
+                phase_products = True
 
                 if phase == PHASE_EMBEDDING:
                     # chunks (text) already stored for this source: chunk-reuse
@@ -1412,8 +1647,15 @@ async def reembed_sources(
                         if _point_matches_source(p, source_name, chat_id)
                     ]
                     if source_points:
+                        # ``running`` is written only for the phase body that
+                        # actually runs: the fall-through below re-parses
+                        # instead and must not leave a stale embedding entry.
+                        await _mark_phase_running(
+                            ccat, scope, source_name, PHASE_EMBEDDING, chat_id,
+                            "url" if is_url(source_name) else "file",
+                        )
                         try:
-                            await _embed_phase(
+                            phase_products = await _embed_phase(
                                 ccat, collection_name, source_name, source_points,
                                 embedder, chat_id, cat, rabbit_hole,
                                 zero_norm_summary=zero_norm_summary,
@@ -1443,10 +1685,15 @@ async def reembed_sources(
                             type_="url" if is_url(source_name) else "file",
                             chat_id=chat_id,
                         )
+                        await _mark_phase_running(
+                            ccat, scope, source_name, PHASE_PARSING_CHUNKING, chat_id,
+                            "url" if is_url(source_name) else "file",
+                        )
                         source_name, stored_points = await _run_parsing_phase(
                             ccat, collection_name, source, source_name, chat_id, cat,
                             rabbit_hole, active_chunker_name,
                         )
+                        phase_products = stored_points
                 elif phase == PHASE_PARSING_CHUNKING:
                     # ---- parsing_chunking phase body ----
                     await set_phase(
@@ -1456,10 +1703,15 @@ async def reembed_sources(
                         type_="url" if is_url(source_name) else "file",
                         chat_id=chat_id,
                     )
+                    await _mark_phase_running(
+                        ccat, scope, source_name, PHASE_PARSING_CHUNKING, chat_id,
+                        "url" if is_url(source_name) else "file",
+                    )
                     source_name, stored_points = await _run_parsing_phase(
                         ccat, collection_name, source, source_name, chat_id, cat,
                         rabbit_hole, active_chunker_name,
                     )
+                    phase_products = stored_points
                 else:
                     # external phase (e.g. MyGRAPH): dispatched through the
                     # ``ingestion_phase_run`` hook (tri-state, hooks.py).
@@ -1469,6 +1721,15 @@ async def reembed_sources(
                     # completion write below and re-probed; ``not_ready`` is
                     # retried (bounded) and an exceeded bound marks the row
                     # ERROR. The machine stops on any ERROR (absorbing).
+                    await set_phase(
+                        ccat.agent_key, scope, source_name, phase,
+                        type_="url" if is_url(source_name) else "file",
+                        chat_id=chat_id,
+                    )
+                    await _mark_phase_running(
+                        ccat, scope, source_name, phase, chat_id,
+                        "url" if is_url(source_name) else "file",
+                    )
                     if not await _run_external_phase(
                         ccat, cat, scope, source_name, phase, chat_id
                     ):
@@ -1476,10 +1737,15 @@ async def reembed_sources(
                         # stop the machine; the ERROR-absorbing check above
                         # never advances nor resurrects it.
                         break
+                    phase_products = True
 
-                # ---- ATOMIC COMPLETION: record the diary entry (never at
-                # ---- phase start): marker + settings_version + deps ----
-                await _record_phase(ccat, cat, scope, source_name, phase, chat_id=chat_id)
+                # ---- ATOMIC COMPLETION: record ``state: complete`` ONLY when
+                # ---- the body produced products (never at phase start) ----
+                if not await _finish_phase(
+                    ccat, cat, scope, source_name, phase, chat_id, phase_products
+                ):
+                    # nothing was written: leave the running entry in place
+                    break
 
                 # ---- re-probe with the updated diary ----
                 doc = await get_status(ccat.agent_key, scope, source_name)
@@ -1496,7 +1762,11 @@ async def reembed_sources(
                         pending = [{"phase": PHASE_EMBEDDING}, *pending]
 
                 # ---- terminal COMPLETED when nothing is stale anymore ----
-                if not pending and not _should_stop_for_error(doc):
+                if (
+                    not pending
+                    and not _should_stop_for_error(doc)
+                    and not has_live_running_phase(doc)
+                ):
                     await _complete_source(ccat, cat, scope, source_name, chat_id)
                     break
                 if not pending:
