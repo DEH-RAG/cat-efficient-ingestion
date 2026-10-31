@@ -383,6 +383,47 @@ def _point_matches_source(point, source_name: str, chat_id) -> bool:
     return meta.get("chat_id") in (None, "")
 
 
+async def _source_has_stored_points(
+    ccat, handler, collection_name, source_name: str, chat_id
+) -> bool:
+    """Store-grounded freshness probe for ONE source.
+
+    The completed-phases diary is bookkeeping, NOT proof the points still
+    exist: a wipe that leaves the diary intact would otherwise make every
+    phase look fresh and permanently suppress re-embedding (the source keeps
+    zero chunk points, the embedder is never called, and later phases such as
+    ``catalog_cards`` fail forever).
+
+    This asks the ACTIVE vector-memory handler whether the source still has at
+    least one stored CHUNK point (catalogue cards excluded), with ONE bounded
+    query per source. It is called ONLY when the diary already says fresh.
+
+    Returns True (populated) whenever the store cannot be proven empty, so an
+    unavailable/erroring handler never triggers a destructive re-parse.
+    """
+    count_source_chunk_points = getattr(handler, "count_source_chunk_points", None)
+    try:
+        if count_source_chunk_points is not None:
+            count = await count_source_chunk_points(
+                str(collection_name), source_name, chat_id=chat_id
+            )
+            return int(count or 0) > 0
+        # Generic handlers have no catalogue cards: a bounded get (limit 1) is
+        # enough to tell "some point exists" from "no point at all".
+        points, _ = await handler.get_all_tenant_points(
+            str(collection_name), limit=1,
+            metadata=_source_metadata(source_name, chat_id),
+            with_vectors=False,
+        )
+    except Exception as e:  # noqa: BLE001 - a probe error must never wipe
+        log.warning(
+            f"Agent id: {ccat._id}. Source {source_name}: store freshness probe "
+            f"failed ({e}); assuming the stored points are present"
+        )
+        return True
+    return bool(points)
+
+
 async def _cleanup_orphan_images(ccat, collection_name, source_name, chat_id) -> None:
     """Remove image points + saved image files of a source before a full re-ingest.
 
@@ -1223,6 +1264,11 @@ async def reembed_sources(
         doc_chunker = (doc or {}).get("chunker_name")
         doc_phase = (doc or {}).get("phase")
 
+        # Set when the diary says fresh but the store holds no chunk point: the
+        # forced re-parse must be followed by a forced re-embed in THIS pass
+        # (the diary's own re-probe cannot see the wipe).
+        store_empty_forced = False
+
         if doc is not None:
             # Clock-free phase probe: read the completed-phases diary (backfilling
             # legacy completed rows that predate the diary), convert it to the hook
@@ -1233,6 +1279,25 @@ async def reembed_sources(
             # phases. No timestamps are used for correctness anywhere.
             # clock-free phase probe (diary -> hook list shape -> accumulator)
             pending = await _probe_pending(ccat, cat, source_name, doc)
+            if not pending and not await _source_has_stored_points(
+                ccat, ccat.vector_memory_handler, collection_name,
+                source_name, chat_id,
+            ):
+                # The diary says every phase is fresh, but the source has ZERO
+                # stored chunk points: the store was wiped while the diary
+                # survived. Trust the STORE, not the diary: force a full
+                # re-parse + re-embed, otherwise the embed phase never runs and
+                # later phases (catalog_cards) fail forever.
+                log.info(
+                    f"Agent id: {ccat._id}. Source {source_name}: "
+                    f"diary-fresh-store-empty; forcing parsing_chunking + "
+                    f"embedding"
+                )
+                pending = [
+                    {"phase": PHASE_PARSING_CHUNKING},
+                    {"phase": PHASE_EMBEDDING},
+                ]
+                store_empty_forced = True
             if not pending:
                 # every recorded phase is still fresh against the current settings
                 # -> the source is up to date: skip WITHOUT claiming.
@@ -1419,6 +1484,16 @@ async def reembed_sources(
                 # ---- re-probe with the updated diary ----
                 doc = await get_status(ccat.agent_key, scope, source_name)
                 pending = await _probe_pending(ccat, cat, source_name, doc)
+
+                # The diary was fresh while the store was empty: the re-parse
+                # just repopulated the points, but the diary still says
+                # ``embedding`` is fresh (its dependency marker did not change),
+                # so force the matching re-embed in THIS pass. The store check
+                # alone cannot catch this: the staging pass writes empty-vector
+                # points, which the store probe counts as present.
+                if store_empty_forced and phase == PHASE_PARSING_CHUNKING:
+                    if not any(p.get("phase") == PHASE_EMBEDDING for p in pending):
+                        pending = [{"phase": PHASE_EMBEDDING}, *pending]
 
                 # ---- terminal COMPLETED when nothing is stale anymore ----
                 if not pending and not _should_stop_for_error(doc):

@@ -619,6 +619,26 @@ async def delete_status(agent_id: str, scope: str, source: str) -> None:
     await crud.delete(status_key(agent_id, scope, source))
 
 
+async def clear_completed_phases(agent_id: str, scope: str, source: str) -> bool:
+    """Clear the completed-phases diary of a source (crud-only, no raw Redis).
+
+    The diary is BOOKKEEPING, not proof the points exist. ``--reingest`` wipes
+    a source's points and must also clear its diary, so the phases re-run
+    deterministically even if the status row survives (e.g. ``delete_status``
+    fails after the points are gone) instead of looking fresh forever.
+
+    Returns True when a diary entry was cleared, False when the row/doc/diary
+    was absent.
+    """
+    key = status_key(agent_id, scope, source)
+    doc = await _read_doc(key)
+    if not isinstance(doc, dict) or not doc.get("completed_phases"):
+        return False
+    doc["completed_phases"] = {}
+    await crud.store(key, doc)
+    return True
+
+
 async def list_statuses(agent_id: str, chat_id: Optional[str] = None) -> List[Dict]:
     """List the ingestion-status docs for an agent.
 
