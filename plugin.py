@@ -30,7 +30,11 @@ from cat.exceptions import CustomHookVetoException
 from cat.log import log
 
 from .configs import EfficientIngestionConfiguration
-from .hooks import execute_phase_hook
+from .hooks import (
+    _caller,
+    execute_phase_accumulator,
+    execute_phase_hook_on_all,
+)
 from .phases import PHASES
 from .registry import (
     PHASE_DOWNLOADING,
@@ -246,7 +250,9 @@ async def finalize_oversized_chunks(docs: List[Document], cat) -> List[Document]
 
 
 @hook(priority=100)
-async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
+async def before_rabbithole_stores_documents(
+    docs: List[Document], cat=None, lizard=None
+) -> List[Document]:
     """Apply the token-budget split on the document-store path.
 
     Fired by ``RabbitHole.store_documents`` before the embed/store loop (e.g.
@@ -255,13 +261,15 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
     empty-vector store. It is the single split path on the efficient engine, so
     the chunking step does not run ``finalize_oversized_chunks`` on top of it.
     """
+    cat = _caller(cat, lizard)
     embedder = await cat.lizard.embedder()
     return split_oversized(docs, embedder)
 
 
 @hook(priority=0)
-async def rabbithole_ingestion_start(source, metadata, is_url, cat) -> None:
+async def rabbithole_ingestion_start(source, metadata, is_url, cat=None, lizard=None) -> None:
     """Record that an ingestion is about to begin (source known, nothing stored yet)."""
+    cat = _caller(cat, lizard)
     if await ingestion_canceled(cat.agent_key):
         # Agent deleted (or master key gone): never write an UPLOADED row for
         # a dead agent — the teardown wipes the namespace anyway.
@@ -333,8 +341,9 @@ async def rabbithole_url_download_completed(url, filename, cat) -> None:
 
 
 @hook(priority=0)
-async def rabbithole_ingestion_processing(source, cat) -> None:
+async def rabbithole_ingestion_processing(source, cat=None, lizard=None) -> None:
     """Record that the source is being parsed, chunked and embedded."""
+    cat = _caller(cat, lizard)
     if await ingestion_canceled(cat.agent_key):
         # Agent deleted mid-ingestion: skip the write entirely. Marking the
         # row ERROR via set_status would be a NO-OP here — set_status itself
@@ -355,7 +364,7 @@ async def rabbithole_ingestion_processing(source, cat) -> None:
 
 
 @hook(priority=0)
-async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
+async def after_rabbithole_stored_documents(source, stored_points, cat=None, lizard=None) -> None:
     """Record that the source was stored successfully (phase-probe gated).
 
     The hook fires in the ``finally`` block of ``ingest_file`` and mid-loop
@@ -375,6 +384,7 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
       unresolved empty source. A canceled agent (delete marker / missing
       master key) is skipped entirely: no phase advance, no COMPLETED.
     """
+    cat = _caller(cat, lizard)
     if not source:
         return
     if await ingestion_canceled(cat.agent_key):
@@ -392,14 +402,13 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
     # shape, thread it into the accumulator and keep only the stale phases.
     completed = await backfill_completed_phases(current or {}, list(PHASES.keys()))
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-    pending = await execute_phase_hook(
-        cat.plugin_manager,
+    pending = await execute_phase_accumulator(
+        cat,
         "ingestion_phase_pending",
         [],
         source,
         completed_as_list,
         default=list,
-        caller=cat,
     )
     pending = [p for p in (pending or []) if p and p.get("phase")]
 
@@ -416,10 +425,12 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
         )
         return
 
-    # Nothing pending: final gate, then the terminal state.
+    # Nothing pending: final gate, then the terminal state. The gate runs on
+    # EVERY manager: EffING's built-in one is on the system manager and
+    # agent-level providers (MyGRAPH) register their own on the agent manager.
     try:
-        await cat.plugin_manager.execute_hook(
-            "before_ingestion_status_completed", source, caller=cat
+        await execute_phase_hook_on_all(
+            cat, "before_ingestion_status_completed", source
         )
     except CustomHookVetoException as e:
         # a hook refused the completion: honour it and record the reason
@@ -473,8 +484,9 @@ async def rabbithole_ingestion_error(source, error, cat) -> None:
     )
 
 @hook(priority=0)
-async def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat) -> None:
+async def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat=None, lizard=None) -> None:
     """Spawn the heartbeat task that keeps an in-flight row fresh."""
+    cat = _caller(cat, lizard)
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)
@@ -484,8 +496,9 @@ async def rabbithole_processing_heartbeat_start(source: str, scope: str, interva
 
 
 @hook(priority=0)
-async def rabbithole_processing_heartbeat_stop(source: str, scope: str, cat) -> None:
+async def rabbithole_processing_heartbeat_stop(source: str, scope: str, cat=None, lizard=None) -> None:
     """Cancel the heartbeat task spawned on processing start."""
+    cat = _caller(cat, lizard)
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)

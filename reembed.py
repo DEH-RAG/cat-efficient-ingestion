@@ -66,9 +66,14 @@ from cat.core_plugins.cat_multimodal_ingestion.ingestion import (
     strip_image_payload,
 )
 
-from .hooks import execute_phase_hook, phase_settings_key
+from .hooks import (
+    execute_phase_accumulator,
+    execute_phase_hook_on_all,
+    execute_shared_hook,
+    phase_settings_key,
+)
 from .ingestion_executor import run_in_ingestion_executor
-from .phases import merged_phases
+from .phases import execute_phase_on_owner, merged_phases
 from .registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
@@ -153,9 +158,10 @@ async def _start_heartbeat(ccat, source_name: str, scope: str, cat) -> None:
     if plugin_manager is None:
         return
     try:
-        await plugin_manager.execute_hook(
+        await execute_shared_hook(
+            cat,
             "rabbithole_processing_heartbeat_start",
-            source_name, scope, _heartbeat_interval(), caller=cat,
+            source_name, scope, _heartbeat_interval(),
         )
     except Exception as e:  # noqa: BLE001 - a heartbeat must never break ingestion
         log.warning(
@@ -170,9 +176,10 @@ async def _stop_heartbeat(ccat, source_name: str, scope: str, cat) -> None:
     if plugin_manager is None:
         return
     try:
-        await plugin_manager.execute_hook(
+        await execute_shared_hook(
+            cat,
             "rabbithole_processing_heartbeat_stop",
-            source_name, scope, caller=cat,
+            source_name, scope,
         )
     except Exception as e:  # noqa: BLE001 - stopping must never break the pass
         log.warning(
@@ -515,8 +522,8 @@ async def _embed_phase(ccat, collection_name, source_name, source_points, embedd
     )
 
     # Token accounting + completion signal.
-    await ccat.plugin_manager.execute_hook(
-        "after_rabbithole_stored_documents", source_name, points, caller=cat,
+    await execute_shared_hook(
+        cat, "after_rabbithole_stored_documents", source_name, points,
     )
     return points
 
@@ -543,14 +550,13 @@ async def _probe_pending(ccat, cat, source_name, doc) -> list:
         doc or {}, list((await merged_phases(ccat, cat)).keys())
     )
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-    pending = await execute_phase_hook(
-        ccat.plugin_manager,
+    pending = await execute_phase_accumulator(
+        cat,
         "ingestion_phase_pending",
         [],
         source_name,
         completed_as_list,
         default=list,
-        caller=cat,
     )
     return [p for p in (pending or []) if p and p.get("phase")]
 
@@ -585,9 +591,10 @@ async def _run_external_phase(ccat, cat, scope, source_name, phase, chat_id) -> 
     retries = 0
     while True:
         try:
-            result = await execute_phase_hook(
-                ccat.plugin_manager,
+            result = await execute_phase_on_owner(
+                cat if cat is not None else ccat,
                 "ingestion_phase_run",
+                phase,
                 phase,
                 source_name,
                 completed_as_list,
@@ -671,8 +678,13 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
             marker=None, settings_version=None, deps={},
         )
 
-    marker = await ccat.plugin_manager.execute_hook(
-        "ingestion_phase_settings_marker", phase, caller=cat
+    marker = await execute_phase_on_owner(
+        cat if cat is not None else ccat,
+        "ingestion_phase_settings_marker",
+        phase,
+        phase,
+        default=None,
+        caller=cat,
     )
     settings_version = None
     if spec.settings_category is not None:
@@ -714,8 +726,10 @@ async def _complete_source(ccat, cat, scope, source_name, chat_id) -> None:
     phase finished, so no phase is pending. Never overwrites an ``error`` row.
     """
     try:
-        await ccat.plugin_manager.execute_hook(
-            "before_ingestion_status_completed", source_name, caller=cat
+        await execute_phase_hook_on_all(
+            cat if cat is not None else ccat,
+            "before_ingestion_status_completed",
+            source_name,
         )
     except CustomHookVetoException as e:
         # a hook refused the completion: honour it and record the reason
@@ -856,8 +870,8 @@ async def _run_parsing_phase(
     #     lets other plugins append or rewrite the documents; the embedding
     #     phase rebuilds points from the stored payload, so it must NOT emit
     #     the hook again.
-    docs = await ccat.plugin_manager.execute_hook(
-        "before_rabbithole_stores_documents", docs, caller=cat,
+    docs = await execute_shared_hook(
+        cat, "before_rabbithole_stores_documents", docs,
     )
     if not docs:
         raise Exception(f"No valid chunks found in the file '{source_name}'.")
@@ -1234,19 +1248,21 @@ class EfficientIngestionEngine(BaseIngestionEngine):
             content = file
 
         # lifecycle: start + persist (durable across restarts) + processing
-        await ccat.plugin_manager.execute_hook(
-            "rabbithole_ingestion_start", source_name, metadata or {},
-            is_url(source_name), caller=cat,
+        # Shared hooks run on the agent manager (other plugins) AND the system
+        # manager (EffING's own status/heartbeat), each plugin exactly once.
+        await execute_shared_hook(
+            cat, "rabbithole_ingestion_start", source_name, metadata or {},
+            is_url(source_name),
         )
         if store_file and file_data is not None:
             await ccat.save_file(file_data, content_type, source_name, chat_id)
-        await ccat.plugin_manager.execute_hook(
-            "rabbithole_ingestion_processing", source_name, caller=cat,
+        await execute_shared_hook(
+            cat, "rabbithole_ingestion_processing", source_name,
         )
         heartbeat_interval = get_env_int("CAT_INGESTION_HEARTBEAT_SECONDS") or 30
-        await ccat.plugin_manager.execute_hook(
-            "rabbithole_processing_heartbeat_start",
-            source_name, scope, heartbeat_interval, caller=cat,
+        await execute_shared_hook(
+            cat, "rabbithole_processing_heartbeat_start",
+            source_name, scope, heartbeat_interval,
         )
 
         try:
@@ -1259,9 +1275,9 @@ class EfficientIngestionEngine(BaseIngestionEngine):
                 caller_cat=cat,
             )
         finally:
-            await ccat.plugin_manager.execute_hook(
-                "rabbithole_processing_heartbeat_stop",
-                source_name, scope, caller=cat,
+            await execute_shared_hook(
+                cat, "rabbithole_processing_heartbeat_stop",
+                source_name, scope,
             )
 
     async def run(self, lizard) -> bool:

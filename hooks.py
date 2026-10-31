@@ -63,6 +63,191 @@ async def execute_phase_hook(
             raise
         return _degraded()
 
+
+def _accepts_caller(function, keyword: str) -> bool:
+    """True when ``function`` can receive the caller as ``keyword``.
+
+    A hook declared ``def h(..., cat)`` cannot be called as ``h(lizard=...)``.
+    The system manager passes ``lizard=`` and the agent manager ``cat=``; an
+    agent-level provider (MyGRAPH/CATALOG) that is ALSO loaded on the system
+    manager must therefore be skipped there and served by the agent manager,
+    instead of logging a ``TypeError`` on every probe. ``**kwargs`` hooks
+    accept either name.
+    """
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):  # builtins / C callables: assume compatible
+        return True
+    if keyword in parameters:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
+async def execute_hook_compat(manager, hook_name: str, *args, caller=None):
+    """Execute ``hook_name`` on one manager, skipping incompatible registrants.
+
+    Returns ``(ran, value)``: ``ran`` is False when the manager has no
+    registrant for the hook (missing hook, or none able to accept the manager's
+    caller keyword). The first argument is threaded through the registrants,
+    like ``MadHatter.execute_hook``; a generic hook error is logged and the
+    chain continues, while a veto/management gate propagates.
+    """
+    hooks = getattr(manager, "hooks", None)
+    if not isinstance(hooks, dict):
+        # no registry (unit-test fake): delegate to the manager's dispatcher
+        try:
+            return True, await manager.execute_hook(hook_name, *args, caller=caller)
+        except Exception as exc:  # noqa: BLE001 - only a missing hook is skipped
+            if _is_missing_hook_error(exc, hook_name):
+                return False, None
+            raise
+
+    registered = hooks.get(hook_name) or []
+    if not registered:
+        return False, None
+
+    keyword = getattr(manager, "context_execute_hook", "cat")
+    value = args[0] if args else None
+    rest = args[1:]
+    ran = False
+    for registered_hook in registered:
+        function = getattr(registered_hook, "function", registered_hook)
+        if not _accepts_caller(function, keyword):
+            continue
+        ran = True
+        try:
+            result = function(value, *rest, **{keyword: caller})
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not None:
+                value = result
+        except CustomHookVetoException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - same policy as MadHatter
+            plugin_id = getattr(registered_hook, "plugin_id", None) or "?"
+            log.error(f"Error in plugin {plugin_id}::{hook_name}: {exc}")
+    return ran, value
+
+
+async def execute_shared_hook(cat, hook_name: str, value, *args):
+    """Thread a SHARED ingestion lifecycle hook through both managers.
+
+    Hooks such as ``before_rabbithole_stores_documents`` and
+    ``after_rabbithole_stored_documents`` are implemented by EffING (now
+    system-only) AND by agent-level plugins. The agent manager runs first so
+    agent plugins can append/rewrite documents, then the system manager runs
+    EffING's own handler (the single token-budget split) on the final list.
+    Each plugin lives on exactly one manager, so nothing runs twice.
+    """
+    ordered = []
+    for manager in (agent_plugin_manager(cat), system_plugin_manager(cat)):
+        if manager is not None and all(manager is not seen for seen in ordered):
+            ordered.append(manager)
+    for manager in ordered:
+        ran, new_value = await execute_hook_compat(
+            manager, hook_name, value, *args, caller=cat
+        )
+        if ran:
+            value = new_value
+    return value
+
+
+def system_plugin_manager(cat):
+    """The system-level plugin manager (BillTheLizard's own), or None.
+
+    EffING is a system-only plugin: its own phase hooks are registered there.
+    ``cat.lizard`` is the ``BillTheLizard`` singleton for every cat
+    (CheshireCat/StrayCat) — verified against ``cat/mixins.py`` (BotMixin.lizard)
+    — and ``.plugin_manager`` is its ``MadHatter``.
+    """
+    lizard = getattr(cat, "lizard", None)
+    return getattr(lizard, "plugin_manager", None) if lizard is not None else None
+
+
+def agent_plugin_manager(cat):
+    """The caller's agent-level plugin manager (or None)."""
+    return getattr(cat, "plugin_manager", None)
+
+
+def phase_managers(cat):
+    """The managers a phase hook can live on: system first, then agent.
+
+    System-only EffING hooks live on the system manager; the phase PROVIDERS
+    (MyGRAPH, CATALOG) stay agent-level plugins, so their hooks live on the
+    caller's agent manager. The list is deduplicated by identity (a caller that
+    exposes the same manager twice, or a unit-test fake without ``lizard``,
+    yields a single entry) and never contains None.
+    """
+    managers = []
+    for manager in (system_plugin_manager(cat), agent_plugin_manager(cat)):
+        if manager is not None and all(manager is not seen for seen in managers):
+            managers.append(manager)
+    return managers
+
+
+async def execute_phase_hook_on_all(cat, hook_name: str, *args, default=None):
+    """Execute a NON-accumulator phase hook on every manager that has it.
+
+    Every registrant must run: EffING's built-in completion gate lives on the
+    system manager and agent-level providers (MyGRAPH) register their own gate
+    on the agent manager. Exceptions — including a veto — propagate unchanged
+    so the caller can honour them. Only when NO manager registers the hook does
+    this degrade like :func:`execute_phase_hook`.
+    """
+    ran_any = False
+    result = default() if callable(default) else default
+    for manager in phase_managers(cat):
+        ran, new_result = await execute_hook_compat(
+            manager, hook_name, *args, caller=cat
+        )
+        if ran:
+            ran_any = True
+            result = new_result
+    if not ran_any:
+        log.warning(
+            f"Phase hook {hook_name} is not present in any active plugin: "
+            f"treating it as no external phases"
+        )
+    return result
+
+
+async def execute_phase_accumulator(cat, hook_name: str, value, *args, default=None):
+    """Thread an accumulator phase hook through every manager that has it.
+
+    System first, then agent: the accumulated value returned by EffING's own
+    registrant (system manager) is handed to any agent-level registrant, so a
+    phase provider that also implements the accumulator keeps working. A
+    missing hook on one manager is skipped (never a warning) as long as at
+    least one manager registers it; if none does, this degrades like
+    :func:`execute_phase_hook`.
+    """
+    ran_any = False
+    for manager in phase_managers(cat):
+        ran, new_value = await execute_hook_compat(
+            manager, hook_name, value, *args, caller=cat
+        )
+        if ran:
+            ran_any = True
+            value = new_value
+    if not ran_any:
+        log.warning(
+            f"Phase hook {hook_name} is not present in any active plugin: "
+            f"treating it as no external phases"
+        )
+        return default() if callable(default) else default
+    return value
+
+def _caller(cat, lizard):
+    """The caller object, whatever name the plugin manager used for it.
+
+    A system plugin manager passes hooks ``lizard=<caller>`` while an agent
+    manager passes ``cat=<caller>`` (``MadHatter.context_execute_hook``). EffING
+    runs on the system manager but still acts on behalf of the calling agent, so
+    the value is the agent cat in both cases; only the keyword name differs.
+    """
+    return cat if cat is not None else lizard
+
+
 # The ``completed_phases`` argument threaded through the hooks is a
 # ``list[dict]`` where every entry carries at least a ``"phase"`` key
 # (MyGRAPH compatibility: its existing hook reads
@@ -72,7 +257,7 @@ async def execute_phase_hook(
 
 
 @hook(priority=0)
-def ingestion_phase_pending(pending, source, completed_phases, cat):
+def ingestion_phase_pending(pending, source, completed_phases, cat=None, lizard=None):
     """Accumulator of stale phases for ``source``.
 
     ``pending`` is threaded through every registrant: each one appends the
@@ -96,7 +281,7 @@ def ingestion_phase_pending(pending, source, completed_phases, cat):
 
 
 @hook(priority=0)
-def ingestion_phase_run(phase, source, completed_phases, cat):
+def ingestion_phase_run(phase, source, completed_phases, cat=None, lizard=None):
     """Run one phase for ``source``; tri-state contract.
 
     A registrant that implements ``phase`` must either:
@@ -124,7 +309,7 @@ def ingestion_phase_run(phase, source, completed_phases, cat):
 
 
 @hook(priority=0)
-async def before_ingestion_status_completed(source, cat):
+async def before_ingestion_status_completed(source, cat=None, lizard=None):
     """Final gate before ``source`` is marked COMPLETED.
 
     Called right before the machine writes the COMPLETED status for a source.
@@ -148,7 +333,7 @@ async def before_ingestion_status_completed(source, cat):
     Raises:
         CustomHookVetoException: when the caller reports pending source tasks.
     """
-    probe = getattr(cat, "has_pending_source_tasks", None)
+    probe = getattr(_caller(cat, lizard), "has_pending_source_tasks", None)
     if probe is None:
         return
 
@@ -225,7 +410,7 @@ def _material_settings(value: object) -> dict:
 
 
 @hook(priority=0)
-async def ingestion_phase_settings_marker(phase, cat):
+async def ingestion_phase_settings_marker(phase, cat=None, lizard=None):
     """Plugin-defined material marker for ``phase``.
 
     The machine compares this marker against the one recorded in the
@@ -256,7 +441,7 @@ async def ingestion_phase_settings_marker(phase, cat):
     if category is None:
         return None
 
-    settings_key = phase_settings_key(phase, getattr(cat, "agent_key", None))
+    settings_key = phase_settings_key(phase, getattr(_caller(cat, lizard), "agent_key", None))
     settings_doc = await crud_settings.get_settings_by_category(settings_key, category)
     if not isinstance(settings_doc, dict):
         return None
@@ -271,7 +456,7 @@ async def ingestion_phase_settings_marker(phase, cat):
 
 
 @hook(priority=0)
-def ingestion_phase_specs(specs, cat) -> list:
+def ingestion_phase_specs(specs, cat=None, lizard=None) -> list:
     """Accumulator: plugins append PhaseSpec objects to declare their own
     ingestion phases. EffING merges them into its PHASES at probe time.
     The default returns `specs` unchanged.

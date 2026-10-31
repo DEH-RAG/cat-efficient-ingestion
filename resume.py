@@ -52,7 +52,7 @@ from cat.exceptions import CustomNotFoundException
 from cat.services.memory.models import VectorMemoryType
 from cat.utils import is_url
 
-from .hooks import execute_phase_hook
+from .hooks import execute_phase_accumulator
 from .phases import PHASES
 from .reconcile import reconcile_agent
 from .reembed import reembed_sources
@@ -302,14 +302,13 @@ async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = No
             # result means at least one phase must be re-run.
             completed = await backfill_completed_phases(entry, list(PHASES.keys()))
             completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-            pending = await execute_phase_hook(
-                ccat.plugin_manager,
+            pending = await execute_phase_accumulator(
+                ccat,
                 "ingestion_phase_pending",
                 [],
                 source,
                 completed_as_list,
                 default=list,
-                caller=ccat,
             )
             pending = [p for p in (pending or []) if p and p.get("phase")]
             if not pending:

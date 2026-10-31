@@ -58,7 +58,11 @@ from typing import Any
 from cat import hook
 from cat.db.cruds import settings as crud_settings
 
-from .hooks import execute_phase_hook, phase_settings_key
+from .hooks import (
+    execute_hook_compat,
+    phase_managers,
+    phase_settings_key,
+)
 from .registry import get_completed_phases
 
 
@@ -92,37 +96,107 @@ PHASES = {
 }
 
 
+async def _registered_specs(cat) -> list[tuple[PhaseSpec, object]]:
+    """Collect every registered ``PhaseSpec`` together with its OWNER manager.
+
+    Phase providers are agent-level plugins: MyGRAPH and CATALOG register their
+    specs on the caller's agent manager. EffING itself is system-only, so its
+    built-ins are not registered this way (they live in :data:`PHASES`). The
+    spec origin is what later tells the run/marker dispatch which manager owns
+    a phase, so it must not be flattened away.
+
+    Managers are visited system-first, then agent; a duplicate phase id is kept
+    from the FIRST manager that registered it (deterministic ownership).
+    Malformed hook output is skipped, never raised on.
+    """
+    seeded: set[str] = set()
+    collected: list[tuple[PhaseSpec, object]] = []
+    for manager in phase_managers(cat):
+        # No registrant on this manager is normal (EffING is system-only, the
+        # providers are agent-level): skip silently, never warn per phase.
+        ran, specs = await execute_hook_compat(
+            manager, "ingestion_phase_specs", [], caller=cat
+        )
+        if not ran or not isinstance(specs, list):
+            continue
+        for spec in specs:
+            if isinstance(spec, PhaseSpec) and spec.id not in seeded:
+                seeded.add(spec.id)
+                collected.append((spec, manager))
+    return collected
+
+
+async def phase_owner(cat, phase: str):
+    """Return the plugin manager that owns ``phase``.
+
+    Built-ins belong to the system manager (EffING's own hooks). A phase
+    declared through ``ingestion_phase_specs`` belongs to the manager its
+    provider registered on (agent-level for MyGRAPH/CATALOG). Unknown phases
+    fall back to the system manager, preserving the fail-hard default.
+    """
+    managers = phase_managers(cat)
+    if phase in PHASES:
+        return managers[0] if managers else None
+    for spec, manager in await _registered_specs(cat):
+        if spec.id == phase:
+            return manager
+    return managers[0] if managers else None
+
+
+async def execute_phase_on_owner(
+    cat, hook_name: str, phase: str, *args, default=None, caller=None
+):
+    """Execute ``hook_name`` on the manager that owns ``phase``.
+
+    Reaching the owning manager is what keeps a built-in phase (system) and an
+    external MyGRAPH/CATALOG phase (agent) both working: a single-manager
+    dispatch would silently run the wrong registrant and drop the other.
+    """
+    manager = await phase_owner(cat, phase)
+    if manager is not None:
+        ran, value = await execute_hook_compat(
+            manager, hook_name, *args, caller=caller
+        )
+        if ran:
+            return value
+    # no manager to ask (unit test fake / bootstrap), or no compatible
+    # registrant: same conservative degradation as a missing hook, never an
+    # AttributeError.
+    from cat.log import log
+    log.warning(
+        f"Phase hook {hook_name} is not present in any active plugin: "
+        f"treating it as no external phases"
+    )
+    return default() if callable(default) else default
+
+
 async def merged_phases(ccat, cat) -> dict[str, PhaseSpec]:
     """Merge the registered phase specs into the built-in ``PHASES``.
 
     Starts from a copy of the built-in ``PHASES`` and appends every
     ``PhaseSpec`` returned by the ``ingestion_phase_specs`` accumulator hook
-    whose ``id`` is not already present — built-ins win, a registered spec
-    with a duplicate id is IGNORED. Malformed hook output (``None``,
+    from BOTH managers (system + agent) whose ``id`` is not already present —
+    built-ins win, a registered spec with a duplicate id is IGNORED. Collecting
+    from both is what keeps agent-level MyGRAPH/CATALOG phases alive while
+    EffING itself is system-only. Malformed hook output (``None``,
     non-``PhaseSpec`` entries) is skipped, never raised on.
 
     Args:
-        ccat: the cat whose ``plugin_manager`` executes the hook (may be
-            ``None`` in unit tests -> built-ins only).
-        cat: the caller threaded into ``execute_hook(..., caller=cat)``.
+        ccat: the cat that issued the pass (unused except as a fallback when
+            ``cat`` is missing; both resolve the same managers).
+        cat: the caller whose ``lizard`` (system manager) and
+            ``plugin_manager`` (agent manager) are queried.
 
     Returns:
         The merged ``dict[str, PhaseSpec]`` (a fresh dict; ``PHASES`` is
         never mutated).
     """
     merged = dict(PHASES)
-    plugin_manager = (
-        getattr(ccat, "plugin_manager", None) if ccat is not None else None
-    )
-    if plugin_manager is None:
+    resolver = cat if cat is not None else ccat
+    if resolver is None:
         return merged
-    specs = await execute_phase_hook(
-        plugin_manager, "ingestion_phase_specs", [], default=list, caller=cat
-    )
-    if not isinstance(specs, list):
-        return merged
-    for spec in specs:
-        if isinstance(spec, PhaseSpec) and spec.id not in merged:
+    for spec, _manager in await _registered_specs(resolver):
+        if spec.id not in merged:
             merged[spec.id] = spec
     return merged
 
@@ -216,7 +290,7 @@ def is_phase_stale(
 
 @hook(priority=0)
 async def ingestion_phase_pending(
-    pending, source, completed_phases, cat
+    pending, source, completed_phases, cat=None, lizard=None
 ) -> list[dict[str, Any]]:
     """Accumulator registrant declaring the stale phases for ``source``.
 
@@ -257,6 +331,7 @@ async def ingestion_phase_pending(
     """
     if pending is None:
         pending = []
+    cat = cat if cat is not None else lizard
     diary = _diary_from_completed_phases(completed_phases)
 
     for spec in (await merged_phases(cat, cat)).values():
@@ -270,11 +345,16 @@ async def ingestion_phase_pending(
                 )
                 if isinstance(settings_doc, dict):
                     current_settings_updated_at = settings_doc.get("updated_at")
-            plugin_manager = getattr(cat, "plugin_manager", None)
+            plugin_manager = await phase_owner(cat, spec.id)
             if plugin_manager is not None:
-                current_marker = await plugin_manager.execute_hook(
-                    "ingestion_phase_settings_marker", spec.id, caller=cat,
+                ran_marker, marker = await execute_hook_compat(
+                    plugin_manager,
+                    "ingestion_phase_settings_marker",
+                    spec.id,
+                    caller=cat,
                 )
+                if ran_marker:
+                    current_marker = marker
         if is_phase_stale(spec, diary, current_settings_updated_at, current_marker):
             pending.append({"phase": spec.id})
     return pending
