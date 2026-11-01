@@ -359,7 +359,6 @@ async def _material_settings(cat, phase) -> Any:
         cat,
         "ingestion_phase_settings_marker",
         phase.id,
-        phase.id,
         default=_MISSING,
         caller=cat,
     )
@@ -513,7 +512,6 @@ class HookPhase(IngestionPhase):
                 self._manager,
                 "ingestion_phase_run",
                 self.id,
-                self.id,
                 source,
                 [],
                 caller=used,
@@ -524,7 +522,6 @@ class HookPhase(IngestionPhase):
             result = await execute_phase_on_owner(
                 used,
                 "ingestion_phase_run",
-                self.id,
                 self.id,
                 source,
                 [],
@@ -544,7 +541,6 @@ class HookPhase(IngestionPhase):
                 self._manager,
                 "ingestion_phase_purge",
                 self.id,
-                self.id,
                 source,
                 caller=used,
             )
@@ -554,7 +550,6 @@ class HookPhase(IngestionPhase):
             result = await execute_phase_on_owner(
                 used,
                 "ingestion_phase_purge",
-                self.id,
                 self.id,
                 source,
                 default=_MISSING,
@@ -666,7 +661,7 @@ async def execute_phase_on_owner(
     manager = await phase_owner(cat, phase)
     if manager is not None:
         ran, value = await execute_hook_compat(
-            manager, hook_name, *args, caller=caller
+            manager, hook_name, phase, *args, caller=caller
         )
         if ran:
             return value

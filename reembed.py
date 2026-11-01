@@ -1019,7 +1019,6 @@ async def _purge_external_phase(ccat, cat, source_name, phase) -> bool:
         cat if cat is not None else ccat,
         "ingestion_phase_purge",
         phase,
-        phase,
         source_name,
         default=None,
         caller=cat,
@@ -1365,7 +1364,6 @@ async def _run_external_phase(
                 cat if cat is not None else ccat,
                 "ingestion_phase_run",
                 phase,
-                phase,
                 source_name,
                 completed_as_list,
                 default=None,
@@ -1473,7 +1471,6 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
     marker = await execute_phase_on_owner(
         cat if cat is not None else ccat,
         "ingestion_phase_settings_marker",
-        phase,
         phase,
         default=None,
         caller=cat,
