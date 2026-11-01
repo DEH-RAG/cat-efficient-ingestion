@@ -285,12 +285,12 @@ def ingestion_phase_run(phase, source, completed_phases, cat=None, lizard=None):
     """Run one phase for ``source``; tri-state contract.
 
     A registrant that implements ``phase`` must either:
-      - return ``{"status": "done"}`` on success. Optionally include
-        ``"processed": N`` and ``"expected": M`` (both integers) to let the
-        machine enforce the exact completion predicate (complete iff
-        ``processed == expected``, including ``0 == 0``). Omitting them — or a
-        bare ``{"status": "done"}`` — keeps the legacy behaviour ("expected
-        unknown": a truthy result completes the phase);
+      - return ``{"status": "done"}`` on success. Completion is "the worker
+        finished without error", NOT an item count: the optional
+        ``"processed": N`` / ``"expected": M`` fields are TELEMETRY ONLY (the
+        machine logs them) and never decide completion;
+      - return ``{"status": "skipped", "reason": "..."}`` when the phase does
+        not apply (the machine records ``state: skipped`` with the reason);
       - return ``{"status": "not_ready", "retry_after": N}`` when the phase is
         retriable but cannot run yet (the machine retries after ``N`` seconds);
       - return ``{"status": "error", "reason": "..."}`` on a permanent failure
@@ -319,7 +319,7 @@ def ingestion_phase_run(phase, source, completed_phases, cat=None, lizard=None):
 async def ingestion_phase_purge(phase, source, cat=None, lizard=None):
     """Purge the products of one external phase for ONE source.
 
-    Recovery contract: when a ``running`` diary entry's lease expired, the
+    Recovery contract: when a ``processing`` diary entry's lease expired, the
     machine calls this hook for the abandoned phase (and any completed later
     phase, in REVERSE execution order) before re-running it. A registrant must
     delete ONLY the artifacts THAT phase produced for THAT source.
@@ -327,7 +327,7 @@ async def ingestion_phase_purge(phase, source, cat=None, lizard=None):
     The default is a no-op returning ``None``, which the dispatcher reads as
     "this phase has NO purge implementation": it does NOT delete anything
     blindly, logs a WARNING naming the phase/source and leaves the entry
-    ``running`` (visible, not re-run, not completed). A real implementation
+    ``processing`` (visible, not re-run, not completed). A real implementation
     must return a truthy value (e.g. ``{"status": "done"}``) after purging.
 
     Args:

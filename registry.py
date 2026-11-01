@@ -28,6 +28,7 @@ import hashlib
 import os
 import socket
 import time
+import uuid
 from typing import Dict, List, Optional
 
 from cat.db import crud
@@ -61,29 +62,118 @@ PHASE_DOWNLOADING = "downloading"
 PHASE_PARSING_CHUNKING = "parsing_chunking"
 PHASE_EMBEDDING = "embedding"
 
-#: Per-(source, phase) diary state machine. Every diary entry carries a
-#: ``state``: ``running`` is written BEFORE the phase body starts (with
-#: ``started_at`` / ``attempt`` / ``owner``), ``complete`` only AFTER the body
-#: finished and its products were stored. An entry written by an older release
-#: has no ``state`` and is treated as ``complete`` (backward compatible).
-PHASE_STATE_RUNNING = "running"
+#: Per-(source, phase) diary state machine. Every diary entry carries an
+#: explicit ``state``: ``processing`` is written BEFORE the phase body starts,
+#: ``complete`` when the body returned ``done``, ``error`` with a reason when
+#: it failed, and ``skipped`` with a reason when ``applies_to`` says the phase
+#: does not apply. An ABSENT entry means ``pending``. An entry written by an
+#: older release has no ``state`` and is read as ``complete`` (backward
+#: compatible) and normalized on the next write.
+PHASE_STATE_PENDING = "pending"
+PHASE_STATE_PROCESSING = "processing"
 PHASE_STATE_COMPLETE = "complete"
+PHASE_STATE_ERROR = "error"
+PHASE_STATE_SKIPPED = "skipped"
 
-#: Lease of a ``running`` diary entry, in seconds (env-overridable). A
-#: ``running`` entry older than this is considered abandoned: its phase is
+#: The explicit states stored in a diary entry (``pending`` is the absence of
+#: an entry, so it is never written).
+PHASE_STATES = (
+    PHASE_STATE_PROCESSING,
+    PHASE_STATE_COMPLETE,
+    PHASE_STATE_ERROR,
+    PHASE_STATE_SKIPPED,
+)
+
+#: Deprecated alias: the old "running" state is now ``processing``.
+PHASE_STATE_RUNNING = PHASE_STATE_PROCESSING
+
+#: Lease of a ``processing`` diary entry, in seconds (env-overridable). A
+#: ``processing`` entry older than this is considered abandoned: its phase is
 #: purged and re-run from scratch. Default 30 minutes.
 PHASE_LEASE_SECONDS_DEFAULT = 1800
 
+#: Identity of THIS process/boot, stable for the lifetime of the process.
+_BOOT_ID = str(uuid.uuid4())
+
+
+def _pod_name() -> str:
+    """Best-effort pod/container name of the current process."""
+    return os.environ.get("HOSTNAME") or socket.gethostname()
+
+
 
 def phase_lease_seconds() -> float:
-    """Lease duration of a ``running`` phase entry (env-overridable)."""
+    """Lease duration of a ``processing`` phase entry (env-overridable)."""
     value = get_env_int("CAT_INGESTION_PHASE_LEASE_SECONDS")
     return float(value) if value is not None and value > 0 else float(PHASE_LEASE_SECONDS_DEFAULT)
 
 
 def current_phase_owner() -> Dict[str, object]:
-    """Identity of the process writing a ``running`` entry (pid + hostname)."""
-    return {"pid": os.getpid(), "hostname": socket.gethostname()}
+    """Identity of the process writing a ``processing`` entry.
+
+    ``pod`` is the container/pod name, ``pid`` the process id and ``boot`` a
+    per-process UUID generated at import time (a restart gets a new boot).
+    """
+    return {"pod": _pod_name(), "pid": os.getpid(), "boot": _BOOT_ID}
+
+
+def phase_state(entry: Optional[Dict]) -> str:
+    """Return the explicit state of a diary entry.
+
+    An absent/malformed entry is ``pending``. A legacy entry without ``state``
+    reads as ``complete`` (the pre-state-machine contract). The old ``running``
+    value reads as ``processing`` so an entry written by the previous release
+    is never mistaken for a finished phase.
+    """
+    if not isinstance(entry, dict):
+        return PHASE_STATE_PENDING
+    state = entry.get("state")
+    if state in PHASE_STATES:
+        return state
+    if state == "running":
+        return PHASE_STATE_PROCESSING
+    return PHASE_STATE_COMPLETE
+
+
+def normalize_phase_entry(entry: Optional[Dict]) -> Optional[Dict]:
+    """Return ``entry`` with the explicit five-state shape, without mutating it.
+
+    Legacy entries (no ``state``) gain ``state: complete`` and the missing
+    shape fields with their neutral defaults, so the next diary write persists
+    the normalized contract.
+    """
+    if not isinstance(entry, dict):
+        return entry
+    normalized = dict(entry)
+    normalized["state"] = phase_state(entry)
+    normalized.setdefault("reason", None)
+    normalized.setdefault("started_at", None)
+    normalized.setdefault("owner", None)
+    normalized.setdefault("tag", "")
+    normalized.setdefault("attempt", 1)
+    return normalized
+
+
+def derive_source_status(diary: Optional[Dict], phase_ids=None) -> str:
+    """Derive the source status from the phase diary.
+
+    - ``error`` if ANY phase is ``error``;
+    - ``complete`` iff no phase is ``pending`` or ``processing``;
+    - ``processing`` otherwise.
+
+    ``phase_ids`` is the authoritative phase set for the source; an ABSENT
+    entry is ``pending``. When ``phase_ids`` is omitted the diary keys are
+    used (useful when no registry is resolvable).
+    """
+    diary = diary if isinstance(diary, dict) else {}
+    ids = list(phase_ids) if phase_ids is not None else list(diary.keys())
+    states = [phase_state(diary.get(phase)) for phase in ids]
+    if PHASE_STATE_ERROR in states:
+        return PHASE_STATE_ERROR
+    if any(state in (PHASE_STATE_PENDING, PHASE_STATE_PROCESSING) for state in states):
+        return PHASE_STATE_PROCESSING
+    return PHASE_STATE_COMPLETE
+
 
 
 def _entry_started_at(entry: Dict) -> Optional[float]:
@@ -94,7 +184,7 @@ def _entry_started_at(entry: Dict) -> Optional[float]:
 
 
 def is_phase_lease_expired(entry: Optional[Dict], now: Optional[float] = None) -> bool:
-    """Whether a ``running`` diary entry's lease is expired.
+    """Whether a ``processing`` diary entry's lease is expired.
 
     Both contract conditions are evaluated explicitly:
 
@@ -103,10 +193,11 @@ def is_phase_lease_expired(entry: Optional[Dict], now: Optional[float] = None) -
     - the recorded ``owner`` is NOT the current process and the entry is older
       than the same threshold.
 
-    A non-``running`` entry (``complete`` or legacy no-state) never expires:
-    expiry only applies to the ``running`` state machine.
+    A non-``processing`` entry (``complete`` / ``error`` / ``skipped`` or a
+    legacy no-state entry) never expires: expiry only applies to the
+    ``processing`` state machine.
     """
-    if not isinstance(entry, dict) or entry.get("state") != PHASE_STATE_RUNNING:
+    if phase_state(entry) != PHASE_STATE_PROCESSING:
         return False
     now = time.time() if now is None else now
     lease = phase_lease_seconds()
@@ -120,6 +211,7 @@ def is_phase_lease_expired(entry: Optional[Dict], now: Optional[float] = None) -
     owner_expired = (not owner_is_current) and age is not None and age > lease
 
     return started_expired or owner_expired
+
 
 
 def status_key(agent_id: str, scope: str, source: str) -> str:
@@ -324,8 +416,14 @@ async def set_status(
     if completed_phases:
         stored = doc.get("completed_phases")
         diary = dict(stored) if isinstance(stored, dict) else {}
+        # Normalize EVERY entry on write: a legacy entry without ``state`` is
+        # persisted as ``complete`` the next time the diary is touched.
+        diary = {
+            phase_id: normalize_phase_entry(entry)
+            for phase_id, entry in diary.items()
+        }
         for phase_id, entry in completed_phases.items():
-            diary[phase_id] = entry
+            diary[phase_id] = normalize_phase_entry(entry)
         doc["completed_phases"] = diary
     await crud.store(key, doc)
     return doc
@@ -409,7 +507,14 @@ def get_completed_phases(doc: Optional[Dict]) -> dict:
     if not doc:
         return {}
     diary = doc.get("completed_phases")
-    return diary if isinstance(diary, dict) else {}
+    if not isinstance(diary, dict):
+        return {}
+    # Read-as-complete for the pre-state-machine entries: the returned copy
+    # always carries an explicit ``state`` without rewriting Redis.
+    return {
+        phase: normalize_phase_entry(entry)
+        for phase, entry in diary.items()
+    }
 
 
 async def backfill_completed_phases(doc: Optional[Dict], phase_ids) -> dict:
@@ -444,9 +549,74 @@ async def backfill_completed_phases(doc: Optional[Dict], phase_ids) -> dict:
     if not doc or doc.get("status") != IngestionStatus.COMPLETED.value:
         return {}
     return {
-        phase: {"marker": None, "settings_version": None, "deps": {}}
+        phase: {
+            "state": PHASE_STATE_COMPLETE,
+            "reason": None,
+            "started_at": None,
+            "owner": None,
+            "tag": "",
+            "attempt": 1,
+            "marker": None,
+            "settings_version": None,
+            "deps": {},
+        }
         for phase in (phase_ids or [])
     }
+
+
+
+async def _previous_diary_entry(agent_id, scope, source, phase):
+    return get_completed_phases(
+        await get_status(agent_id, scope, source)
+    ).get(phase)
+
+
+def _attempt(previous) -> int:
+    """Attempt counter for the next entry (previous + 1, or 1)."""
+    try:
+        return int(previous.get("attempt") or 0) + 1 if isinstance(previous, dict) else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _carried(previous, *, started_at, owner, tag, attempt) -> dict:
+    """Shape fields carried from the previous entry, with sane defaults."""
+    previous = previous if isinstance(previous, dict) else {}
+    return {
+        "started_at": (
+            previous.get("started_at") if started_at is None else started_at
+        ),
+        "owner": previous.get("owner") if owner is None else owner,
+        "tag": tag if tag else str(previous.get("tag") or ""),
+        "attempt": int(previous.get("attempt") or attempt),
+    }
+
+
+async def _write_phase_entry(
+    agent_id: str,
+    scope: str,
+    source: str,
+    phase: str,
+    entry: dict,
+    *,
+    type_: str = "file",
+    chat_id: Optional[str] = None,
+) -> dict:
+    """Write ONE diary entry (merged by phase) and nothing else.
+
+    The SOURCE status is derived and written by the dispatcher, never by a
+    phase: this helper only records the phase state and keeps the row alive as
+    ``processing`` while the phase machine is running.
+    """
+    return await set_status(
+        agent_id,
+        scope,
+        source,
+        type_=type_,
+        status=IngestionStatus.PROCESSING,
+        chat_id=chat_id,
+        completed_phases={phase: entry},
+    )
 
 
 async def record_phase_completed(
@@ -458,61 +628,48 @@ async def record_phase_completed(
     marker: object = None,
     settings_version: Optional[str] = None,
     deps: Optional[Dict] = None,
+    tag: str = "",
+    type_: str = "file",
+    chat_id: Optional[str] = None,
 ) -> dict:
-    """Record the successful completion of one work phase in the diary.
+    """Record ``state: complete`` for one phase (body returned ``done``).
 
-    Writes the entry ``{phase: {"marker": marker, "settings_version":
-    settings_version, "deps": deps or {}}}`` into the status doc's
-    ``completed_phases`` diary, merging by phase (re-recording the same phase
-    replaces only its own entry). Uses the plugin-defined ``marker`` only; no
-    full settings fingerprint is stored. ``settings_version`` is an OPAQUE
-    copy of the settings entry's ``updated_at`` used only for equality, never
-    as a time — no timestamps are used for correctness.
+    Completion is "the worker finished without error", NOT an item count: the
+    caller records this entry whenever the phase body returned ``done``,
+    including when it produced zero items. The entry keeps the material marker
+    fields used by staleness (``marker`` / ``settings_version`` / ``deps``)
+    plus the explicit five-state shape::
 
-    **ATOMIC COMPLETION INVARIANT**: the diary entry is written ONLY on
-    successful completion of the phase, in a single atomic write — NEVER at
-    phase start. A phase interrupted by a restart therefore has no entry and
-    is re-run on recovery.
+        {phase: {"state": "complete", "reason": None,
+                 "started_at": <epoch float|None>,
+                 "owner": {"pod", "pid", "boot"}|None,
+                 "tag": <str>, "attempt": <int>,
+                 "marker": ..., "settings_version": ..., "deps": {...}}}
 
-    Args:
-        agent_id: The agent (chatbot) id.
-        scope: ``"agent"`` or a conversation ``chat_id``.
-        source: The ingested file name or URL.
-        phase: The phase id that completed (e.g. ``parsing_chunking``).
-        marker: The plugin-defined marker of the settings the phase ran with.
-        settings_version: Opaque copy of the settings entry's ``updated_at``.
-        deps: ``{upstream_phase: upstream_marker}`` of the phases this phase
-            consumed. ``None``/missing upstreams are stored as ``{}``.
-
-    Returns:
-        The stored status document. A malformed (missing/invalid) ``phase``
-        is a no-op that never crashes and returns the current doc (or ``{}``).
+    **ATOMIC COMPLETION INVARIANT**: the entry is written ONLY after the phase
+    body succeeded, never at phase start. A phase interrupted before this
+    write has no entry and is re-run on recovery.
     """
     if not phase or not isinstance(phase, str):
         return await get_status(agent_id, scope, source) or {}
-    previous = get_completed_phases(
-        await get_status(agent_id, scope, source)
-    ).get(phase)
+    previous = await _previous_diary_entry(agent_id, scope, source, phase)
+    carried = _carried(
+        previous, started_at=None, owner=None, tag=tag, attempt=_attempt(previous)
+    )
     entry = {
         "state": PHASE_STATE_COMPLETE,
+        "reason": None,
+        **carried,
         "marker": marker,
         "settings_version": settings_version,
         "deps": deps or {},
     }
-    # Keep the attempt counter of the run that produced the products.
-    if isinstance(previous, dict) and previous.get("attempt") is not None:
-        entry["attempt"] = previous.get("attempt")
-    return await set_status(
-        agent_id,
-        scope,
-        source,
-        type_="file",
-        status=IngestionStatus.PROCESSING,
-        completed_phases={phase: entry},
+    return await _write_phase_entry(
+        agent_id, scope, source, phase, entry, type_=type_, chat_id=chat_id
     )
 
 
-async def record_phase_running(
+async def record_phase_processing(
     agent_id: str,
     scope: str,
     source: str,
@@ -521,47 +678,97 @@ async def record_phase_running(
     type_: str = "file",
     chat_id: Optional[str] = None,
     started_at: Optional[float] = None,
+    tag: str = "",
 ) -> dict:
-    """Mark a phase ``running`` BEFORE its body starts (state machine start).
+    """Mark a phase ``processing`` BEFORE its body starts.
 
     Writes the diary entry::
 
-        {phase: {"state": "running", "started_at": <epoch float>,
-                 "attempt": <n>, "owner": {"pid": <pid>,
-                                           "hostname": "<host>"}}}
+        {phase: {"state": "processing", "reason": None,
+                 "started_at": <epoch float>,
+                 "owner": {"pod", "pid", "boot"},
+                 "tag": <str>, "attempt": <n>}}
 
-    replacing any previous entry for that phase (a stale ``complete`` or an
-    abandoned ``running`` one). ``attempt`` is the previous attempt count + 1,
-    or 1 for a fresh phase, so a recovery re-run is visible in the diary.
-
-    The atomic-completion invariant is preserved: a ``running`` entry is NOT
-    proof the phase completed. Only :func:`record_phase_completed` writes
-    ``state: "complete"``, and it does so only after the products are stored.
+    replacing any previous entry for that phase (a stale ``complete``, an
+    ``error``, a ``skipped`` or an abandoned ``processing`` one). ``attempt``
+    is the previous attempt count + 1, or 1 for a fresh phase, so a recovery
+    re-run is visible in the diary. A ``processing`` entry is NOT proof the
+    phase completed.
     """
     if not phase or not isinstance(phase, str):
         return await get_status(agent_id, scope, source) or {}
-    previous = get_completed_phases(
-        await get_status(agent_id, scope, source)
-    ).get(phase)
-    try:
-        attempt = int(previous.get("attempt") or 0) + 1 if isinstance(previous, dict) else 1
-    except (TypeError, ValueError):
-        attempt = 1
+    previous = await _previous_diary_entry(agent_id, scope, source, phase)
     entry = {
-        "state": PHASE_STATE_RUNNING,
+        "state": PHASE_STATE_PROCESSING,
+        "reason": None,
         "started_at": generate_timestamp() if started_at is None else float(started_at),
-        "attempt": attempt,
         "owner": current_phase_owner(),
+        "tag": tag if tag else str((previous or {}).get("tag") or ""),
+        "attempt": _attempt(previous),
     }
-    return await set_status(
-        agent_id,
-        scope,
-        source,
-        type_=type_,
-        status=IngestionStatus.PROCESSING,
-        chat_id=chat_id,
-        completed_phases={phase: entry},
+    return await _write_phase_entry(
+        agent_id, scope, source, phase, entry, type_=type_, chat_id=chat_id
     )
+
+
+async def record_phase_error(
+    agent_id: str,
+    scope: str,
+    source: str,
+    phase: str,
+    reason: str,
+    *,
+    type_: str = "file",
+    chat_id: Optional[str] = None,
+    tag: str = "",
+) -> dict:
+    """Record ``state: error`` (with the reason) for one phase."""
+    if not phase or not isinstance(phase, str):
+        return await get_status(agent_id, scope, source) or {}
+    previous = await _previous_diary_entry(agent_id, scope, source, phase)
+    carried = _carried(
+        previous, started_at=None, owner=None, tag=tag, attempt=_attempt(previous)
+    )
+    entry = {
+        "state": PHASE_STATE_ERROR,
+        "reason": reason,
+        **carried,
+    }
+    return await _write_phase_entry(
+        agent_id, scope, source, phase, entry, type_=type_, chat_id=chat_id
+    )
+
+
+async def record_phase_skipped(
+    agent_id: str,
+    scope: str,
+    source: str,
+    phase: str,
+    reason: Optional[str] = None,
+    *,
+    type_: str = "file",
+    chat_id: Optional[str] = None,
+    tag: str = "",
+) -> dict:
+    """Record ``state: skipped`` (with the reason) for a non-applicable phase."""
+    if not phase or not isinstance(phase, str):
+        return await get_status(agent_id, scope, source) or {}
+    previous = await _previous_diary_entry(agent_id, scope, source, phase)
+    carried = _carried(
+        previous, started_at=None, owner=None, tag=tag, attempt=_attempt(previous)
+    )
+    entry = {
+        "state": PHASE_STATE_SKIPPED,
+        "reason": reason,
+        **carried,
+    }
+    return await _write_phase_entry(
+        agent_id, scope, source, phase, entry, type_=type_, chat_id=chat_id
+    )
+
+
+#: Backward-compatible alias: "running" is spelled ``processing`` now.
+record_phase_running = record_phase_processing
 
 
 async def reset_phase_entries(

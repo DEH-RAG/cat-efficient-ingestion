@@ -44,6 +44,7 @@ import mimetypes
 import os
 import time
 import uuid
+from typing import Optional
 from urllib.parse import urlparse
 
 from langchain_core.documents import Document
@@ -83,16 +84,22 @@ from .phases import (
 from .registry import (
     PHASE_EMBEDDING,
     PHASE_PARSING_CHUNKING,
+    PHASE_STATE_COMPLETE,
+    PHASE_STATE_ERROR,
+    PHASE_STATE_PROCESSING,
     IngestionStatus,
     backfill_completed_phases,
     claim_source_for_resume,
-    PHASE_STATE_RUNNING,
+    derive_source_status,
     get_completed_phases,
     get_status,
     ingestion_canceled,
     is_phase_lease_expired,
+    phase_state,
     record_phase_completed,
-    record_phase_running,
+    record_phase_error,
+    record_phase_processing,
+    record_phase_skipped,
     reset_phase_entries,
     set_phase,
     set_status,
@@ -912,7 +919,7 @@ async def _purge_external_phase(ccat, cat, source_name, phase) -> bool:
     """PURGE an external phase via ``ingestion_phase_purge`` on its owner.
 
     Returns False (and logs a WARNING naming phase/source) when the phase has
-    no purge implementation: recovery must then leave the entry ``running``,
+    no purge implementation: recovery must then leave the entry ``processing``,
     not delete anything blindly, not re-run and not mark it complete.
     """
     result = await execute_phase_on_owner(
@@ -927,7 +934,7 @@ async def _purge_external_phase(ccat, cat, source_name, phase) -> bool:
     if result is None:
         log.warning(
             f"Agent id: {ccat._id}. Phase {phase} for {source_name} has no "
-            f"purge implementation; leaving its running entry in place "
+            f"purge implementation; leaving its processing entry in place "
             f"(not re-running, not completing)"
         )
         return False
@@ -939,7 +946,7 @@ async def _purge_phase(ccat, cat, collection_name, scope, source_name, chat_id, 
 
     Built-in phases have an explicit product boundary; everything else goes
     through the external hook. Returns False when no purge implementation
-    exists (the caller must leave the running entry untouched).
+    exists (the caller must leave the processing entry untouched).
     """
     if phase == PHASE_PARSING_CHUNKING:
         count = await _purge_parsing_phase(ccat, collection_name, source_name, chat_id)
@@ -961,11 +968,11 @@ async def _purge_phase(ccat, cat, collection_name, scope, source_name, chat_id, 
 async def _recover_abandoned_phases(
     ccat, cat, collection_name, scope, source_name, chat_id, doc
 ) -> bool | None:
-    """Purge + reset every abandoned (expired-lease) running phase.
+    """Purge + reset every abandoned (expired-lease) processing phase.
 
     Called from the SAME dispatch loop where the periodic probe runs
     (``reembed_sources``), BEFORE the pending phase is re-run. The earliest
-    expired ``running`` entry in execution order is the abandoned phase; every
+    expired ``processing`` entry in execution order is the abandoned phase; every
     later phase that has a diary entry (its downstream products) is purged
     with it, in REVERSE execution order (later phases first). The purged
     entries are then reset so the phases are stale again and re-run from
@@ -975,7 +982,7 @@ async def _recover_abandoned_phases(
         ``None`` when nothing is abandoned (normal path), ``True`` after a
         successful purge+reset, ``False`` when a phase has no purge
         implementation (its WARNING was logged; the caller must stop this
-        source and leave the entry running).
+        source and leave the entry processing).
     """
     diary = get_completed_phases(doc)
     if not diary:
@@ -985,7 +992,7 @@ async def _recover_abandoned_phases(
     expired = [
         phase for phase in order
         if isinstance(diary.get(phase), dict)
-        and diary[phase].get("state") == PHASE_STATE_RUNNING
+        and phase_state(diary[phase]) == PHASE_STATE_PROCESSING
         and is_phase_lease_expired(diary[phase])
     ]
     if not expired:
@@ -1009,7 +1016,7 @@ async def _recover_abandoned_phases(
             ccat, cat, collection_name, scope, source_name, chat_id, phase
         ):
             # No purge implementation: do NOT delete blindly and do NOT
-            # re-run; the abandoned entry stays ``running`` and visible.
+            # re-run; the abandoned entry stays ``processing`` and visible.
             return False
 
     await reset_phase_entries(ccat.agent_key, scope, source_name, to_purge)
@@ -1021,9 +1028,32 @@ async def _recover_abandoned_phases(
 
 
 async def _mark_phase_running(ccat, scope, source_name, phase, chat_id, type_) -> None:
-    """Write ``state: running`` BEFORE the phase body starts."""
-    await record_phase_running(
+    """Write ``state: processing`` BEFORE the phase body starts."""
+    await record_phase_processing(
         ccat.agent_key, scope, source_name, phase, type_=type_, chat_id=chat_id
+    )
+
+
+async def _mark_phase_error(ccat, scope, source_name, phase, reason, chat_id, type_) -> None:
+    """Write ``state: error`` (with the reason) for a failed phase.
+
+    Also writes the DERIVED source status: any phase in ``error`` makes the
+    source ``error`` (the phase never writes the source status itself).
+    """
+    await record_phase_error(
+        ccat.agent_key, scope, source_name, phase, reason,
+        type_=type_, chat_id=chat_id,
+    )
+    await _set_status(
+        ccat, source_name, IngestionStatus.ERROR, error=reason, chat_id=chat_id
+    )
+
+
+async def _mark_phase_skipped(ccat, scope, source_name, phase, reason, chat_id, type_) -> None:
+    """Write ``state: skipped`` (with the reason) for a non-applicable phase."""
+    await record_phase_skipped(
+        ccat.agent_key, scope, source_name, phase, reason,
+        type_=type_, chat_id=chat_id,
     )
 
 
@@ -1058,61 +1088,49 @@ async def _finish_phase(
     ccat, cat, scope, source_name, phase, chat_id, products,
     expected=None, processed=None,
 ) -> bool:
-    """Record ``state: complete`` according to the phase's expected/processed counts.
+    """Record ``state: complete`` because the phase body returned ``done``.
 
-    ``expected`` / ``processed`` are the counts the phase body REPORTED:
+    Completion is "the worker finished without error". It does NOT depend on
+    how many items were produced: a phase with ZERO items still completes, and
+    an item-count mismatch is never a reason to stay ``processing``.
 
-    - both known: complete iff ``processed == expected``. ``0 == 0`` is a
-      legitimate completion (an empty source must not stay ``running``); any
-      mismatch (in particular ``processed < expected``) logs a WARNING naming
-      both numbers and leaves the entry ``running``;
-    - unknown (either count is ``None``): legacy behaviour — a non-empty/
-      truthy ``products`` means complete, an empty/falsy one means "the phase
-      wrote nothing" and leaves it ``running``. A DEBUG line records that the
-      counts were unavailable.
-
-    ``products`` is the phase body's stored output (a non-empty list of points
-    for the built-ins, or True for an external phase that reported ``done``).
+    ``expected`` / ``processed`` are TELEMETRY ONLY: when the body reported
+    them they are logged at INFO, otherwise a DEBUG line says they were
+    unavailable. They never feed a decision here.
     """
-    counts_known = expected is not None and processed is not None
-    if counts_known:
-        if processed == expected:
-            await _record_phase(ccat, cat, scope, source_name, phase, chat_id=chat_id)
-            return True
-        log.warning(
-            f"Agent id: {ccat._id}. Phase {phase} for {source_name} processed "
-            f"{processed} of {expected} expected item(s); leaving it running "
-            f"(NOT marked complete)"
+    if expected is None and processed is None:
+        log.debug(
+            f"Agent id: {ccat._id}. Phase {phase} for {source_name} "
+            "completed; processed/expected counts unavailable"
         )
-        return False
-
-    log.debug(
-        f"Agent id: {ccat._id}. Phase {phase} for {source_name}: expected/"
-        "processed counts unavailable; falling back to product-presence check"
-    )
-    if not products:
-        log.warning(
-            f"Agent id: {ccat._id}. Phase {phase} for {source_name} produced "
-            f"no products; leaving it running (NOT marked complete)"
+    else:
+        log.info(
+            f"Agent id: {ccat._id}. Phase {phase} for {source_name} "
+            f"completed: processed {processed!r} of expected {expected!r} "
+            "item(s) (telemetry only)"
         )
-        return False
+    # ``products`` is kept in the signature for callers that still report the
+    # body output; completion no longer inspects it.
+    _ = products
     await _record_phase(ccat, cat, scope, source_name, phase, chat_id=chat_id)
     return True
 
 
 async def _run_external_phase(
-    ccat, cat, scope, source_name, phase, chat_id, counts=None
+    ccat, cat, scope, source_name, phase, chat_id, counts=None, outcome=None
 ) -> bool:
     """Dispatch one external (non-``PHASES``) phase through the run hook.
 
-    Handles the tri-state contract of ``ingestion_phase_run`` (hooks.py):
+    Handles the contract of ``ingestion_phase_run`` (hooks.py):
 
-      - ``{"status": "done"}`` -> returns ``True``: the caller records the
-        diary entry and re-probes. The optional ``processed`` / ``expected``
-        fields, when both are integers, are copied into ``counts`` so the
-        caller can enforce the exact completion predicate; a bare
-        ``{"status": "done"}`` leaves both as ``None`` (counts unknown, legacy
-        behaviour preserved);
+      - ``{"status": "done"}`` -> returns ``True`` and records the outcome
+        ``done``; the caller writes the diary ``complete`` entry and re-probes.
+        The optional ``processed`` / ``expected`` fields, when both are
+        integers, are copied into ``counts`` as TELEMETRY only (they never
+        decide completion);
+      - ``{"status": "skipped", "reason": "..."}`` -> returns ``True`` with
+        outcome ``skipped``; the caller writes a ``skipped`` diary entry with
+        the reason;
       - ``{"status": "not_ready", "retry_after": N}`` -> the phase is retried
         after ``N`` seconds, keeping the row NON-TERMINAL (status
         ``processing``, phase unchanged) until the wall-clock budget
@@ -1127,10 +1145,20 @@ async def _run_external_phase(
     An ``error`` row is never resurrected: returning ``False`` leaves the
     absorbing ERROR in place and the caller stops the machine.
 
+    ``outcome`` (optional dict) receives ``{"status": "done"|"skipped"|
+    "error", "reason": ...}`` so the caller can write the matching diary state
+    instead of inferring it from the boolean.
+
     Returns:
-        ``True`` when the phase completed (diary recording is the caller's
-        job); ``False`` when the row was marked ERROR.
+        ``True`` when the phase produced ``done``/``skipped``; ``False`` when
+        the row was marked ERROR.
     """
+    outcome = outcome if outcome is not None else {}
+
+    def _set_outcome(status, reason=None):
+        outcome["status"] = status
+        outcome["reason"] = reason
+
     doc = await get_status(ccat.agent_key, scope, source_name)
     completed = await backfill_completed_phases(
         doc or {}, list((await merged_phases(ccat, cat)).keys())
@@ -1153,15 +1181,20 @@ async def _run_external_phase(
             log.error(
                 f"Agent id: {ccat._id}. External phase {phase} for {source_name} raised: {e}"
             )
+            _set_outcome("error", str(e))
             await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
             return False
 
         if isinstance(result, dict) and result.get("status") == "done":
             if counts is not None:
-                # Only an integer pair is a usable report; anything else keeps
-                # the legacy "expected unknown" behaviour.
+                # Telemetry only: an integer pair is a usable report, anything
+                # else leaves the counts unknown. It never decides completion.
                 counts["expected"] = _phase_count(result.get("expected"))
                 counts["processed"] = _phase_count(result.get("processed"))
+            _set_outcome("done")
+            return True
+        if isinstance(result, dict) and result.get("status") == "skipped":
+            _set_outcome("skipped", result.get("reason"))
             return True
         if isinstance(result, dict) and result.get("status") == "not_ready":
             retry_after = _not_ready_retry_after(result)
@@ -1169,6 +1202,7 @@ async def _run_external_phase(
             if not await _wait_not_ready(
                 ccat, scope, source_name, phase, chat_id, reason, retry_after
             ):
+                _set_outcome("error", reason)
                 return False
             await asyncio.sleep(retry_after)
             continue
@@ -1176,12 +1210,14 @@ async def _run_external_phase(
             reason = result.get("reason") or f"external phase {phase} reported an error"
             msg = f"external phase {phase} failed: {reason}"
             log.error(f"Agent id: {ccat._id}. {msg} for {source_name}")
+            _set_outcome("error", reason)
             await _set_status(ccat, source_name, IngestionStatus.ERROR, error=reason, chat_id=chat_id)
             return False
 
         # None or any other return: fail-hard (unimplemented / misleading).
         msg = f"external phase {phase} returned {result!r} (expected a status dict)"
         log.error(f"Agent id: {ccat._id}. {msg} for {source_name}")
+        _set_outcome("error", msg)
         await _set_status(ccat, source_name, IngestionStatus.ERROR, error=msg, chat_id=chat_id)
         return False
 
@@ -1233,6 +1269,8 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
         return await record_phase_completed(
             ccat.agent_key, scope, source_name, phase,
             marker=None, settings_version=None, deps={},
+            type_="url" if is_url(source_name) else "file",
+            chat_id=chat_id,
         )
 
     marker = await execute_phase_on_owner(
@@ -1261,6 +1299,15 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
         upstream_entry = diary.get(upstream)
         deps[upstream] = upstream_entry.get("marker") if isinstance(upstream_entry, dict) else None
 
+    tag = ""
+    try:
+        for registered in await get_phases(cat if cat is not None else ccat):
+            if registered.id == phase:
+                tag = registered.tag(cat if cat is not None else ccat)
+                break
+    except Exception as exc:  # noqa: BLE001 - a tag must never break completion
+        log.debug(f"Agent id: {ccat._id}. Could not resolve tag for phase {phase}: {exc}")
+
     return await record_phase_completed(
         ccat.agent_key,
         scope,
@@ -1269,7 +1316,71 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
         marker=marker,
         settings_version=settings_version,
         deps=deps,
+        tag=tag,
+        type_="url" if is_url(source_name) else "file",
+        chat_id=chat_id,
     )
+
+
+async def _phase_applies(ccat, cat, phase, diary) -> tuple[bool, Optional[str]]:
+    """Ask the registered phase whether it applies to this source.
+
+    Returns ``(True, None)`` when no registered implementation is resolvable
+    (the dispatcher then runs the legacy flow and fails hard if the phase is
+    truly unimplemented). A phase whose ``applies_to`` returns false is
+    recorded as ``skipped`` with its reason instead of being run.
+    """
+    try:
+        for registered in await get_phases(cat if cat is not None else ccat):
+            if registered.id != phase:
+                continue
+            applies, reason = await registered.applies_to(
+                cat if cat is not None else ccat, diary
+            )
+            return bool(applies), reason
+    except Exception as exc:  # noqa: BLE001 - applicability must never break the pass
+        log.warning(
+            f"Agent id: {ccat._id}. Could not evaluate applies_to for phase "
+            f"{phase}: {exc}"
+        )
+    return True, None
+
+
+def _first_error_reason(diary) -> Optional[str]:
+    """Reason of the first diary entry in ``error`` (None when absent)."""
+    for entry in (diary or {}).values():
+        if phase_state(entry) == PHASE_STATE_ERROR:
+            return (entry or {}).get("reason")
+    return None
+
+
+async def _refresh_source_status(ccat, cat, scope, source_name, chat_id) -> Optional[str]:
+    """Derive the source status from the diary and write it (dispatcher-owned).
+
+    The rule is explicit and shared (:func:`registry.derive_source_status`):
+    ``error`` if any phase is ``error``; ``complete`` iff no phase is
+    ``pending``/``processing``; ``processing`` otherwise. A ``complete``
+    derivation still passes through the completion gate (:func:`_complete_source`).
+    """
+    doc = await get_status(ccat.agent_key, scope, source_name)
+    if not doc:
+        return None
+    phase_ids = list((await merged_phases(ccat, cat)).keys())
+    diary = get_completed_phases(doc)
+    derived = derive_source_status(diary, phase_ids)
+    if derived == PHASE_STATE_ERROR:
+        await _set_status(
+            ccat, source_name, IngestionStatus.ERROR,
+            error=_first_error_reason(diary) or "a phase failed",
+            chat_id=chat_id,
+        )
+    elif derived == PHASE_STATE_COMPLETE:
+        await _complete_source(ccat, cat, scope, source_name, chat_id)
+    else:
+        await _set_status(
+            ccat, source_name, IngestionStatus.PROCESSING, chat_id=chat_id
+        )
+    return derived
 
 
 async def _complete_source(ccat, cat, scope, source_name, chat_id) -> None:
@@ -1601,13 +1712,13 @@ async def reembed_sources(
                 ]
                 store_empty_forced = True
             if not pending:
-                # A ``running`` entry with a LIVE lease means another worker
+                # A ``processing`` entry with a LIVE lease means another worker
                 # (or this process) is still inside the phase body: leave the
                 # source alone, never terminalize it mid-phase.
                 if has_live_running_phase(doc):
                     log.debug(
                         f"Agent id: {ccat._id}. Source {source_name}: a live "
-                        f"running phase lease is held; leaving it alone"
+                        f"processing phase lease is held; leaving it alone"
                     )
                     continue
                 # every recorded phase is still fresh against the current settings
@@ -1624,10 +1735,12 @@ async def reembed_sources(
                 ):
                     log.info(
                         f"Agent id: {ccat._id}. Source {source_name}: every phase is "
-                        f"already complete (status {doc_status!r}); writing terminal "
-                        f"COMPLETED"
+                        f"already complete (status {doc_status!r}); writing the "
+                        f"derived status"
                     )
-                    await _complete_source(ccat, cat, scope, source_name, chat_id)
+                    await _refresh_source_status(
+                        ccat, cat, scope, source_name, chat_id
+                    )
                 else:
                     log.debug(
                         f"Agent id: {ccat._id}. Source {source_name}: no stale phases "
@@ -1679,6 +1792,10 @@ async def reembed_sources(
         # claimed row fresh here, otherwise a phase longer than the boot-stale
         # threshold could be re-claimed by the next periodic sweep.
         await _start_heartbeat(ccat, source_name, scope, cat)
+        # The phase body currently in flight (None between bodies). Used to
+        # attribute a raised exception to the phase that produced it so the
+        # machine writes ``state: error`` with the reason.
+        current_phase = None
         try:
             # ---- SERIAL PROBE-DRIVEN PHASE DISPATCH ----
             # One phase at a time, in probe order. After each phase body
@@ -1696,10 +1813,10 @@ async def reembed_sources(
                     # ERROR absorbing: never advance a failed row
                     break
                 # ---- RECOVERY: the same place the periodic probe runs ----
-                # An expired ``running`` entry is abandoned: purge its
+                # An expired ``processing`` entry is abandoned: purge its
                 # products (later phases first) and reset the entries BEFORE
                 # the phase is re-run from scratch below. ``False`` means a
-                # phase has no purge implementation: leave it running, do not
+                # phase has no purge implementation: leave it processing, do not
                 # re-run, stop this source.
                 recovered = await _recover_abandoned_phases(
                     ccat, cat, collection_name, scope, source_name, chat_id, doc
@@ -1713,11 +1830,38 @@ async def reembed_sources(
                         break
                 entry = pending[0]
                 phase = entry["phase"]
+                current_phase = None
                 phase_products = True
-                # Counts REPORTED by the phase body for the completion
-                # predicate; None means "expected unknown" (legacy behaviour).
+                # Counts REPORTED by the phase body: TELEMETRY ONLY, logged by
+                # ``_finish_phase`` and never used as a completion criterion.
                 phase_expected = None
                 phase_processed = None
+
+                # A phase may declare itself not applicable (e.g. a graph
+                # phase on a Qdrant agent): record ``skipped`` with the reason
+                # instead of running the body. The machine then re-probes; if
+                # every remaining phase is terminal-non-error the source
+                # completes through the derived-status path.
+                applies, skip_reason = await _phase_applies(
+                    ccat, cat, phase, get_completed_phases(doc)
+                )
+                if not applies:
+                    await _mark_phase_skipped(
+                        ccat, scope, source_name, phase, skip_reason, chat_id,
+                        "url" if is_url(source_name) else "file",
+                    )
+                    doc = await get_status(ccat.agent_key, scope, source_name)
+                    pending = await _probe_pending(ccat, cat, source_name, doc)
+                    if (
+                        not pending
+                        and not _should_stop_for_error(doc)
+                        and not has_live_running_phase(doc)
+                    ):
+                        await _refresh_source_status(
+                            ccat, cat, scope, source_name, chat_id
+                        )
+                        break
+                    continue
 
                 if phase == PHASE_EMBEDDING:
                     # chunks (text) already stored for this source: chunk-reuse
@@ -1744,13 +1888,14 @@ async def reembed_sources(
                         if _point_matches_source(p, source_name, chat_id)
                     ]
                     if source_points:
-                        # ``running`` is written only for the phase body that
+                        # ``processing`` is written only for the phase body that
                         # actually runs: the fall-through below re-parses
                         # instead and must not leave a stale embedding entry.
                         await _mark_phase_running(
                             ccat, scope, source_name, PHASE_EMBEDDING, chat_id,
                             "url" if is_url(source_name) else "file",
                         )
+                        current_phase = PHASE_EMBEDDING
                         try:
                             embed_counts: dict = {}
                             phase_products = await _embed_phase(
@@ -1790,6 +1935,7 @@ async def reembed_sources(
                             ccat, scope, source_name, PHASE_PARSING_CHUNKING, chat_id,
                             "url" if is_url(source_name) else "file",
                         )
+                        current_phase = PHASE_PARSING_CHUNKING
                         source_name, stored_points, phase_expected, phase_processed = (
                             _unpack_parsing_result(
                                 await _run_parsing_phase(
@@ -1812,6 +1958,7 @@ async def reembed_sources(
                         ccat, scope, source_name, PHASE_PARSING_CHUNKING, chat_id,
                         "url" if is_url(source_name) else "file",
                     )
+                    current_phase = PHASE_PARSING_CHUNKING
                     source_name, stored_points, phase_expected, phase_processed = (
                         _unpack_parsing_result(
                             await _run_parsing_phase(
@@ -1839,27 +1986,57 @@ async def reembed_sources(
                         ccat, scope, source_name, phase, chat_id,
                         "url" if is_url(source_name) else "file",
                     )
+                    current_phase = phase
                     external_counts: dict = {}
+                    external_outcome: dict = {}
                     if not await _run_external_phase(
                         ccat, cat, scope, source_name, phase, chat_id,
-                        counts=external_counts,
+                        counts=external_counts, outcome=external_outcome,
                     ):
                         # the row was marked ERROR (fail-hard / retry bound):
-                        # stop the machine; the ERROR-absorbing check above
-                        # never advances nor resurrects it.
+                        # write the matching diary state and stop the machine;
+                        # the ERROR-absorbing check above never advances nor
+                        # resurrects it.
+                        await _mark_phase_error(
+                            ccat, scope, source_name, phase,
+                            external_outcome.get("reason")
+                            or f"external phase {phase} failed",
+                            chat_id, "url" if is_url(source_name) else "file",
+                        )
+                        current_phase = None
                         break
+                    if external_outcome.get("status") == "skipped":
+                        await _mark_phase_skipped(
+                            ccat, scope, source_name, phase,
+                            external_outcome.get("reason"), chat_id,
+                            "url" if is_url(source_name) else "file",
+                        )
+                        current_phase = None
+                        doc = await get_status(ccat.agent_key, scope, source_name)
+                        pending = await _probe_pending(ccat, cat, source_name, doc)
+                        if (
+                            not pending
+                            and not _should_stop_for_error(doc)
+                            and not has_live_running_phase(doc)
+                        ):
+                            await _refresh_source_status(
+                                ccat, cat, scope, source_name, chat_id
+                            )
+                            break
+                        continue
                     phase_products = True
                     phase_expected = external_counts.get("expected")
                     phase_processed = external_counts.get("processed")
 
-                # ---- ATOMIC COMPLETION: record ``state: complete`` ONLY when
-                # ---- the body met its expected/processed predicate ----
+                # ---- ATOMIC COMPLETION: the body returned ``done``, so the
+                # ---- phase is complete regardless of how many items it made
+                # ---- (item counts are telemetry only).
                 if not await _finish_phase(
                     ccat, cat, scope, source_name, phase, chat_id, phase_products,
                     expected=phase_expected, processed=phase_processed,
                 ):
-                    # predicate not met / nothing written: leave running
                     break
+                current_phase = None
 
                 # ---- re-probe with the updated diary ----
                 doc = await get_status(ccat.agent_key, scope, source_name)
@@ -1881,7 +2058,11 @@ async def reembed_sources(
                     and not _should_stop_for_error(doc)
                     and not has_live_running_phase(doc)
                 ):
-                    await _complete_source(ccat, cat, scope, source_name, chat_id)
+                    # Derived source status: ``complete`` only because no
+                    # phase is pending/processing and none errored.
+                    await _refresh_source_status(
+                        ccat, cat, scope, source_name, chat_id
+                    )
                     break
                 if not pending:
                     # an error row appeared while recording: never resurrect it
@@ -1898,7 +2079,25 @@ async def reembed_sources(
             return
         except Exception as e:  # noqa: BLE001 - a failing source must not abort the pass
             log.error(f"Agent id: {ccat._id}. Error re-embedding source {source_name}: {e}")
-            await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
+            if current_phase is not None:
+                # Attribute the failure to the phase body that raised: the
+                # diary carries ``state: error`` with the reason and the
+                # derived source status becomes ``error``.
+                try:
+                    await _mark_phase_error(
+                        ccat, scope, source_name, current_phase, str(e),
+                        chat_id, "url" if is_url(source_name) else "file",
+                    )
+                    await _refresh_source_status(
+                        ccat, cat, scope, source_name, chat_id
+                    )
+                except Exception as state_error:  # noqa: BLE001 - status must never break the pass
+                    log.error(
+                        f"Agent id: {ccat._id}. Could not record phase error for "
+                        f"{current_phase} of {source_name}: {state_error}"
+                    )
+            else:
+                await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
         finally:
             await _stop_heartbeat(ccat, source_name, scope, cat)
 

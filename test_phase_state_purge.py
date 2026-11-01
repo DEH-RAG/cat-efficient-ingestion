@@ -1,5 +1,5 @@
-"""Standalone, import-safe tests for the per-(source, phase) running/complete
-state machine and its phase-scoped purge on restart.
+"""Standalone, import-safe tests for the per-(source, phase) five-state
+diary and its phase-scoped purge on restart.
 
 Crash simulation only: a phase is left ``running`` with an EXPIRED lease in the
 diary and the recovery path is exercised against fakes. No real crash, no real
@@ -81,10 +81,10 @@ if __name__ == "__main__":
 
     def _running(started_at, owner=None, attempt=1):
         return {
-            "state": registry.PHASE_STATE_RUNNING,
+            "state": registry.PHASE_STATE_PROCESSING,
             "started_at": started_at,
             "attempt": attempt,
-            "owner": owner or {"pid": 999999, "hostname": "other-host"},
+            "owner": owner or {"pod": "other-pod", "pid": 999999, "boot": "other-boot"},
         }
 
     def _complete(marker="m"):
@@ -192,10 +192,10 @@ if __name__ == "__main__":
         finally:
             for name, value in saved.items():
                 setattr(reembed, name, value)
-        assert ok is False, "a body that wrote nothing must not complete"
-        assert recorded == [], recorded
-        assert any("produced no products" in m and "parsing_chunking" in m for m in log.warnings), log.warnings
-        print("PASS (c) complete is written only after products exist")
+        assert ok is True, "a body that returned done completes even with zero items"
+        assert len(recorded) == 1, recorded
+        assert not any("produced no products" in m for m in log.warnings), log.warnings
+        print("PASS (c) zero items still completes (no count criterion)")
 
     async def test_d_purge_order_is_reverse():
         old = time.time() - (registry.phase_lease_seconds() + 60)
@@ -247,7 +247,7 @@ if __name__ == "__main__":
                 setattr(reembed, name, value)
         assert result is False, result
         assert reset_log == [], "the entry must stay running (no reset)"
-        assert doc["completed_phases"]["graph_extraction"]["state"] == "running"
+        assert doc["completed_phases"]["graph_extraction"]["state"] == "processing"
         assert any(
             "graph_extraction" in m and "doc.txt" in m and "no purge implementation" in m
             for m in log.warnings

@@ -6,8 +6,9 @@ which of them are stale for a source, using ONLY content comparison — no
 timestamps are ever used for correctness.
 
 **Clock-free two-level staleness.** A phase's diary entry (see
-``registry.completed_phases``) records ``{"marker", "settings_version",
-"deps"}``. A phase is stale when:
+``registry.completed_phases``) records the explicit state plus the
+material ``tag`` and ``{"marker", "settings_version", "deps"}``. A phase is
+stale when:
 
 - (a) **dependency**: any upstream in ``spec.depends_on`` is missing from the
   diary, or the recorded ``deps[upstream]`` differs from the upstream's
@@ -80,9 +81,12 @@ from .hooks import (
     phase_settings_key,
 )
 from .registry import (
-    PHASE_STATE_RUNNING,
+    PHASE_STATE_ERROR,
+    PHASE_STATE_PROCESSING,
+    PHASE_STATE_SKIPPED,
     get_completed_phases,
     is_phase_lease_expired,
+    phase_state,
 )
 
 
@@ -683,12 +687,18 @@ def is_phase_stale(
     if not isinstance(entry, dict):
         return True
 
-    # (state machine) A phase whose last entry is ``running`` is stale only
-    # when its lease expired: an abandoned run must be purged and re-run from
-    # scratch, while a LIVE run (another worker, or this process still inside
-    # the phase body) is left alone.
-    if entry.get("state") == PHASE_STATE_RUNNING:
+    # (state machine) A ``processing`` entry is stale only when its lease
+    # expired: an abandoned run must be purged and re-run from scratch, while
+    # a LIVE run (another worker, or this process still inside the phase body)
+    # is left alone. ``error`` / ``skipped`` are terminal-non-complete states:
+    # they are never stale by themselves (the source status carries the error,
+    # and a skipped phase does not apply), while an ABSENT entry is pending and
+    # therefore stale.
+    state = phase_state(entry)
+    if state == PHASE_STATE_PROCESSING:
         return is_phase_lease_expired(entry)
+    if state in (PHASE_STATE_ERROR, PHASE_STATE_SKIPPED):
+        return False
 
     # (a) dependency: upstream marker identity, never timestamps
     for upstream in spec.depends_on:
@@ -710,16 +720,16 @@ def is_phase_stale(
 
 
 def has_live_running_phase(completed_phases: Any) -> bool:
-    """Whether the diary holds a ``running`` entry with a LIVE lease.
+    """Whether the diary holds a ``processing`` entry with a LIVE lease.
 
     Such a source is being worked on by another worker (or by this process,
     earlier in the same pass): the machine must leave it alone and must NOT
-    write a terminal COMPLETED while the lease is live.
+    write a terminal COMPLETED while the lease is live. (The name is kept for
+    API compatibility; ``processing`` is the current spelling of ``running``.)
     """
     diary = _diary_from_completed_phases(completed_phases)
     return any(
-        isinstance(entry, dict)
-        and entry.get("state") == PHASE_STATE_RUNNING
+        phase_state(entry) == PHASE_STATE_PROCESSING
         and not is_phase_lease_expired(entry)
         for entry in diary.values()
     )
