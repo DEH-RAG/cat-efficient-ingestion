@@ -2056,15 +2056,29 @@ async def reembed_sources(
                 ) as should_run:
                     if not should_run:
                         doc = await get_status(ccat.agent_key, scope, source_name)
-                        pending = await _probe_pending(ccat, cat, source_name, doc)
+                        if phase_state(get_completed_phases(doc).get(phase)) in (
+                            PHASE_STATE_COMPLETE,
+                            PHASE_STATE_ERROR,
+                            PHASE_STATE_SKIPPED,
+                        ):
+                            # Another worker terminalized it under the lock:
+                            # re-probe and pick the next pending phase.
+                            pending = await _probe_pending(ccat, cat, source_name, doc)
+                            if not pending:
+                                if (
+                                    not _should_stop_for_error(doc)
+                                    and not has_live_running_phase(doc)
+                                ):
+                                    await _refresh_source_status(
+                                        ccat, cat, scope, source_name, chat_id
+                                    )
+                                break
+                            continue
+                        # Lock timeout: the entry was left untouched. Do NOT
+                        # retry the SAME phase in this pass (it would spin on
+                        # the held lock); continue with the NEXT phase.
+                        pending = [p for p in pending if p.get("phase") != phase]
                         if not pending:
-                            if (
-                                not _should_stop_for_error(doc)
-                                and not has_live_running_phase(doc)
-                            ):
-                                await _refresh_source_status(
-                                    ccat, cat, scope, source_name, chat_id
-                                )
                             break
                         continue
 
