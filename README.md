@@ -19,26 +19,35 @@ Lifecycle states: `uploaded → processing → completed | error`, with `downloa
 
 Sources are claimed under a **per-source distributed lock**, so different sources of the same agent are ingested concurrently while the same source is never processed twice by two workers. A heartbeat keeps every in-flight row (`uploaded`, `downloading`, `downloaded`, `processing`) fresh while a worker handles it, so live work is never stolen by another replica. The download heartbeat is bounded (`CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS`, default `1800`): a download that fails without firing `rabbithole_url_download_completed` stops refreshing and the row ages out, becoming resumable again.
 
-<h2>🧭 Clock-free two-level phase invalidation</h2>
+<h2>🧭 Clock-free recursive phase tags</h2>
 
 The plugin decides whether a source must be re-run with a **clock-free** model: no timestamps are ever used for correctness. Each status document carries a `completed_phases` diary, keyed by phase id:
 
 ```
-completed_phases: {phase: {"marker": Any, "settings_version": str|None,
-                           "deps": {upstream_phase: upstream_marker}}}
+completed_phases: {phase: {"tag": str,
+                           "marker": Any, "deps": {upstream_phase: upstream_marker}}}
 ```
 
-- `marker` is the plugin-defined marker of the settings the phase ran with;
-- `settings_version` is an **opaque** copy of the settings entry's `updated_at`, used only for equality, never as a time;
-- `deps` maps each upstream phase to the marker it ran with.
+- `tag` is a **recursive** SHA-256 of the phase's own material (its settings marker, or a declared `id:category:deps` fallback) folded with the tag of every phase in `depends_on`;
+- `marker` is the plugin-defined marker of the settings the phase ran with (kept for compatibility/readability);
+- `deps` maps each upstream phase to the marker it ran with (kept for compatibility/readability).
+
+`compute_tags(cat, phases)` resolves the tags in dependency order. For each phase:
+
+```
+tag = sha256(own_material + "|" + "|".join(f"{dep}={dep_tag}" for dep in sorted(depends_on)))
+```
+
+Because dependencies are resolved first, **any change deep in the chain changes every dependent's tag**, transitively. A cycle raises `PhaseTagCycleError` naming the cycle. The legacy flat `settings_version` field remains readable on old entries but is **not** part of the decision.
 
 A phase is stale when any of these hold:
 
-- **(a) dependency**: an upstream in its `depends_on` is missing from the diary, or the recorded `deps[upstream]` differs from the upstream's current diary `marker` (the upstream re-ran, so this phase must re-run too);
-- **(b) settings fast-path**: the settings entry for the phase's category was **not** rewritten since the phase ran (`settings_version` equals the current entry's `updated_at`, compared as an opaque token) → FRESH, no marker comparison needed;
-- **(c) slow-path**: the plugin-defined marker from `ingestion_phase_settings_marker` differs from the recorded `marker` (the settings entry *was* rewritten; the phase-owning plugin decides whether the change is material).
+- its own diary entry is absent (pending) or its `processing` lease expired;
+- a dependency is absent (pending), `processing`, `error` or `skipped` — there is no completed upstream work to consume;
+- the stored `tag` differs from the current recursive tag, or is missing (a legacy entry, stale exactly once until rewritten).
 
-The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) → `embedding` (depends on the embedder settings **and** the recorded `parsing_chunking` marker). So an embedder-only change re-runs only `embedding`, while a chunker change re-runs `parsing_chunking` first and `embedding` follows on the next probe.
+The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) → `embedding` (depends on the embedder settings **and** the `parsing_chunking` tag). So an embedder-only change re-runs only `embedding`, while a chunker change re-runs `parsing_chunking` first and `embedding` follows on the next probe (its tag now includes the new parsing tag).
+
 
 **Atomic-completion invariant**: a phase's diary entry is written **only** on successful completion, in a single atomic write, never at phase start. A phase interrupted by a restart therefore has no entry and is re-run on recovery.
 
@@ -63,16 +72,16 @@ External plugins can declare their own ingestion phases without touching the Eff
 A `PhaseSpec` declares three things:
 
 - `id` — the phase id (also the diary key);
-- `settings_category` — the settings category whose `updated_at` is the opaque fast-path token, or `None` for phases with no settings entry (marker-only invalidation);
-- `depends_on` — upstream phase ids whose recorded markers this phase consumed.
+- `settings_category` — the settings category the phase's material marker is read from, or `None` for phases with no settings entry (marker-only invalidation; the declared `id:category:deps` string is the fallback own material);
+- `depends_on` — upstream phase ids whose tags this phase folds into its own tag.
 
 A provider only declares a spec + a marker + an execution hook:
 
 - **`ingestion_phase_specs(specs, cat)`** — declares the phase (accumulator);
-- **`ingestion_phase_settings_marker(phase, cat)`** — the material marker compared against the recorded diary `marker` (the provider decides whether a settings rewrite is material);
+- **`ingestion_phase_settings_marker(phase, cat)`** — the material marker that feeds the phase's own tag (the provider decides whether a settings rewrite is material). It may be a coroutine: `HookPhase.tag` awaits it when needed; it reads configuration only and performs no LLM call;
 - **`ingestion_phase_run(phase, source, completed_phases, cat)`** — executes the phase (tri-state contract).
 
-EffING computes staleness for ALL merged phases (deps by upstream marker identity + marker comparison), so a provider never re-implements the pending probe. Registered phases get REAL diary entries: `_record_phase` writes the marker from `ingestion_phase_settings_marker`, reads `settings_version` only when `settings_category` is set, and copies `deps` from the current diary upstream markers — the same atomic-completion invariant as the built-ins. A registered phase is therefore restartable and re-runs automatically when its upstreams re-run or its marker changes.
+EffING computes staleness for ALL merged phases by comparing the stored recursive `tag` against the freshly computed one, so a provider never re-implements the pending probe and a change deep in the chain invalidates every dependent. Registered phases get REAL diary entries: `_record_phase` writes the recursive `tag` from `compute_tags`, the marker from `ingestion_phase_settings_marker`, and copies `deps` from the current diary upstream markers — the same atomic-completion invariant as the built-ins. A registered phase is therefore restartable and re-runs automatically when it or any upstream changes.
 
 <h2>🧩 Third-party phase-extension contract</h2>
 
@@ -98,12 +107,12 @@ Never require EffING at import time and never make `PhaseSpec` duck-typed: the s
 
 <h2>🔁 Probe-driven dispatcher</h2>
 
-`reembed_sources` is the one probe-driven dispatcher. For each source it reads the `completed_phases` diary (backfilling legacy completed rows), converts it to the hook list shape and threads it into the `ingestion_phase_pending` accumulator. Registrants compare the diary against the current settings markers/versions and report the stale phases:
+`reembed_sources` is the one probe-driven dispatcher. For each source it reads the `completed_phases` diary (backfilling legacy completed rows), converts it to the hook list shape and threads it into the `ingestion_phase_pending` accumulator. Registrants compare each stored recursive `tag` against the freshly computed tag (which folds in every dependency) and report the stale phases:
 
 - **no stale phases** → the source is up to date: it is **skipped without claiming** when it is already terminal (`completed`/`error`); a non-terminal row left behind (e.g. an interrupted run that recorded every phase but never wrote `completed`) is **terminalized to `completed`** here, in one pass, so the sweep never re-hands it forever;
 - **stale phases** → the row is claimed (per-source lock) and the stale phases run **serially**, one at a time in probe order.
 
-After each phase succeeds, its diary entry (`marker` / `settings_version` / `deps`) is recorded **atomically at completion** — never at phase start — and the probe is re-run against the updated diary. When the re-probe is empty, the terminal COMPLETED status is written (after the `before_ingestion_status_completed` gate), with the work phase cleared. An `error` row is never advanced nor resurrected to COMPLETED.
+After each phase succeeds, its diary entry (`tag`, plus `marker` / `deps` for compatibility) is recorded **atomically at completion** — never at phase start — and the probe is re-run against the updated diary. When the re-probe is empty, the terminal COMPLETED status is written (after the `before_ingestion_status_completed` gate), with the work phase cleared. An `error` row is never advanced nor resurrected to COMPLETED.
 
 <h2>🛡️ Hardening</h2>
 

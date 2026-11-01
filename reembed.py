@@ -76,6 +76,7 @@ from .hooks import (
 )
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import (
+    compute_tags,
     execute_phase_on_owner,
     get_phases,
     has_live_running_phase,
@@ -1234,7 +1235,10 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
       ``spec.settings_category`` (used only for equality); ``None`` when the
       phase declares no settings category;
     - ``deps``: ``{upstream: <current diary marker>}`` for each upstream in
-      ``spec.depends_on``, copied from the CURRENT diary.
+      ``spec.depends_on``, copied from the CURRENT diary;
+    - ``tag``: the phase's recursive tag from :func:`compute_tags` (own
+      material folded with every dependency's tag), so a later deep change
+      invalidates this entry.
 
     The spec is looked up in the MERGED phase set (:func:`merged_phases`):
     built-in ``PHASES`` plus every ``PhaseSpec`` registered through the
@@ -1301,10 +1305,9 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
 
     tag = ""
     try:
-        for registered in await get_phases(cat if cat is not None else ccat):
-            if registered.id == phase:
-                tag = registered.tag(cat if cat is not None else ccat)
-                break
+        caller = cat if cat is not None else ccat
+        tags = await compute_tags(caller, await get_phases(caller))
+        tag = tags.get(phase, "")
     except Exception as exc:  # noqa: BLE001 - a tag must never break completion
         log.debug(f"Agent id: {ccat._id}. Could not resolve tag for phase {phase}: {exc}")
 

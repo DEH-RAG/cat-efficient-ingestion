@@ -149,7 +149,7 @@ if __name__ == "__main__":
         # The reset entry is stale again -> the machine re-runs it from scratch
         # only AFTER the purge removed its products above.
         assert phases.is_phase_stale(
-            phases.PHASES["parsing_chunking"], {}, None, None
+            phases.PHASES["parsing_chunking"], {}, "current-tag"
         ) is True
         print("PASS (a) expired running lease purges products, resets and re-runs")
 
@@ -168,7 +168,7 @@ if __name__ == "__main__":
         assert reset_log == [], reset_log
         assert phases.is_phase_stale(
             phases.PHASES["parsing_chunking"],
-            doc["completed_phases"], None, None,
+            doc["completed_phases"], "current-tag",
         ) is False, "a live running lease must not be stale"
         assert phases.has_live_running_phase(doc["completed_phases"]) is True
         print("PASS (b) a running entry with a live lease is not touched")

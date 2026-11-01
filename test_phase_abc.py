@@ -48,8 +48,9 @@ if __name__ == "__main__":
         async def delete(self, source, cat):
             self.artifacts.discard("artifact:A")
 
-        def tag(self, cat):
-            return f"{self.id}:{self.config.get('marker')}"
+        async def tag(self, cat, dep_tags):
+            own = f"{self.id}:{self.config.get('marker')}"
+            return phases._compose_tag(own, dep_tags)
 
     class NoDeletePhase(phases.IngestionPhase):
         id = "no_delete"
@@ -60,8 +61,8 @@ if __name__ == "__main__":
         async def process(self, source, cat):
             return phases.PhaseResult(status="done")
 
-        def tag(self, cat):
-            return self.id
+        async def tag(self, cat, dep_tags):
+            return phases._compose_tag(self.id, dep_tags)
 
     class FakeHook:
         def __init__(self, function, plugin_id="fake"):
@@ -127,10 +128,9 @@ if __name__ == "__main__":
         hook_result = await hook_phase.process("doc.txt", None)
         assert class_result == hook_result, (class_result, hook_result)
         assert class_result.status == "done", class_result
-        assert class_phase.tag(None) == hook_phase.tag(None), (
-            class_phase.tag(None),
-            hook_phase.tag(None),
-        )
+        class_tag = await class_phase.tag(None, {})
+        hook_tag = await hook_phase.tag(None, {})
+        assert class_tag == hook_tag, (class_tag, hook_tag)
 
         await class_phase.delete("doc.txt", None)
         await hook_phase.delete("doc.txt", None)
@@ -169,14 +169,14 @@ if __name__ == "__main__":
         hook_phase = phases.HookPhase(
             spec, settings_marker=lambda phase: config["marker"]
         )
-        first = hook_phase.tag(_cat())
-        second = hook_phase.tag(_cat())
+        first = await hook_phase.tag(_cat(), {})
+        second = await hook_phase.tag(_cat(), {})
         assert first == second, (first, second)
 
         config["marker"] = "settings-v2"
-        third = hook_phase.tag(_cat())
+        third = await hook_phase.tag(_cat(), {})
         assert third != first, (first, third)
-        assert first == "legacy_tagged:settings-v1", first
+        assert first != "legacy_tagged:settings-v1", first
         print("PASS (e) tag() is deterministic and changes with the config")
 
     async def _main():

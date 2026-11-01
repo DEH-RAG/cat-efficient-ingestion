@@ -5,26 +5,26 @@ and the accumulator registrant of ``ingestion_phase_pending`` that reports
 which of them are stale for a source, using ONLY content comparison — no
 timestamps are ever used for correctness.
 
-**Clock-free two-level staleness.** A phase's diary entry (see
-``registry.completed_phases``) records the explicit state plus the
-material ``tag`` and ``{"marker", "settings_version", "deps"}``. A phase is
-stale when:
+**Recursive dependency tags.** A phase's diary entry (see
+``registry.completed_phases``) records the explicit state plus a material
+``tag``. The tag is a SHA-256 of the phase's OWN material (its settings
+marker, or a declared ``id:category:deps`` fallback when no marker hook
+resolves) folded with the tags of every dependency in ``spec.depends_on``.
+Because dependencies are resolved first, a change deep in the chain changes
+the tag of every dependent, transitively. ``compute_tags`` performs this
+resolution in dependency order and raises on a cycle.
 
-- (a) **dependency**: any upstream in ``spec.depends_on`` is missing from the
-  diary, or the recorded ``deps[upstream]`` differs from the upstream's
-  current diary ``marker`` (upstream re-ran -> this phase must re-run too);
-- (b) **settings fast-path**: the settings entry for ``spec.settings_category``
-  was NOT rewritten since the phase ran (``settings_version`` equals the
-  current entry's ``updated_at``, used as an OPAQUE token) -> FRESH, no
-  marker comparison needed;
-- (c) **slow-path**: the plugin-defined marker from
-  ``ingestion_phase_settings_marker`` differs from the recorded ``marker``
-  (the settings entry WAS rewritten; the phase-owning plugin decides whether
-  the change is material).
+A phase is stale when:
 
-A missing settings entry means the fast-path cannot apply (no current
-version) and the phase falls to the slow-path with the marker the plugin
-returns — conservatively stale when the marker is unknown.
+- its own entry is absent (pending) or its ``processing`` lease expired;
+- any dependency is absent (pending), ``processing``, ``error`` or
+  ``skipped`` — there is no completed upstream work to consume;
+- the stored ``tag`` differs from the recursively computed current tag, or is
+  missing (legacy entry, stale exactly once until rewritten).
+
+The legacy flat ``settings_version`` field is no longer part of the decision:
+the tag already folds in every material input. The field stays readable on
+old entries only.
 
 **Phase registration.** Every phase is exposed as an
 :class:`IngestionPhase` instance through :func:`get_phases`: the built-ins (as
@@ -64,6 +64,7 @@ data structure and the ``@hook`` decorator — no Redis, no network, no
 filesystem access at import time.
 """
 
+import hashlib
 import inspect
 import json
 from abc import ABC, abstractmethod
@@ -71,14 +72,12 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from cat import hook
-from cat.db.cruds import settings as crud_settings
 from cat.log import log
 
 from .hooks import (
     _accepts_caller,
     execute_hook_compat,
     phase_managers,
-    phase_settings_key,
 )
 from .registry import (
     PHASE_STATE_ERROR,
@@ -158,8 +157,16 @@ class IngestionPhase(ABC):
         """
 
     @abstractmethod
-    def tag(self, cat) -> str:
-        """Deterministic identity of the phase's material configuration."""
+    async def tag(self, cat, dep_tags: dict[str, str]) -> str:
+        """Recursive identity of this phase's material configuration.
+
+        ``dep_tags`` maps every id in :attr:`depends_on` to its already
+        resolved tag. The phase contributes its OWN material (its settings
+        marker, or a declared tag when no marker is resolvable) and folds the
+        dependency tags into it, so a change deep in the chain invalidates
+        every dependent. Async because a plugin may register its marker as a
+        coroutine; the marker itself only reads configuration (no LLM call).
+        """
 
 
 #: The built-in phase DAG. ``parsing_chunking`` depends only on the chunker
@@ -201,8 +208,19 @@ class _BuiltinPhase(IngestionPhase):
             "hook-declared phases."
         )
 
-    def tag(self, cat) -> str:
-        return _declared_tag(self.id, self.settings_category, self.depends_on)
+    async def tag(self, cat, dep_tags: dict[str, str]) -> str:
+        marker = await execute_phase_on_owner(
+            cat,
+            "ingestion_phase_settings_marker",
+            self.id,
+            self.id,
+            default=_MISSING,
+            caller=cat,
+        )
+        own = _own_material(
+            self.id, self.settings_category, self.depends_on, marker
+        )
+        return _compose_tag(own, dep_tags)
 
 
 class ParsingChunkingPhase(_BuiltinPhase):
@@ -263,11 +281,108 @@ _MISSING = object()
 def _declared_tag(phase_id: str, settings_category: str | None, depends_on) -> str:
     """Stable tag from a phase's declared configuration inputs.
 
-    Used when no synchronous material marker can be resolved (the legacy
-    marker hooks are ``async``). Deterministic and dependency-aware; the
-    recursive settings hash is the next todo's job.
+    Used as the phase's OWN material when no material marker can be resolved
+    (a legacy phase with no ``ingestion_phase_settings_marker`` registrant).
+    The dependency tags are folded in later by :func:`_compose_tag`, so even a
+    marker-less phase still propagates upstream changes.
     """
     return f"{phase_id}:{settings_category or '-'}:{','.join(depends_on)}"
+
+
+def _own_material(
+    phase_id: str,
+    settings_category: str | None,
+    depends_on,
+    marker: Any,
+) -> str:
+    """Render the phase's own material: settings marker, or declared tag.
+
+    ``_MISSING`` means "no marker hook resolvable" -> the declared tag; a
+    literal ``None`` marker means "hook present but unknown" -> conservative
+    ``<id>:unknown``; any other value is rendered deterministically.
+    """
+    if marker is _MISSING:
+        return _declared_tag(phase_id, settings_category, depends_on)
+    if marker is None:
+        return f"{phase_id}:unknown"
+    return f"{phase_id}:{_stable_marker(marker)}"
+
+
+def _compose_tag(own_material: str, dep_tags: dict[str, str]) -> str:
+    """Hash one phase's own material together with its dependency tags.
+
+    ``sha256(own_material + "|" + "|".join(f"{dep}={dep_tag}" ...))`` with the
+    dependency ids sorted, so the result is deterministic and a change ANYWHERE
+    upstream changes this tag (and every tag downstream of it).
+    """
+    dep_part = "|".join(
+        f"{dep}={dep_tags[dep]}" for dep in sorted(dep_tags)
+    )
+    return hashlib.sha256(
+        f"{own_material}|{dep_part}".encode("utf-8")
+    ).hexdigest()
+
+
+class PhaseTagCycleError(RuntimeError):
+    """The phase dependency graph contains a cycle."""
+
+
+async def compute_tags(cat, phases) -> dict[str, str]:
+    """Resolve every phase's recursive tag in dependency order.
+
+    Each phase's tag is its own material (settings marker, else declared tag)
+    folded with the TAGS of its dependencies, so a change deep in the chain
+    changes every dependent's tag. Dependencies are resolved depth-first; a
+    phase id that is referenced but absent from ``phases`` contributes only its
+    declared tag (no material marker available).
+
+    Args:
+        cat: the caller passed through to :meth:`IngestionPhase.tag`.
+        phases: iterable of :class:`IngestionPhase` instances (typically from
+            :func:`get_phases`).
+
+    Returns:
+        ``{phase_id: tag}`` for every phase in ``phases``.
+
+    Raises:
+        PhaseTagCycleError: when the dependency graph cycles, naming the cycle.
+    """
+    phase_by_id: dict[str, IngestionPhase] = {}
+    for phase in phases:
+        phase_by_id.setdefault(phase.id, phase)
+
+    resolved: dict[str, str] = {}
+    visiting: list[str] = []
+
+    async def _resolve(phase_id: str) -> str:
+        if phase_id in resolved:
+            return resolved[phase_id]
+        if phase_id in visiting:
+            start = visiting.index(phase_id)
+            cycle = visiting[start:] + [phase_id]
+            raise PhaseTagCycleError(
+                "phase dependency cycle detected: " + " -> ".join(cycle)
+            )
+        phase = phase_by_id.get(phase_id)
+        if phase is None:
+            tag = _compose_tag(_declared_tag(phase_id, None, ()), {})
+            resolved[phase_id] = tag
+            return tag
+        visiting.append(phase_id)
+        try:
+            dep_tags = {
+                dep: await _resolve(dep) for dep in phase.depends_on
+            }
+            tag = await phase.tag(cat, dep_tags)
+            resolved[phase_id] = tag
+            return tag
+        finally:
+            visiting.pop()
+
+    for phase_id in phase_by_id:
+        await _resolve(phase_id)
+    return resolved
+
 
 
 def _stable_marker(marker: Any) -> str:
@@ -318,12 +433,13 @@ def _coerce_phase_result(phase_id: str, result: Any) -> PhaseResult:
     )
 
 
-def _call_sync_legacy_hook(manager, hook_name: str, phase: str, cat):
-    """Call a SYNC legacy hook registrant directly, or return ``_MISSING``.
+async def _call_legacy_hook_async(manager, hook_name: str, phase: str, cat):
+    """Call a legacy marker registrant, awaiting it when it is a coroutine.
 
-    ``tag`` is synchronous by contract, so it cannot await an ``async``
-    marker hook. When the marker registrant on this manager is synchronous it
-    is used verbatim; otherwise the caller falls back to the declared tag.
+    The marker hook only reads configuration (it performs no LLM call), so
+    awaiting it is cheap and deterministic. A plain function is called
+    directly; the first compatible registrant wins. Returns ``_MISSING`` when
+    the manager has no compatible registrant.
     """
     hooks = getattr(manager, "hooks", None)
     registered = hooks.get(hook_name) if isinstance(hooks, dict) else None
@@ -332,12 +448,13 @@ def _call_sync_legacy_hook(manager, hook_name: str, phase: str, cat):
     keyword = getattr(manager, "context_execute_hook", "cat")
     for registered_hook in registered:
         function = getattr(registered_hook, "function", registered_hook)
-        if inspect.iscoroutinefunction(function):
-            continue
         if not _accepts_caller(function, keyword):
             continue
         try:
-            return function(phase, **{keyword: cat})
+            value = function(phase, **{keyword: cat})
+            if inspect.isawaitable(value):
+                value = await value
+            return value
         except Exception as exc:  # noqa: BLE001 - a marker must never break tag()
             log.warning(f"Legacy {hook_name} for phase '{phase}' failed: {exc}")
     return _MISSING
@@ -359,8 +476,10 @@ class HookPhase(IngestionPhase):
     - :meth:`process` maps the legacy status dict to :class:`PhaseResult`;
     - :meth:`delete` calls the purge hook and RAISES when it is absent (or
       when the legacy no-op returns ``None``) — never a silent no-op;
-    - :meth:`tag` uses the settings marker when a synchronous registrant is
-      available, else a deterministic declared tag.
+    - :meth:`tag` reads the settings marker (awaiting it when the registrant
+      is a coroutine) and folds the dependency tags into a recursive hash; when
+      no marker hook resolves it falls back to the declared
+      ``id:category:deps`` material (documented, never silent).
     """
 
     def __init__(
@@ -450,24 +569,26 @@ class HookPhase(IngestionPhase):
                 f"implementation; refusing to delete its artifacts silently"
             )
 
-    def tag(self, cat) -> str:
+    async def tag(self, cat, dep_tags: dict[str, str]) -> str:
         used = cat if cat is not None else self._cat
-        marker = self._resolve_marker(used)
-        if marker is _MISSING:
-            return _declared_tag(self.id, self.settings_category, self.depends_on)
-        if marker is None:
-            return f"{self.id}:unknown"
-        return f"{self.id}:{_stable_marker(marker)}"
+        marker = await self._resolve_marker(used)
+        own = _own_material(
+            self.id, self.settings_category, self.depends_on, marker
+        )
+        return _compose_tag(own, dep_tags)
 
-    def _resolve_marker(self, cat):
+    async def _resolve_marker(self, cat):
         if self._settings_marker is not None:
             try:
-                return self._settings_marker(self.id)
+                value = self._settings_marker(self.id)
+                if inspect.isawaitable(value):
+                    value = await value
+                return value
             except Exception as exc:  # noqa: BLE001 - a marker must never break tag()
                 log.warning(f"Settings marker for phase '{self.id}' failed: {exc}")
                 return _MISSING
         if self._manager is not None:
-            return _call_sync_legacy_hook(
+            return await _call_legacy_hook_async(
                 self._manager, "ingestion_phase_settings_marker", self.id, cat
             )
         return _MISSING
@@ -651,34 +772,31 @@ def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:
 def is_phase_stale(
     spec: PhaseSpec,
     completed_phases: dict[str, Any],
-    current_settings_updated_at: object,
-    current_marker: object,
+    current_tag: object,
 ) -> bool:
     """Decide whether one phase is stale, purely (no I/O).
 
-    Clock-free two-level check over the diary entry of ``spec.id``:
+    Clock-free decision over the diary entry of ``spec.id``:
 
-    - (a) dependency: for each upstream in ``spec.depends_on``, stale when the
-      upstream entry is missing, when ``deps[upstream]`` is missing, or when
-      it differs from the upstream's current diary ``marker``;
-    - (b) settings fast-path: when ``spec.settings_category`` is set AND a
-      current settings version is available, equal ``settings_version`` ->
-      FRESH (the settings entry was not rewritten since the phase ran);
-    - (c) slow-path: the plugin marker — equal to the recorded ``marker`` ->
-      fresh, different -> stale.
+    - the entry's OWN state machine is honoured first: a ``processing`` entry
+      is stale only when its lease expired (a live run is left alone), while
+      ``error`` / ``skipped`` are terminal-non-complete and not stale by
+      themselves;
+    - a dependency that is absent (pending), ``processing``, ``error`` or
+      ``skipped`` makes this phase stale — it cannot have consumed completed
+      upstream work;
+    - the stored ``tag`` (a recursive hash of this phase's own material plus
+      every dependency's tag) must equal ``current_tag``. A MISSING/empty tag
+      is a legacy entry and is stale exactly once (the rewrite stores a tag).
 
-    A missing diary entry (phase never completed) is always stale. A missing
-    current settings version (no settings entry) skips the fast-path and
-    falls to the slow-path — conservative.
+    ``settings_version`` is deliberately NOT consulted: the tag already folds
+    in every material input, so the old flat version comparison is redundant.
+    The field stays readable on legacy entries but never drives the decision.
 
     Args:
         spec: The phase declaration to evaluate.
         completed_phases: The diary dict keyed by phase id.
-        current_settings_updated_at: The current settings entry's
-            ``updated_at`` (opaque token, only ever compared for equality),
-            or None when the settings entry is missing.
-        current_marker: The plugin-defined marker from
-            ``ingestion_phase_settings_marker`` (None = unknown).
+        current_tag: The recursively computed tag for ``spec.id`` now.
 
     Returns:
         True when the phase must be re-run, False when it is fresh.
@@ -687,36 +805,30 @@ def is_phase_stale(
     if not isinstance(entry, dict):
         return True
 
-    # (state machine) A ``processing`` entry is stale only when its lease
-    # expired: an abandoned run must be purged and re-run from scratch, while
-    # a LIVE run (another worker, or this process still inside the phase body)
-    # is left alone. ``error`` / ``skipped`` are terminal-non-complete states:
-    # they are never stale by themselves (the source status carries the error,
-    # and a skipped phase does not apply), while an ABSENT entry is pending and
-    # therefore stale.
     state = phase_state(entry)
     if state == PHASE_STATE_PROCESSING:
         return is_phase_lease_expired(entry)
     if state in (PHASE_STATE_ERROR, PHASE_STATE_SKIPPED):
         return False
 
-    # (a) dependency: upstream marker identity, never timestamps
+    # Dependency state: pending / processing / error / skipped upstreams mean
+    # there is no completed material for this phase to have consumed.
     for upstream in spec.depends_on:
         upstream_entry = completed_phases.get(upstream)
         if not isinstance(upstream_entry, dict):
             return True
-        deps = entry.get("deps")
-        recorded = deps.get(upstream) if isinstance(deps, dict) else None
-        if recorded is None or recorded != upstream_entry.get("marker"):
+        upstream_state = phase_state(upstream_entry)
+        if upstream_state in (
+            PHASE_STATE_PROCESSING,
+            PHASE_STATE_ERROR,
+            PHASE_STATE_SKIPPED,
+        ):
             return True
 
-    # (b) settings fast-path: opaque version equality
-    if spec.settings_category is not None and current_settings_updated_at is not None:
-        if entry.get("settings_version") == current_settings_updated_at:
-            return False
-
-    # (c) slow-path: plugin marker comparison
-    return entry.get("marker") != current_marker
+    stored_tag = entry.get("tag")
+    if not isinstance(stored_tag, str) or not stored_tag:
+        return True
+    return stored_tag != current_tag
 
 
 def has_live_running_phase(completed_phases: Any) -> bool:
@@ -751,17 +863,10 @@ async def ingestion_phase_pending(
     The phases probed are the MERGED set from :func:`merged_phases`: the
     built-in ``PHASES`` plus every ``PhaseSpec`` registered through the
     ``ingestion_phase_specs`` accumulator hook (built-ins win on duplicate
-    ids). For each ``PhaseSpec`` the current inputs are resolved live:
-
-    - ``current_settings_updated_at``: the ``updated_at`` of the settings
-      entry for ``spec.settings_category`` (via ``crud_settings`` — the
-      official CRUD API, no raw Redis), used only as an opaque equality
-      token; a missing settings entry yields None and falls to the slow-path;
-      registered phases with ``settings_category=None`` skip the fast-path
-      entirely (their marker IS the material settings fingerprint);
-    - ``current_marker``: the plugin-defined marker from the
-      ``ingestion_phase_settings_marker`` hook (None = unknown ->
-      conservative stale).
+    ids). The current recursive tags are resolved ONCE per probe with
+    :func:`compute_tags` over :func:`get_phases`; each tag already folds in the
+    phase's settings marker and every dependency's tag, so no separate
+    settings-version or marker read is needed here.
 
     Args:
         pending: list of stale-phase dicts accumulated so far (``None`` is
@@ -781,27 +886,21 @@ async def ingestion_phase_pending(
     cat = cat if cat is not None else lizard
     diary = _diary_from_completed_phases(completed_phases)
 
+    tags: dict[str, str] = {}
+    if cat is not None:
+        try:
+            tags = await compute_tags(cat, await get_phases(cat))
+        except PhaseTagCycleError as exc:
+            log.error(f"Cannot compute phase tags: {exc}")
+            tags = {}
+
     for spec in (await merged_phases(cat, cat)).values():
-        current_settings_updated_at = None
-        current_marker = None
-        if cat is not None:
-            if spec.settings_category is not None:
-                settings_key = phase_settings_key(spec.id, getattr(cat, "agent_key", None))
-                settings_doc = await crud_settings.get_settings_by_category(
-                    settings_key, spec.settings_category
-                )
-                if isinstance(settings_doc, dict):
-                    current_settings_updated_at = settings_doc.get("updated_at")
-            plugin_manager = await phase_owner(cat, spec.id)
-            if plugin_manager is not None:
-                ran_marker, marker = await execute_hook_compat(
-                    plugin_manager,
-                    "ingestion_phase_settings_marker",
-                    spec.id,
-                    caller=cat,
-                )
-                if ran_marker:
-                    current_marker = marker
-        if is_phase_stale(spec, diary, current_settings_updated_at, current_marker):
+        current_tag = tags.get(spec.id)
+        if current_tag is None:
+            current_tag = _compose_tag(
+                _declared_tag(spec.id, spec.settings_category, spec.depends_on),
+                {},
+            )
+        if is_phase_stale(spec, diary, current_tag):
             pending.append({"phase": spec.id})
     return pending
