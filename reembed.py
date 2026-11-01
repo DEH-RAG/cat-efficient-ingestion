@@ -76,6 +76,7 @@ from .hooks import (
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import (
     execute_phase_on_owner,
+    get_phases,
     has_live_running_phase,
     merged_phases,
 )
@@ -1500,6 +1501,18 @@ async def reembed_sources(
     resurrected to COMPLETED.
     """
     log.info(f"Agent id: {ccat._id}. Embedding stored files to the vector memory")
+
+    # Additive registry wiring: list the phases the registry exposes. This is a
+    # DEBUG log only — the dispatch loop below is unchanged and still runs the
+    # legacy flow. A failure here must never affect ingestion.
+    try:
+        registered_phases = await get_phases(caller_cat)
+        log.debug(
+            f"Agent id: {ccat._id}. Registered ingestion phases: "
+            f"{[phase.id for phase in registered_phases]}"
+        )
+    except Exception as exc:  # noqa: BLE001 - a debug listing must never break ingestion
+        log.warning(f"Agent id: {ccat._id}. Could not list ingestion phases: {exc}")
 
     existing_points, _ = await ccat.vector_memory_handler.get_all_tenant_points(
         str(collection_name), with_vectors=False

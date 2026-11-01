@@ -25,13 +25,24 @@ A missing settings entry means the fast-path cannot apply (no current
 version) and the phase falls to the slow-path with the marker the plugin
 returns — conservatively stale when the marker is unknown.
 
-**Phase registration.** External plugins declare their own phases through the
+**Phase registration.** Every phase is exposed as an
+:class:`IngestionPhase` instance through :func:`get_phases`: the built-ins (as
+classes), then the instances a plugin returns from the
+``ingestion_phase_objects`` getter hook, then the legacy ``ingestion_phase_specs``
+declarations wrapped in a :class:`HookPhase` adapter (so an unmigrated plugin
+keeps working). External plugins declare their own legacy phases through the
 ``ingestion_phase_specs`` accumulator hook (see ``hooks.py``);
 :func:`merged_phases` merges the returned ``PhaseSpec`` objects into the
 built-in ``PHASES`` at probe time — built-ins win on duplicate ids — and the
 ``ingestion_phase_pending`` registrant computes staleness for ALL merged
 phases, so a provider only declares a spec + a marker and never re-implements
-staleness.
+staleness. The class API is additive for now: the dispatch loop still runs the
+legacy flow.
+
+**Mandatory cleanup.** :meth:`IngestionPhase.delete` is abstract: a subclass
+without it cannot be instantiated. :class:`HookPhase.delete` calls the legacy
+purge hook and raises :class:`PhaseDeleteError` when the hook is absent (or its
+no-op returns ``None``) — a phase never silently skips cleanup.
 
 **Third-party extension contract.** A plugin exposing a phase must (1) declare
 a dependency on ``cat_efficient_ingestion`` — the FOLDER id with underscores,
@@ -52,13 +63,18 @@ data structure and the ``@hook`` decorator — no Redis, no network, no
 filesystem access at import time.
 """
 
+import inspect
+import json
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from cat import hook
 from cat.db.cruds import settings as crud_settings
+from cat.log import log
 
 from .hooks import (
+    _accepts_caller,
     execute_hook_compat,
     phase_managers,
     phase_settings_key,
@@ -88,6 +104,60 @@ class PhaseSpec:
     depends_on: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PhaseResult:
+    """Outcome of running one phase.
+
+    ``processed`` / ``expected`` are TELEMETRY ONLY: they may be logged or
+    surfaced to an operator, but they are never a completion criterion. A
+    phase is complete because ``status == "done"``, not because a count
+    matches.
+    """
+
+    status: Literal["done", "not_ready", "error", "skipped"]
+    reason: str | None = None
+    processed: int | None = None
+    expected: int | None = None
+
+
+class IngestionPhase(ABC):
+    """One ingestion phase, owning its applicability, work and cleanup.
+
+    Every phase MUST implement all four operations. ``delete`` is deliberately
+    abstract: a phase that cannot clean up its own artifacts would make the
+    recovery path delete data blindly, so it cannot exist. There is no no-op
+    default anywhere — a subclass without ``delete`` raises ``TypeError`` at
+    instantiation time.
+    """
+
+    #: Stable phase id (the diary key, e.g. ``"embedding"``).
+    id: str = ""
+    #: Upstream phase ids this phase consumes.
+    depends_on: tuple[str, ...] = ()
+    #: Settings category whose material configuration feeds :meth:`tag`.
+    settings_category: str | None = None
+
+    @abstractmethod
+    async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
+        """Whether this phase applies, with an optional human-readable reason."""
+
+    @abstractmethod
+    async def process(self, source: str, cat) -> PhaseResult:
+        """Run the phase body for ``source``."""
+
+    @abstractmethod
+    async def delete(self, source: str, cat) -> None:
+        """Delete ONLY the artifacts this phase produced for ``source``.
+
+        Must raise when the phase has no cleanup implementation: a silent
+        no-op would let recovery delete data blindly.
+        """
+
+    @abstractmethod
+    def tag(self, cat) -> str:
+        """Deterministic identity of the phase's material configuration."""
+
+
 #: The built-in phase DAG. ``parsing_chunking`` depends only on the chunker
 #: settings; ``embedding`` depends on the embedder settings AND the recorded
 #: ``parsing_chunking`` marker — so an embedder-only change re-runs only
@@ -98,6 +168,57 @@ PHASES = {
     "parsing_chunking": PhaseSpec("parsing_chunking", "chunker", ()),
     "embedding": PhaseSpec("embedding", "embedder", ("parsing_chunking",)),
 }
+
+
+class _BuiltinPhase(IngestionPhase):
+    """Declarative built-in phase.
+
+    The built-in phase BODIES still live in the legacy ``reembed`` dispatcher
+    (this todo is additive): :meth:`process` / :meth:`delete` are implemented
+    so the ABC contract is complete, but they refuse to run here rather than
+    duplicating the dispatcher's source-scoped logic. Wiring the dispatcher to
+    these methods is the next todo, not this one.
+    """
+
+    async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
+        return True, None
+
+    async def process(self, source: str, cat) -> PhaseResult:
+        raise NotImplementedError(
+            f"Built-in phase '{self.id}' is executed by the legacy reembed "
+            "dispatcher until the dispatch migration; use HookPhase for "
+            "hook-declared phases."
+        )
+
+    async def delete(self, source: str, cat) -> None:
+        raise NotImplementedError(
+            f"Built-in phase '{self.id}' is purged by the legacy reembed "
+            "dispatcher until the dispatch migration; use HookPhase for "
+            "hook-declared phases."
+        )
+
+    def tag(self, cat) -> str:
+        return _declared_tag(self.id, self.settings_category, self.depends_on)
+
+
+class ParsingChunkingPhase(_BuiltinPhase):
+    id = "parsing_chunking"
+    depends_on = ()
+    settings_category = "chunker"
+
+
+class EmbeddingPhase(_BuiltinPhase):
+    id = "embedding"
+    depends_on = ("parsing_chunking",)
+    settings_category = "embedder"
+
+
+#: Built-in phase classes in execution order. ``get_phases`` instantiates them
+#: fresh on every call so callers can never mutate a shared phase object.
+_BUILTIN_PHASE_CLASSES: tuple[type[IngestionPhase], ...] = (
+    ParsingChunkingPhase,
+    EmbeddingPhase,
+)
 
 
 async def _registered_specs(cat) -> list[tuple[PhaseSpec, object]]:
@@ -127,6 +248,265 @@ async def _registered_specs(cat) -> list[tuple[PhaseSpec, object]]:
             if isinstance(spec, PhaseSpec) and spec.id not in seeded:
                 seeded.add(spec.id)
                 collected.append((spec, manager))
+    return collected
+
+
+#: Sentinel distinguishing "no marker hook resolvable" from a marker that is
+#: legitimately ``None`` ("unknown").
+_MISSING = object()
+
+
+def _declared_tag(phase_id: str, settings_category: str | None, depends_on) -> str:
+    """Stable tag from a phase's declared configuration inputs.
+
+    Used when no synchronous material marker can be resolved (the legacy
+    marker hooks are ``async``). Deterministic and dependency-aware; the
+    recursive settings hash is the next todo's job.
+    """
+    return f"{phase_id}:{settings_category or '-'}:{','.join(depends_on)}"
+
+
+def _stable_marker(marker: Any) -> str:
+    """Render a marker deterministically (dicts are sorted by key)."""
+    if isinstance(marker, str):
+        return marker
+    try:
+        return json.dumps(marker, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(marker)
+
+
+def _as_count(value: Any) -> int | None:
+    """Return ``value`` only when it is a genuine integer count (not bool)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _coerce_phase_result(phase_id: str, result: Any) -> PhaseResult:
+    """Normalize a legacy ``ingestion_phase_run`` return into ``PhaseResult``.
+
+    Legacy registrants return a status dict (or the fail-hard ``None``). An
+    unknown/invalid return becomes an explicit ``error`` — never a silent
+    success, mirroring the dispatcher's hard-fail policy.
+    """
+    if isinstance(result, PhaseResult):
+        return result
+    if isinstance(result, dict):
+        status = result.get("status")
+        if status not in ("done", "not_ready", "error", "skipped"):
+            return PhaseResult(
+                status="error",
+                reason=f"phase '{phase_id}' returned invalid status {status!r}",
+            )
+        return PhaseResult(
+            status=status,
+            reason=result.get("reason"),
+            processed=_as_count(result.get("processed")),
+            expected=_as_count(result.get("expected")),
+        )
+    if result is None or result is _MISSING:
+        return PhaseResult(
+            status="error",
+            reason=f"phase '{phase_id}' has no run implementation",
+        )
+    return PhaseResult(
+        status="error",
+        reason=f"phase '{phase_id}' returned {result!r} (expected a status dict)",
+    )
+
+
+def _call_sync_legacy_hook(manager, hook_name: str, phase: str, cat):
+    """Call a SYNC legacy hook registrant directly, or return ``_MISSING``.
+
+    ``tag`` is synchronous by contract, so it cannot await an ``async``
+    marker hook. When the marker registrant on this manager is synchronous it
+    is used verbatim; otherwise the caller falls back to the declared tag.
+    """
+    hooks = getattr(manager, "hooks", None)
+    registered = hooks.get(hook_name) if isinstance(hooks, dict) else None
+    if not registered:
+        return _MISSING
+    keyword = getattr(manager, "context_execute_hook", "cat")
+    for registered_hook in registered:
+        function = getattr(registered_hook, "function", registered_hook)
+        if inspect.iscoroutinefunction(function):
+            continue
+        if not _accepts_caller(function, keyword):
+            continue
+        try:
+            return function(phase, **{keyword: cat})
+        except Exception as exc:  # noqa: BLE001 - a marker must never break tag()
+            log.warning(f"Legacy {hook_name} for phase '{phase}' failed: {exc}")
+    return _MISSING
+
+
+class PhaseDeleteError(RuntimeError):
+    """A phase has no delete/purge implementation: refuse to delete blindly."""
+
+
+class HookPhase(IngestionPhase):
+    """Adapter keeping one legacy hook-declared phase working.
+
+    Wraps a single :class:`PhaseSpec` plus the legacy hooks
+    (``ingestion_phase_run``, ``ingestion_phase_settings_marker``,
+    ``ingestion_phase_purge``). Legacy behaviour is preserved:
+
+    - :meth:`applies_to` is ``(True, None)`` (legacy phases were always
+      considered applicable);
+    - :meth:`process` maps the legacy status dict to :class:`PhaseResult`;
+    - :meth:`delete` calls the purge hook and RAISES when it is absent (or
+      when the legacy no-op returns ``None``) — never a silent no-op;
+    - :meth:`tag` uses the settings marker when a synchronous registrant is
+      available, else a deterministic declared tag.
+    """
+
+    def __init__(
+        self,
+        spec: PhaseSpec,
+        *,
+        cat=None,
+        manager=None,
+        run_hook=None,
+        purge_hook=None,
+        settings_marker=None,
+    ):
+        self.spec = spec
+        self.id = spec.id
+        self.depends_on = tuple(spec.depends_on)
+        self.settings_category = spec.settings_category
+        self._cat = cat
+        self._manager = manager
+        self._run_hook = run_hook
+        self._purge_hook = purge_hook
+        self._settings_marker = settings_marker
+
+    async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
+        return True, None
+
+    async def process(self, source: str, cat) -> PhaseResult:
+        used = cat if cat is not None else self._cat
+        if self._run_hook is not None:
+            result = self._run_hook(self.id, source, [], used)
+            if inspect.isawaitable(result):
+                result = await result
+        elif self._manager is not None:
+            ran, result = await execute_hook_compat(
+                self._manager,
+                "ingestion_phase_run",
+                self.id,
+                self.id,
+                source,
+                [],
+                caller=used,
+            )
+            if not ran:
+                result = None
+        else:
+            result = await execute_phase_on_owner(
+                used,
+                "ingestion_phase_run",
+                self.id,
+                self.id,
+                source,
+                [],
+                default=_MISSING,
+                caller=used,
+            )
+        return _coerce_phase_result(self.id, result)
+
+    async def delete(self, source: str, cat) -> None:
+        used = cat if cat is not None else self._cat
+        if self._purge_hook is not None:
+            result = self._purge_hook(self.id, source, used)
+            if inspect.isawaitable(result):
+                result = await result
+        elif self._manager is not None:
+            ran, result = await execute_hook_compat(
+                self._manager,
+                "ingestion_phase_purge",
+                self.id,
+                self.id,
+                source,
+                caller=used,
+            )
+            if not ran:
+                result = None
+        else:
+            result = await execute_phase_on_owner(
+                used,
+                "ingestion_phase_purge",
+                self.id,
+                self.id,
+                source,
+                default=_MISSING,
+                caller=used,
+            )
+        if result is None or result is _MISSING:
+            raise PhaseDeleteError(
+                f"Ingestion phase '{self.id}' has no delete/purge "
+                f"implementation; refusing to delete its artifacts silently"
+            )
+
+    def tag(self, cat) -> str:
+        used = cat if cat is not None else self._cat
+        marker = self._resolve_marker(used)
+        if marker is _MISSING:
+            return _declared_tag(self.id, self.settings_category, self.depends_on)
+        if marker is None:
+            return f"{self.id}:unknown"
+        return f"{self.id}:{_stable_marker(marker)}"
+
+    def _resolve_marker(self, cat):
+        if self._settings_marker is not None:
+            try:
+                return self._settings_marker(self.id)
+            except Exception as exc:  # noqa: BLE001 - a marker must never break tag()
+                log.warning(f"Settings marker for phase '{self.id}' failed: {exc}")
+                return _MISSING
+        if self._manager is not None:
+            return _call_sync_legacy_hook(
+                self._manager, "ingestion_phase_settings_marker", self.id, cat
+            )
+        return _MISSING
+
+
+async def _plugin_phase_objects(cat) -> list[IngestionPhase]:
+    """Collect phase instances contributed through ``ingestion_phase_objects``.
+
+    The hook is a getter (``ingestion_phase_objects(cat) -> list``), not an
+    accumulator: every registrant on every manager is called and its returned
+    list is merged, so two plugins can both contribute without clobbering each
+    other. Non-list / non-``IngestionPhase`` output is skipped, never raised
+    on.
+    """
+    if cat is None:
+        return []
+    collected: list[IngestionPhase] = []
+    for manager in phase_managers(cat):
+        hooks = getattr(manager, "hooks", None)
+        registered = (
+            hooks.get("ingestion_phase_objects") if isinstance(hooks, dict) else None
+        )
+        if not registered:
+            continue
+        keyword = getattr(manager, "context_execute_hook", "cat")
+        for registered_hook in registered:
+            function = getattr(registered_hook, "function", registered_hook)
+            if not _accepts_caller(function, keyword):
+                continue
+            try:
+                value = function(**{keyword: cat})
+                if inspect.isawaitable(value):
+                    value = await value
+            except Exception as exc:  # noqa: BLE001 - one bad plugin must not break the registry
+                plugin_id = getattr(registered_hook, "plugin_id", None) or "?"
+                log.error(
+                    f"Error in plugin {plugin_id}::ingestion_phase_objects: {exc}"
+                )
+                continue
+            if isinstance(value, list):
+                collected.extend(
+                    phase for phase in value if isinstance(phase, IngestionPhase)
+                )
     return collected
 
 
@@ -203,6 +583,36 @@ async def merged_phases(ccat, cat) -> dict[str, PhaseSpec]:
         if spec.id not in merged:
             merged[spec.id] = spec
     return merged
+
+
+async def get_phases(cat) -> list[IngestionPhase]:
+    """Return every ingestion phase as an :class:`IngestionPhase` instance.
+
+    Order: the built-in phases (as classes, in execution order), then the
+    instances contributed by plugins through the ``ingestion_phase_objects``
+    hook, then the legacy ``ingestion_phase_specs`` declarations wrapped in a
+    :class:`HookPhase` adapter. Built-ins win on duplicate ids; a phase id is
+    returned exactly once.
+
+    ``cat`` may be ``None`` (unit tests / bootstrap): only the built-ins are
+    returned. This is purely additive — the dispatch loop still runs the
+    legacy flow; the registry is consumed only where a debug listing is safe.
+    """
+    phases: list[IngestionPhase] = [cls() for cls in _BUILTIN_PHASE_CLASSES]
+    seeded = {phase.id for phase in phases}
+
+    for phase in await _plugin_phase_objects(cat):
+        if phase.id in seeded:
+            continue
+        seeded.add(phase.id)
+        phases.append(phase)
+
+    for spec, manager in await _registered_specs(cat):
+        if spec.id in seeded:
+            continue
+        seeded.add(spec.id)
+        phases.append(HookPhase(spec, cat=cat, manager=manager))
+    return phases
 
 
 def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:

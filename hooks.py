@@ -505,3 +505,22 @@ def ingestion_phase_specs(specs, cat=None, lizard=None) -> list:
         The extended ``specs`` list.
     """
     return specs
+
+
+@hook(priority=0)
+def ingestion_phase_objects(cat=None, lizard=None) -> list:
+    """Return the phase INSTANCES a plugin contributes to the registry.
+
+    Unlike ``ingestion_phase_specs`` (an accumulator of declarations), this is
+    a getter: each registrant returns its OWN list of ``IngestionPhase``
+    instances and the registry merges every manager's result. The default is an
+    empty list, so a plugin that only declares a spec keeps working through the
+    ``HookPhase`` adapter.
+
+    Args:
+        cat: the CheshireCat instance (may be ``None`` in unit tests).
+
+    Returns:
+        The list of ``IngestionPhase`` instances contributed by this plugin.
+    """
+    return []
