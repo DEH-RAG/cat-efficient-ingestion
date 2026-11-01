@@ -180,7 +180,7 @@ them:
    `Document`s, so it must run **before** any vector wipe. Until entities
    carry their own source locator, removing the vectors first would leave the
    purge with nothing to walk from.
-3. **Commit `3d433197` in the MyGRAPH repository.** That commit carries phase
+3. **Commit `3d433197` in the cat-efficient-ingestion repository.** That commit carries phase
    3's message but is a real refactor: it extracted the tag resolver. It is
    present on the remote and was not rewritten. Read it as a refactor, not as
    the phase-3 behaviour change its message describes.
