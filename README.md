@@ -28,15 +28,18 @@ completed_phases: {phase: {"tag": str,
                            "marker": Any, "deps": {upstream_phase: upstream_marker}}}
 ```
 
-- `tag` is a **recursive** SHA-256 of the phase's own material (its settings marker, or a declared `id:category:deps` fallback) folded with the tag of every phase in `depends_on`;
+- `tag` is a **recursive** SHA-256: the phase's own tag is `sha256(kind + ":" + canonical_json(relevant_settings))`, then folded with the tag of every phase in `depends_on`;
 - `marker` is the plugin-defined marker of the settings the phase ran with (kept for compatibility/readability);
 - `deps` maps each upstream phase to the marker it ran with (kept for compatibility/readability).
 
-`compute_tags(cat, phases)` resolves the tags in dependency order. For each phase:
+`compute_tags(cat, phases)` resolves each phase's material configuration and delegates to `phase_tag_resolver.resolve_tags(settings, phases)`, which walks the graph in dependency order. For each phase:
 
 ```
-tag = sha256(own_material + "|" + "|".join(f"{dep}={dep_tag}" for dep in sorted(depends_on)))
+own_tag  = sha256(kind + ":" + canonical_json(relevant_settings))
+tag      = sha256(own_tag + "|" + "|".join(f"{dep}={dep_tag}" for dep in sorted(depends_on)))
 ```
+
+`relevant_settings` is the whole settings value unless the phase declares a `settings_check`: a key collection keeps only those keys, while a (possibly async) callable returns the value that participates. Tag computation reads configuration only — never an LLM call.
 
 Because dependencies are resolved first, **any change deep in the chain changes every dependent's tag**, transitively. A cycle raises `PhaseTagCycleError` naming the cycle. The legacy flat `settings_version` field remains readable on old entries but is **not** part of the decision.
 
@@ -72,8 +75,9 @@ External plugins can declare their own ingestion phases without touching the Eff
 A `PhaseSpec` declares three things:
 
 - `id` — the phase id (also the diary key);
-- `settings_category` — the settings category the phase's material marker is read from, or `None` for phases with no settings entry (marker-only invalidation; the declared `id:category:deps` string is the fallback own material);
-- `depends_on` — upstream phase ids whose tags this phase folds into its own tag.
+- `settings_category` — the settings category the phase's material marker is read from, or `None` for phases with no settings entry (the declared `id:category:deps` string is the fallback own material);
+- `depends_on` — upstream phase ids whose tags this phase folds into its own tag;
+- `settings_check` — optional narrowing of the settings that feed the phase's own tag: a key collection keeps only those keys, a (possibly async) callable returns the value that participates; omitted/`None` uses the whole settings value.
 
 A provider only declares a spec + a marker + an execution hook:
 

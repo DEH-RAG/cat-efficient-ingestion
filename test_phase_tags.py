@@ -1,13 +1,14 @@
 """Standalone, import-safe tests for recursive phase tags.
 
 Covers the recursive-tag contract of the phase machine:
-  (a) the same configuration yields identical tags across two computations;
+  (a) the same configuration yields identical tags across two resolutions;
   (b) changing a DEEP dependency's config changes the dependent's tag;
   (c) changing an unrelated phase's config does not change the target tag;
-  (d) a dependency cycle raises an error naming the cycle;
+  (d) a dependency cycle raises, naming the cycle;
   (e) a legacy entry without a tag is stale exactly once, then stable after
       the rewrite;
-  (f) an async marker hook is awaited and its value participates in the tag.
+  (f) an async ``settings_check`` is awaited and its value participates in
+      the tag.
 
 The CAT plugin loader imports EVERY ``.py`` under a plugin folder at
 activation, so the whole file is inert on import: every import, class and test
@@ -20,76 +21,68 @@ host repository (the plugin is symlinked under ``cat/core_plugins``):
 
 if __name__ == "__main__":
     import asyncio
-    import hashlib
     import sys
-    import types
 
-    from cat.core_plugins.cat_efficient_ingestion import phases
+    from cat.core_plugins.cat_efficient_ingestion import phase_tag_resolver, phases
 
-    class FakeHook:
-        def __init__(self, function, plugin_id="fake"):
-            self.function = function
-            self.plugin_id = plugin_id
+    class TagPhase(phases.IngestionPhase):
+        """Minimal phase: inherits the concrete ``tag`` from the ABC."""
 
-    class FakeManager:
-        context_execute_hook = "cat"
+        def __init__(self, phase_id, depends_on=(), settings_check=None):
+            self.id = phase_id
+            self.depends_on = tuple(depends_on)
+            self.settings_check = settings_check
 
-        def __init__(self, hooks=None):
-            self.hooks = hooks or {}
+        async def applies_to(self, cat, deps_state):
+            return True, None
 
-    def _cat(manager=None):
-        if manager is None:
-            return types.SimpleNamespace()
-        return types.SimpleNamespace(plugin_manager=manager)
+        async def process(self, source, cat):
+            return phases.PhaseResult(status="done")
 
-    def _phase(phase_id, depends_on=(), marker=None, config=None, manager=None):
-        spec = phases.PhaseSpec(phase_id, None, tuple(depends_on))
-        if manager is not None:
-            return phases.HookPhase(spec, cat=_cat(manager), manager=manager)
-        return phases.HookPhase(
-            spec,
-            settings_marker=lambda _pid: config[phase_id] if config is not None else marker,
-        )
+        async def delete(self, source, cat):
+            return None
 
     async def test_a_same_config_same_tags():
-        config = {"a": "A1", "b": "B1", "c": "C1"}
+        settings = {"a": {"model": "m1"}, "b": {"k": 1}, "c": {"k": 2}}
         phases_list = [
-            _phase("a", config=config),
-            _phase("b", ("a",), config=config),
-            _phase("c", ("b",), config=config),
+            TagPhase("a"),
+            TagPhase("b", ("a",)),
+            TagPhase("c", ("b",)),
         ]
-        first = await phases.compute_tags(_cat(), phases_list)
-        second = await phases.compute_tags(_cat(), phases_list)
+        first = await phase_tag_resolver.resolve_tags(settings, phases_list)
+        second = await phase_tag_resolver.resolve_tags(settings, phases_list)
         assert first == second, (first, second)
         assert set(first) == {"a", "b", "c"}, first
         print("PASS (a) identical config gives identical tags")
 
     async def test_b_deep_dependency_change_propagates():
-        config = {"a": "A1", "b": "B1", "c": "C1"}
+        settings = {"a": {"model": "m1"}, "b": {"k": 1}, "c": {"k": 2}}
         phases_list = [
-            _phase("a", config=config),
-            _phase("b", ("a",), config=config),
-            _phase("c", ("b",), config=config),
+            TagPhase("a"),
+            TagPhase("b", ("a",)),
+            TagPhase("c", ("b",)),
         ]
-        before = await phases.compute_tags(_cat(), phases_list)
-        config["a"] = "A2"
-        after = await phases.compute_tags(_cat(), phases_list)
+        before = await phase_tag_resolver.resolve_tags(settings, phases_list)
+        settings["a"] = {"model": "m2"}
+        after = await phase_tag_resolver.resolve_tags(settings, phases_list)
         assert after["a"] != before["a"], (before, after)
         assert after["b"] != before["b"], "direct dependent did not change"
         assert after["c"] != before["c"], "deep dependent did not change"
         print("PASS (b) a deep dependency change invalidates the whole chain")
 
     async def test_c_unrelated_phase_change_does_not_propagate():
-        config = {"a": "A1", "b": "B1", "c": "C1", "x": "X1"}
+        settings = {
+            "a": {"model": "m1"}, "b": {"k": 1}, "c": {"k": 2}, "x": {"k": 9},
+        }
         phases_list = [
-            _phase("a", config=config),
-            _phase("b", ("a",), config=config),
-            _phase("c", ("b",), config=config),
-            _phase("x", config=config),
+            TagPhase("a"),
+            TagPhase("b", ("a",)),
+            TagPhase("c", ("b",)),
+            TagPhase("x"),
         ]
-        before = await phases.compute_tags(_cat(), phases_list)
-        config["x"] = "X2"
-        after = await phases.compute_tags(_cat(), phases_list)
+        before = await phase_tag_resolver.resolve_tags(settings, phases_list)
+        settings["x"] = {"k": 10}
+        after = await phase_tag_resolver.resolve_tags(settings, phases_list)
         assert after["x"] != before["x"], (before, after)
         assert after["a"] == before["a"], (before, after)
         assert after["b"] == before["b"], (before, after)
@@ -97,14 +90,11 @@ if __name__ == "__main__":
         print("PASS (c) an unrelated phase change leaves the target tag alone")
 
     async def test_d_cycle_raises_naming_the_cycle():
-        config = {"a": "A1", "b": "B1"}
-        phases_list = [
-            _phase("a", ("b",), config=config),
-            _phase("b", ("a",), config=config),
-        ]
+        settings = {"a": {}, "b": {}}
+        phases_list = [TagPhase("a", ("b",)), TagPhase("b", ("a",))]
         try:
-            await phases.compute_tags(_cat(), phases_list)
-        except phases.PhaseTagCycleError as exc:
+            await phase_tag_resolver.resolve_tags(settings, phases_list)
+        except phase_tag_resolver.PhaseTagCycleError as exc:
             message = str(exc)
             assert "cycle" in message.lower(), message
             assert "a" in message and "b" in message, message
@@ -115,31 +105,45 @@ if __name__ == "__main__":
 
     async def test_e_legacy_entry_is_stale_once_then_stable():
         spec = phases.PhaseSpec("a", None, ())
-        current_tag = phases._compose_tag(
-            phases._declared_tag("a", None, ()), {}
-        )
+        current_tag = (
+            await phase_tag_resolver.resolve_tags(
+                {"a": {"model": "m1"}}, [TagPhase("a")]
+            )
+        )["a"]
         legacy = {"state": "complete"}
         assert phases.is_phase_stale(spec, {"a": legacy}, current_tag) is True
         legacy["tag"] = current_tag
         assert phases.is_phase_stale(spec, {"a": legacy}, current_tag) is False
         print("PASS (e) a legacy entry is stale once, then stable after rewrite")
 
-    async def test_f_async_marker_hook_is_awaited():
+    async def test_f_async_settings_check_is_awaited():
         awaited = []
 
-        async def marker(phase, cat=None):
-            awaited.append(phase)
-            return "async-marker-v1"
+        async def check(settings):
+            awaited.append(settings.get("model"))
+            return {"model": settings.get("model")}
 
-        manager = FakeManager(
-            {"ingestion_phase_settings_marker": [FakeHook(marker)]}
-        )
-        phase = _phase("a", manager=manager)
-        tag = await phase.tag(_cat(manager), {})
-        expected = hashlib.sha256(b"a:async-marker-v1|").hexdigest()
-        assert awaited == ["a"], awaited
-        assert tag == expected, (tag, expected)
-        print("PASS (f) an async marker hook is awaited and folds into the tag")
+        phase = TagPhase("a", settings_check=check)
+        first = (
+            await phase_tag_resolver.resolve_tags(
+                {"a": {"model": "m1", "noise": 1}}, [phase]
+            )
+        )["a"]
+        assert awaited == ["m1"], awaited
+        second = (
+            await phase_tag_resolver.resolve_tags(
+                {"a": {"model": "m2", "noise": 1}}, [phase]
+            )
+        )["a"]
+        assert first != second, (first, second)
+        # An unrelated field is filtered out by settings_check -> same tag.
+        third = (
+            await phase_tag_resolver.resolve_tags(
+                {"a": {"model": "m1", "noise": 2}}, [phase]
+            )
+        )["a"]
+        assert third == first, (first, third)
+        print("PASS (f) an async settings_check is awaited and folds into the tag")
 
     async def _main():
         await test_a_same_config_same_tags()
@@ -147,7 +151,7 @@ if __name__ == "__main__":
         await test_c_unrelated_phase_change_does_not_propagate()
         await test_d_cycle_raises_naming_the_cycle()
         await test_e_legacy_entry_is_stale_once_then_stable()
-        await test_f_async_marker_hook_is_awaited()
+        await test_f_async_settings_check_is_awaited()
 
     try:
         asyncio.run(_main())

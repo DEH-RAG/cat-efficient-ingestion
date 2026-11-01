@@ -64,9 +64,7 @@ data structure and the ``@hook`` decorator — no Redis, no network, no
 filesystem access at import time.
 """
 
-import hashlib
 import inspect
-import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -78,6 +76,14 @@ from .hooks import (
     _accepts_caller,
     execute_hook_compat,
     phase_managers,
+)
+from .phase_tag_resolver import (
+    PhaseTagCycleError,
+    PhaseTagError,
+    compose_tag,
+    own_tag,
+    relevant_settings,
+    resolve_tags,
 )
 from .registry import (
     PHASE_STATE_ERROR,
@@ -100,11 +106,16 @@ class PhaseSpec:
             for phases with no settings entry (marker-only invalidation).
         depends_on: Upstream phase ids whose recorded markers this phase
             consumed; a change in any upstream marker makes this phase stale.
+        settings_check: Optional narrowing of the settings that feed
+            :meth:`IngestionPhase.tag`: a key collection keeps only those
+            keys, a (possibly async) callable returns the value that
+            participates. ``None`` means the whole settings value.
     """
 
     id: str
     settings_category: str | None
     depends_on: tuple[str, ...]
+    settings_check: Any = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,14 @@ class IngestionPhase(ABC):
     depends_on: tuple[str, ...] = ()
     #: Settings category whose material configuration feeds :meth:`tag`.
     settings_category: str | None = None
+    #: Optional narrowing of the settings that feed :meth:`tag` (see
+    #: :class:`PhaseSpec`). ``None`` uses the whole settings value.
+    settings_check: Any = None
+
+    @property
+    def name(self) -> str:
+        """Stable phase name (alias of :attr:`id`)."""
+        return self.id
 
     @abstractmethod
     async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
@@ -156,17 +175,20 @@ class IngestionPhase(ABC):
         no-op would let recovery delete data blindly.
         """
 
-    @abstractmethod
-    async def tag(self, cat, dep_tags: dict[str, str]) -> str:
-        """Recursive identity of this phase's material configuration.
+    async def tag(self, settings: Any = None) -> str:
+        """Detached identity of this phase's OWN material configuration.
 
-        ``dep_tags`` maps every id in :attr:`depends_on` to its already
-        resolved tag. The phase contributes its OWN material (its settings
-        marker, or a declared tag when no marker is resolvable) and folds the
-        dependency tags into it, so a change deep in the chain invalidates
-        every dependent. Async because a plugin may register its marker as a
-        coroutine; the marker itself only reads configuration (no LLM call).
+        ``sha256(kind + ":" + canonical_json(relevant_settings))`` where
+        ``relevant_settings`` is ``settings_check``-narrowed when declared,
+        else the whole ``settings`` value. Async because a declared
+        ``settings_check`` may be a coroutine. Only configuration is read —
+        never an LLM call. Folding in dependency tags is
+        :func:`phase_tag_resolver.resolve_tags`' job.
         """
+        relevant = await relevant_settings(
+            {} if settings is None else settings, self.settings_check
+        )
+        return own_tag(self.id, relevant)
 
 
 #: The built-in phase DAG. ``parsing_chunking`` depends only on the chunker
@@ -207,21 +229,6 @@ class _BuiltinPhase(IngestionPhase):
             "dispatcher until the dispatch migration; use HookPhase for "
             "hook-declared phases."
         )
-
-    async def tag(self, cat, dep_tags: dict[str, str]) -> str:
-        marker = await execute_phase_on_owner(
-            cat,
-            "ingestion_phase_settings_marker",
-            self.id,
-            self.id,
-            default=_MISSING,
-            caller=cat,
-        )
-        own = _own_material(
-            self.id, self.settings_category, self.depends_on, marker
-        )
-        return _compose_tag(own, dep_tags)
-
 
 class ParsingChunkingPhase(_BuiltinPhase):
     id = "parsing_chunking"
@@ -279,120 +286,60 @@ _MISSING = object()
 
 
 def _declared_tag(phase_id: str, settings_category: str | None, depends_on) -> str:
-    """Stable tag from a phase's declared configuration inputs.
-
-    Used as the phase's OWN material when no material marker can be resolved
-    (a legacy phase with no ``ingestion_phase_settings_marker`` registrant).
-    The dependency tags are folded in later by :func:`_compose_tag`, so even a
-    marker-less phase still propagates upstream changes.
-    """
+    """Fallback material for a phase with no resolvable settings marker."""
     return f"{phase_id}:{settings_category or '-'}:{','.join(depends_on)}"
 
 
-def _own_material(
-    phase_id: str,
-    settings_category: str | None,
-    depends_on,
-    marker: Any,
-) -> str:
-    """Render the phase's own material: settings marker, or declared tag.
+async def _material_settings(cat, phase) -> Any:
+    """Resolve the settings value handed to ``phase.tag`` for this run.
 
-    ``_MISSING`` means "no marker hook resolvable" -> the declared tag; a
-    literal ``None`` marker means "hook present but unknown" -> conservative
-    ``<id>:unknown``; any other value is rendered deterministically.
+    A HookPhase with an in-instance ``settings_marker`` resolves its own marker
+    in :meth:`HookPhase.tag`; here it gets ``{}``. For every other phase the
+    material settings marker is the configuration fingerprint: the same
+    configuration-only value the marker hook produces (no LLM call). A missing
+    marker falls back to the declared tag, and an unknown marker to an explicit
+    ``<id>:unknown`` sentinel, so a phase never silently hashes nothing.
     """
-    if marker is _MISSING:
-        return _declared_tag(phase_id, settings_category, depends_on)
-    if marker is None:
-        return f"{phase_id}:unknown"
-    return f"{phase_id}:{_stable_marker(marker)}"
-
-
-def _compose_tag(own_material: str, dep_tags: dict[str, str]) -> str:
-    """Hash one phase's own material together with its dependency tags.
-
-    ``sha256(own_material + "|" + "|".join(f"{dep}={dep_tag}" ...))`` with the
-    dependency ids sorted, so the result is deterministic and a change ANYWHERE
-    upstream changes this tag (and every tag downstream of it).
-    """
-    dep_part = "|".join(
-        f"{dep}={dep_tags[dep]}" for dep in sorted(dep_tags)
+    if getattr(phase, "_settings_marker", None) is not None:
+        return {}
+    if cat is None:
+        return _declared_tag(
+            phase.id, getattr(phase, "settings_category", None), phase.depends_on
+        )
+    marker = await execute_phase_on_owner(
+        cat,
+        "ingestion_phase_settings_marker",
+        phase.id,
+        phase.id,
+        default=_MISSING,
+        caller=cat,
     )
-    return hashlib.sha256(
-        f"{own_material}|{dep_part}".encode("utf-8")
-    ).hexdigest()
-
-
-class PhaseTagCycleError(RuntimeError):
-    """The phase dependency graph contains a cycle."""
+    if marker is _MISSING:
+        return _declared_tag(
+            phase.id, getattr(phase, "settings_category", None), phase.depends_on
+        )
+    if marker is None:
+        return f"{phase.id}:unknown"
+    return marker
 
 
 async def compute_tags(cat, phases) -> dict[str, str]:
     """Resolve every phase's recursive tag in dependency order.
 
-    Each phase's tag is its own material (settings marker, else declared tag)
-    folded with the TAGS of its dependencies, so a change deep in the chain
-    changes every dependent's tag. Dependencies are resolved depth-first; a
-    phase id that is referenced but absent from ``phases`` contributes only its
-    declared tag (no material marker available).
-
-    Args:
-        cat: the caller passed through to :meth:`IngestionPhase.tag`.
-        phases: iterable of :class:`IngestionPhase` instances (typically from
-            :func:`get_phases`).
-
-    Returns:
-        ``{phase_id: tag}`` for every phase in ``phases``.
+    Reads each phase's material configuration ONCE (the marker hook, or the
+    declared fallback) and delegates the dependency fold to
+    :func:`phase_tag_resolver.resolve_tags`. A change deep in the chain changes
+    every dependent's tag.
 
     Raises:
         PhaseTagCycleError: when the dependency graph cycles, naming the cycle.
+        PhaseTagError: when a dependency is not declared.
     """
-    phase_by_id: dict[str, IngestionPhase] = {}
-    for phase in phases:
-        phase_by_id.setdefault(phase.id, phase)
-
-    resolved: dict[str, str] = {}
-    visiting: list[str] = []
-
-    async def _resolve(phase_id: str) -> str:
-        if phase_id in resolved:
-            return resolved[phase_id]
-        if phase_id in visiting:
-            start = visiting.index(phase_id)
-            cycle = visiting[start:] + [phase_id]
-            raise PhaseTagCycleError(
-                "phase dependency cycle detected: " + " -> ".join(cycle)
-            )
-        phase = phase_by_id.get(phase_id)
-        if phase is None:
-            tag = _compose_tag(_declared_tag(phase_id, None, ()), {})
-            resolved[phase_id] = tag
-            return tag
-        visiting.append(phase_id)
-        try:
-            dep_tags = {
-                dep: await _resolve(dep) for dep in phase.depends_on
-            }
-            tag = await phase.tag(cat, dep_tags)
-            resolved[phase_id] = tag
-            return tag
-        finally:
-            visiting.pop()
-
-    for phase_id in phase_by_id:
-        await _resolve(phase_id)
-    return resolved
-
-
-
-def _stable_marker(marker: Any) -> str:
-    """Render a marker deterministically (dicts are sorted by key)."""
-    if isinstance(marker, str):
-        return marker
-    try:
-        return json.dumps(marker, sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        return str(marker)
+    phase_list = list(phases)
+    settings = {
+        phase.id: await _material_settings(cat, phase) for phase in phase_list
+    }
+    return await resolve_tags(settings, phase_list)
 
 
 def _as_count(value: Any) -> int | None:
@@ -496,6 +443,7 @@ class HookPhase(IngestionPhase):
         self.id = spec.id
         self.depends_on = tuple(spec.depends_on)
         self.settings_category = spec.settings_category
+        self.settings_check = getattr(spec, "settings_check", None)
         self._cat = cat
         self._manager = manager
         self._run_hook = run_hook
@@ -569,13 +517,18 @@ class HookPhase(IngestionPhase):
                 f"implementation; refusing to delete its artifacts silently"
             )
 
-    async def tag(self, cat, dep_tags: dict[str, str]) -> str:
-        used = cat if cat is not None else self._cat
-        marker = await self._resolve_marker(used)
-        own = _own_material(
-            self.id, self.settings_category, self.depends_on, marker
-        )
-        return _compose_tag(own, dep_tags)
+    async def tag(self, settings: Any = None) -> str:
+        if self._settings_marker is not None:
+            marker = await self._resolve_marker(self._cat)
+            if marker is _MISSING:
+                settings = _declared_tag(
+                    self.id, self.settings_category, self.depends_on
+                )
+            elif marker is None:
+                settings = f"{self.id}:unknown"
+            else:
+                settings = marker
+        return await super().tag(settings)
 
     async def _resolve_marker(self, cat):
         if self._settings_marker is not None:
@@ -890,15 +843,21 @@ async def ingestion_phase_pending(
     if cat is not None:
         try:
             tags = await compute_tags(cat, await get_phases(cat))
-        except PhaseTagCycleError as exc:
+        except PhaseTagError as exc:
             log.error(f"Cannot compute phase tags: {exc}")
             tags = {}
 
     for spec in (await merged_phases(cat, cat)).values():
         current_tag = tags.get(spec.id)
         if current_tag is None:
-            current_tag = _compose_tag(
-                _declared_tag(spec.id, spec.settings_category, spec.depends_on),
+            current_tag = compose_tag(
+                own_tag(
+                    spec.id,
+                    _declared_tag(
+                        spec.id, spec.settings_category, spec.depends_on
+                    ),
+                ),
+                (),
                 {},
             )
         if is_phase_stale(spec, diary, current_tag):

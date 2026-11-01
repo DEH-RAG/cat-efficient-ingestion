@@ -48,9 +48,8 @@ if __name__ == "__main__":
         async def delete(self, source, cat):
             self.artifacts.discard("artifact:A")
 
-        async def tag(self, cat, dep_tags):
-            own = f"{self.id}:{self.config.get('marker')}"
-            return phases._compose_tag(own, dep_tags)
+        async def tag(self, settings=None):
+            return phases.own_tag(self.id, self.config.get("marker"))
 
     class NoDeletePhase(phases.IngestionPhase):
         id = "no_delete"
@@ -60,9 +59,6 @@ if __name__ == "__main__":
 
         async def process(self, source, cat):
             return phases.PhaseResult(status="done")
-
-        async def tag(self, cat, dep_tags):
-            return phases._compose_tag(self.id, dep_tags)
 
     class FakeHook:
         def __init__(self, function, plugin_id="fake"):
@@ -128,8 +124,8 @@ if __name__ == "__main__":
         hook_result = await hook_phase.process("doc.txt", None)
         assert class_result == hook_result, (class_result, hook_result)
         assert class_result.status == "done", class_result
-        class_tag = await class_phase.tag(None, {})
-        hook_tag = await hook_phase.tag(None, {})
+        class_tag = await class_phase.tag(None)
+        hook_tag = await hook_phase.tag()
         assert class_tag == hook_tag, (class_tag, hook_tag)
 
         await class_phase.delete("doc.txt", None)
@@ -169,12 +165,12 @@ if __name__ == "__main__":
         hook_phase = phases.HookPhase(
             spec, settings_marker=lambda phase: config["marker"]
         )
-        first = await hook_phase.tag(_cat(), {})
-        second = await hook_phase.tag(_cat(), {})
+        first = await hook_phase.tag()
+        second = await hook_phase.tag()
         assert first == second, (first, second)
 
         config["marker"] = "settings-v2"
-        third = await hook_phase.tag(_cat(), {})
+        third = await hook_phase.tag()
         assert third != first, (first, third)
         assert first != "legacy_tagged:settings-v1", first
         print("PASS (e) tag() is deterministic and changes with the config")
