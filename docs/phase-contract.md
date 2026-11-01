@@ -173,6 +173,62 @@ locks, retries, or error propagation. Those are owned by the phase machine. A
 plugin therefore declares *what* the phase does and *what configuration* it
 depends on, and the machine decides *whether, when and in what order* it runs.
 
+### LLM-backed phases
+
+A phase whose body calls a language model is still an ordinary phase to the
+machine. The machine knows only the four outcomes `done`, `not_ready` (retried
+until its budget expires), `error` (with a `reason`) and `skipped` (with a
+`reason`). **The phase owns the mapping**: it inspects the LLM result and
+translates it into exactly one of those four outcomes. The machine never sees
+an LLM.
+
+The mapping a phase must implement is:
+
+| LLM outcome | State |
+| --- | --- |
+| timeout / 429 / 5xx / connection dropped | `not_ready` with a reason (transient) |
+| empty-but-valid response on non-empty text | `not_ready` on the first attempt, then `error` carrying the raw text |
+| no LLM configured | `error` with a configuration reason — never `skipped` |
+| partial output (schema drops items) | `error` for now; the reason carries `dropped=<n>` |
+| success with a product | `done` |
+
+These are owner decisions, implemented for the graph concept phase in MyGRAPH
+`341e61c`.
+
+`done` **implies a product**. `done` means the phase produced what it was
+supposed to produce, not merely that it did not crash. A phase that returns
+`done` with zero products is a defect. (The `processed`/`expected` counters
+remain telemetry only — see section 1 — so this is an obligation on the phase,
+not a check the machine performs.)
+
+**Budget.** An LLM-backed phase declares `not_ready_budget_seconds` /
+`not_ready_budget_env` on the ABC. The graph concept phase points its
+`not_ready_budget_env` at `CAT_INGESTION_LLM_NOT_READY_MAX_SECONDS` (default
+`300`), so a dead provider releases the source in minutes instead of holding it
+for the generic `CAT_INGESTION_NOT_READY_MAX_SECONDS` (`3600`). The resolution
+order is the same as the general budget: declared env var → declared value →
+generic.
+
+**OPEN DECISION — partial output.** *When a partially successful phase may be
+considered valid is not decided.* Until it is, partial output is an `error`.
+Note that "partial" has three distinct meanings and only the last is already
+handled:
+
+- **per-item within a phase** — the LLM dropped some items the schema asked
+  for (the case above);
+- **per-source within a run** — some sources finished and some did not;
+- **per-phase within a source** — some phases `complete` and some `error`.
+  This one is already covered by normal error propagation (section 3).
+
+Any future definition of "valid partial" must still record the degradation in
+the diary — `processed=M of N, dropped=K, reason=...` — so a partial success is
+never silent.
+
+**`applies_to` must not mask a missing LLM.** A phase that needs an LLM and
+has none reports `error`. `applies_to` is a *capability* check — it decides
+whether the phase makes sense for a source at all — and must not be used to
+turn a configuration problem into a quiet `skipped`.
+
 ## 9. Known limitations
 
 These are current limitations, stated plainly so consumers can plan around
