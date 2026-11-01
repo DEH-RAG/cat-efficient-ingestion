@@ -64,6 +64,7 @@ data structure and the ``@hook`` decorator — no Redis, no network, no
 filesystem access at import time.
 """
 
+import contextvars
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -89,10 +90,27 @@ from .registry import (
     PHASE_STATE_ERROR,
     PHASE_STATE_PROCESSING,
     PHASE_STATE_SKIPPED,
+    IngestionStatus,
+    delete_status,
     get_completed_phases,
+    get_status,
     phase_state,
+    set_status,
     should_abandon,
 )
+
+#: Scope (``"agent"`` or a chat id) of the file deletion currently running.
+#: ``delete(source, cat)`` has no scope argument, so the delete orchestrator
+#: publishes it for the built-in phases, which purge agent/chat-scoped vector
+#: collections. Task-local (never shared across workers) and reset in a
+#: ``finally`` block.
+_DELETE_SCOPE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "effing_delete_scope", default=None
+)
+
+#: Configuration class name of the efficient ingestion engine in the SYSTEM
+#: ``ingestion`` category. Mirrors the MyGRAPH ``_phase_path_active`` predicate.
+_EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
 
 
 @dataclass(frozen=True)
@@ -206,11 +224,11 @@ PHASES = {
 class _BuiltinPhase(IngestionPhase):
     """Declarative built-in phase.
 
-    The built-in phase BODIES still live in the legacy ``reembed`` dispatcher
-    (this todo is additive): :meth:`process` / :meth:`delete` are implemented
-    so the ABC contract is complete, but they refuse to run here rather than
-    duplicating the dispatcher's source-scoped logic. Wiring the dispatcher to
-    these methods is the next todo, not this one.
+    The built-in phase BODIES still live in the legacy ``reembed`` dispatcher:
+    :meth:`process` refuses to run here rather than duplicating the dispatcher,
+    while :meth:`delete` delegates to the same source-scoped legacy purge the
+    recovery path uses, so the reverse-order file deletion can call EVERY
+    phase's ``delete`` (built-ins included).
     """
 
     async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
@@ -224,11 +242,41 @@ class _BuiltinPhase(IngestionPhase):
         )
 
     async def delete(self, source: str, cat) -> None:
-        raise NotImplementedError(
-            f"Built-in phase '{self.id}' is purged by the legacy reembed "
-            "dispatcher until the dispatch migration; use HookPhase for "
-            "hook-declared phases."
+        """Delete this phase's source-scoped products through the legacy purge.
+
+        The phase body still lives in ``reembed`` (the dispatcher owns the
+        source-scoped product boundary), so :meth:`delete` delegates to the
+        SAME legacy purge instead of duplicating it. The delete orchestrator
+        publishes the scope in :data:`_DELETE_SCOPE`; without it a caller falls
+        back to the caller's own scope (a ``StrayCat.id`` is chat-scoped, a
+        ``CheshireCat`` is agent-scoped).
+
+        Raises:
+            PhaseDeleteError: when the legacy purge reports no implementation.
+        """
+        from cat.services.memory.models import VectorMemoryType
+
+        from . import reembed
+
+        scope = _DELETE_SCOPE.get()
+        if scope is None:
+            caller_id = getattr(cat, "id", None)
+            scope = str(caller_id) if caller_id else "agent"
+        chat_id = None if scope == "agent" else scope
+        collection_name = (
+            VectorMemoryType.EPISODIC if chat_id else VectorMemoryType.DECLARATIVE
         )
+        ccat = cat
+        if not hasattr(ccat, "_id") and hasattr(ccat, "lizard"):
+            ccat = await ccat.lizard.get_cheshire_cat(ccat.agent_key)
+        deleted = await reembed._purge_phase(
+            ccat, cat, collection_name, scope, source, chat_id, self.id
+        )
+        if not deleted:
+            raise PhaseDeleteError(
+                f"Built-in phase '{self.id}' has no delete/purge "
+                f"implementation; refusing to delete its artifacts silently"
+            )
 
 class ParsingChunkingPhase(_BuiltinPhase):
     id = "parsing_chunking"
@@ -691,6 +739,267 @@ async def get_phases(cat) -> list[IngestionPhase]:
         seeded.add(spec.id)
         phases.append(HookPhase(spec, cat=cat, manager=manager))
     return phases
+
+
+async def _resolved_system_ingestion_config_name(cat) -> Optional[str]:
+    """Effective SYSTEM-level ``ingestion`` engine name (EffING's own gate).
+
+    Mirrors MyGRAPH's ``_phase_path_active`` helper: prefer the host's
+    ``resolved_config_name(lizard)`` when it exists, otherwise read the single
+    system-level ``ingestion`` category entry directly. Both paths return the
+    same value. Any failure is ``None`` (the gate then stays inactive).
+    """
+    try:
+        from cat.services.factory.ingestion import resolved_config_name
+    except ImportError:
+        resolved_config_name = None
+
+    if resolved_config_name is not None:
+        try:
+            return await resolved_config_name(cat)
+        except Exception:  # noqa: BLE001 - fall back to the direct settings read
+            pass
+
+    try:
+        from cat.db.cruds import settings as crud_settings
+        from cat.db.database import DEFAULT_SYSTEM_KEY
+
+        saved = await crud_settings.get_settings_by_category(
+            DEFAULT_SYSTEM_KEY, "ingestion"
+        )
+    except Exception as exc:  # noqa: BLE001 - an unresolvable gate is inactive
+        log.warning(
+            f"Could not resolve the system ingestion engine ({exc!r}); "
+            f"using the standard file deletion."
+        )
+        return None
+    return (saved or {}).get("name")
+
+
+async def phase_delete_active(cat) -> bool:
+    """Whether EffING owns the reverse-order phase deletion for this caller.
+
+    Single source of truth for the two deletion modes (mirrors MyGRAPH's
+    ``_phase_path_active``):
+
+    ==========================  ======================  ==================
+    EffING installed/loadable   SYSTEM ``ingestion``    deletion mode
+    ==========================  ======================  ==================
+    no                          any                     standard
+    yes                         core engine             standard
+    yes                         efficient engine        phase reverse
+    ==========================  ======================  ==================
+
+    Gate FALSE means the STANDARD deletion applies: no ``deleting`` state is
+    written, nothing is raised, no residue is left behind.
+    """
+    try:
+        import cat.core_plugins.cat_efficient_ingestion  # noqa: F401
+    except Exception:  # noqa: BLE001 - EffING not importable
+        return False
+
+    try:
+        name = await _resolved_system_ingestion_config_name(cat)
+    except Exception as exc:  # noqa: BLE001 - an unresolvable gate is inactive
+        log.warning(
+            f"Could not resolve the system ingestion engine ({exc!r}); "
+            f"using the standard file deletion."
+        )
+        return False
+    return name == _EFFICIENT_INGESTION_CONFIG_NAME
+
+
+def _delete_scope(cat, scope: Optional[str]) -> str:
+    """Resolve the source scope (``"agent"`` or a chat id) for a deletion."""
+    if scope:
+        return str(scope)
+    caller_id = getattr(cat, "id", None)
+    return str(caller_id) if caller_id else "agent"
+
+
+def _delete_source_type(source: str) -> str:
+    return "url" if source.startswith("http") else "file"
+
+
+def phase_execution_order(phases) -> list:
+    """Return ``phases`` in dependency (execution) order, stable by input.
+
+    A phase's depth is ``0`` without dependencies, else ``1 + max(depth(dep))``;
+    sorting by ``(depth, input position)`` yields a deterministic topological
+    order. An unknown dependency or a cycle contributes no edge instead of
+    raising, so deletion always has an order to reverse.
+    """
+    phase_list = list(phases)
+    by_id: dict[str, Any] = {}
+    for phase in phase_list:
+        by_id.setdefault(phase.id, phase)
+
+    depth: dict[str, int] = {}
+
+    def _depth(phase_id: str, visiting: set[str]) -> int:
+        if phase_id in depth:
+            return depth[phase_id]
+        phase = by_id.get(phase_id)
+        if phase is None or phase_id in visiting:
+            return 0
+        visiting.add(phase_id)
+        deps = [
+            dep
+            for dep in (getattr(phase, "depends_on", ()) or ())
+            if dep in by_id
+        ]
+        value = 0 if not deps else 1 + max(_depth(dep, visiting) for dep in deps)
+        visiting.discard(phase_id)
+        depth[phase_id] = value
+        return value
+
+    indexed = list(enumerate(phase_list))
+    indexed.sort(key=lambda item: (_depth(item[1].id, set()), item[0]))
+    return [phase for _index, phase in indexed]
+
+
+async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
+    """Delete ONE source through EVERY registered phase in REVERSE order.
+
+    This is EffING's single deletion path: it applies its own gate and falls
+    back to the STANDARD deletion when the phase path does not apply. The steps
+    of the phase path are the contract:
+
+    1. gate: :func:`phase_delete_active` must be True, at least one
+       plugin-registered phase (beyond the always-present built-ins) must be in
+       :func:`get_phases`, and the status diary must not reference an
+       UNINSTALLED phase. Otherwise ``False`` is returned and the STANDARD
+       deletion (the core wipe + :func:`delete_status`) applies unchanged.
+    2. write the file-level ``deleting`` state BEFORE any phase delete.
+    3. call each phase's ``delete(source, cat)`` in REVERSE execution order,
+       recording every completed phase so a re-run resumes with the remaining
+       ones. A phase without a delete implementation (or whose delete raises)
+       is surfaced as :class:`PhaseDeleteError`; the ``deleting`` row stays so
+       the operation is retried, and no later delete runs (the remaining
+       upstream inputs must stay resolvable).
+    4. remove the status record LAST, after every delete succeeded.
+
+    Returns:
+        ``True`` when the phase path ran and the record was removed, ``False``
+        when the standard deletion applies instead.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return False
+
+    scope = _delete_scope(cat, scope)
+
+    if not await phase_delete_active(cat):
+        # Gate FALSE: STANDARD deletion. No ``deleting`` row, no error, and
+        # the record (including a stale ``deleting`` one) is removed.
+        await delete_status(agent_id, scope, source)
+        return False
+
+    try:
+        phases = await get_phases(cat)
+    except Exception as exc:  # noqa: BLE001 - a broken registry is an error
+        log.error(
+            f"Agent id: {agent_id}. Could not resolve the ingestion phases "
+            f"for {source}: {exc}"
+        )
+        raise PhaseDeleteError(
+            f"Could not resolve the ingestion phases for {source}: {exc}"
+        ) from exc
+
+    plugin_phases = [phase for phase in phases if phase.id not in PHASES]
+    if not plugin_phases:
+        # Only the always-present built-ins: the standard wipe owns them.
+        await delete_status(agent_id, scope, source)
+        return False
+
+    doc = await get_status(agent_id, scope, source)
+    diary = (doc or {}).get("completed_phases")
+    diary_ids = set(diary) if isinstance(diary, dict) else set()
+    registered_ids = {phase.id for phase in phases}
+    uninstalled = sorted(diary_ids - registered_ids)
+    if uninstalled:
+        log.warning(
+            f"Agent id: {agent_id}. Source {source} has diary phases that are "
+            f"no longer installed ({uninstalled}); using the standard deletion."
+        )
+        await delete_status(agent_id, scope, source)
+        return False
+
+    already: set[str] = set()
+    stored_deleted = (doc or {}).get("deleted_phases")
+    if isinstance(stored_deleted, (list, tuple, set)):
+        already = {str(phase_id) for phase_id in stored_deleted}
+
+    await set_status(
+        agent_id,
+        scope,
+        source,
+        type_=_delete_source_type(source),
+        status=IngestionStatus.DELETING,
+        chat_id=None if scope == "agent" else scope,
+        clear_phase=True,
+        extra={"deleted_phases": sorted(already)},
+    )
+
+    token = _DELETE_SCOPE.set(scope)
+    try:
+        for phase in reversed(phase_execution_order(phases)):
+            if phase.id in already:
+                continue
+
+            delete = getattr(phase, "delete", None)
+            if not callable(delete):
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete implementation; refusing to delete {source} silently"
+                )
+                raise PhaseDeleteError(
+                    f"Ingestion phase '{phase.id}' has no delete implementation"
+                )
+
+            try:
+                await delete(source, cat)
+            except PhaseDeleteError as exc:
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete/purge implementation for {source}: {exc}"
+                )
+                raise
+            except NotImplementedError as exc:
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete implementation for {source}: {exc}"
+                )
+                raise PhaseDeleteError(
+                    f"Ingestion phase '{phase.id}' has no delete implementation"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - surface, never skip
+                log.error(
+                    f"Agent id: {agent_id}. delete() for phase '{phase.id}' of "
+                    f"{source} raised ({exc}); leaving the row deleting for the "
+                    f"next pass"
+                )
+                raise PhaseDeleteError(
+                    f"delete() for phase '{phase.id}' of {source} failed: {exc}"
+                ) from exc
+
+            already.add(phase.id)
+            await set_status(
+                agent_id,
+                scope,
+                source,
+                type_=_delete_source_type(source),
+                status=IngestionStatus.DELETING,
+                chat_id=None if scope == "agent" else scope,
+                clear_phase=True,
+                extra={"deleted_phases": sorted(already)},
+            )
+    finally:
+        _DELETE_SCOPE.reset(token)
+
+    # STATE LAST: the row is removed only after every phase delete succeeded.
+    await delete_status(agent_id, scope, source)
+    return True
 
 
 def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:

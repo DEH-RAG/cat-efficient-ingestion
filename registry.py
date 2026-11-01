@@ -44,6 +44,12 @@ class IngestionStatus(Enum):
 
     Files: ``uploaded -> processing -> completed | error``.
     URLs add ``downloading -> downloaded`` between ``uploaded`` and ``processing``.
+
+    ``deleting`` is the file-level deletion state: written BEFORE any phase
+    ``delete()`` runs, and the row is removed only after every phase delete
+    succeeded. A crash therefore leaves the row ``deleting`` (resumable) instead
+    of claiming a state the artifacts no longer match. It is never claimable by
+    the resume sweep (it is not an in-flight ingestion status).
     """
     UPLOADED = "uploaded"
     DOWNLOADING = "downloading"
@@ -51,6 +57,7 @@ class IngestionStatus(Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     ERROR = "error"
+    DELETING = "deleting"
 
 
 #: Work phases (diary of what the source is doing), stored in ``doc["phase"]``.

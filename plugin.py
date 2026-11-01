@@ -35,7 +35,7 @@ from .hooks import (
     execute_phase_accumulator,
     execute_phase_hook_on_all,
 )
-from .phases import PHASES, has_live_running_phase
+from .phases import PHASES, delete_source, has_live_running_phase
 from .registry import (
     PHASE_DOWNLOADING,
     PHASE_PARSING_CHUNKING,
@@ -513,8 +513,36 @@ async def rabbithole_processing_heartbeat_stop(source: str, scope: str, cat=None
 
 
 @hook(priority=0)
+async def before_file_manager_file_delete(filename: str, scope: str, cat) -> None:
+    """Delete the file's artifacts through EVERY registered phase, in reverse.
+
+    Fired by the core single-file DELETE route right after the file is removed
+    from storage and BEFORE its memory points are deleted, so each phase's
+    ``delete(source, cat)`` still sees the inputs it needs (e.g. the graph purge
+    resolves entities through the source's chunk documents). EffING's
+    :func:`delete_source` decides on its own whether the phase path applies
+    (``phase_delete_active`` + at least one plugin-registered phase + no
+    uninstalled diary phase); otherwise it is a no-op and the standard wipe
+    below proceeds unchanged.
+
+    A phase delete raising leaves the file-level ``deleting`` row in place and
+    propagates: the standard point wipe is skipped so the remaining upstream
+    inputs stay resolvable and the operation is resumed on the next pass.
+    """
+    if cat is None:
+        return
+    await delete_source(filename, cat, scope=scope)
+
+
+@hook(priority=0)
 async def after_file_manager_file_deleted(filename: str, scope: str, cat) -> None:
-    """Drop the per-source status row when the file is deleted."""
+    """Drop the per-source status row when the file is deleted.
+
+    This is the STANDARD cleanup and the recovery path for a row left
+    ``deleting`` by a crash (or by a deactivated phase path): it removes the
+    record unconditionally, so a stale ``deleting`` row can never sit forever.
+    When the phase path already removed it, this is an idempotent no-op.
+    """
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)
