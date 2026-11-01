@@ -87,7 +87,6 @@ from .registry import (
     PHASE_PARSING_CHUNKING,
     PHASE_STATE_COMPLETE,
     PHASE_STATE_ERROR,
-    PHASE_STATE_PROCESSING,
     IngestionStatus,
     backfill_completed_phases,
     claim_source_for_resume,
@@ -95,7 +94,6 @@ from .registry import (
     get_completed_phases,
     get_status,
     ingestion_canceled,
-    is_phase_lease_expired,
     phase_state,
     record_phase_completed,
     record_phase_error,
@@ -104,6 +102,7 @@ from .registry import (
     reset_phase_entries,
     set_phase,
     set_status,
+    should_abandon,
 )
 from .split import split_oversized
 
@@ -966,22 +965,67 @@ async def _purge_phase(ccat, cat, collection_name, scope, source_name, chat_id, 
     return await _purge_external_phase(ccat, cat, source_name, phase)
 
 
+async def _delete_phase(
+    ccat, cat, collection_name, scope, source_name, chat_id, phase
+) -> bool:
+    """Delete one phase's artifacts through its :meth:`IngestionPhase.delete`.
+
+    The phase OBJECT is resolved from the same registry the dispatch uses, so
+    an external phase owns its delete implementation. Built-in phases raise
+    ``NotImplementedError`` from ``delete`` (their bodies still live in this
+    legacy dispatcher): for those the source-scoped legacy purge is the delete
+    operation. Returns False when no purge implementation exists; the caller
+    must leave the ``processing`` entry untouched.
+    """
+    phase_obj = None
+    try:
+        for candidate in await get_phases(cat):
+            if getattr(candidate, "id", None) == phase:
+                phase_obj = candidate
+                break
+    except Exception as exc:  # noqa: BLE001 - registry failure falls back to legacy purge
+        log.warning(
+            f"Agent id: {ccat._id}. Could not resolve phase object for "
+            f"{phase} of {source_name}: {exc}; using the legacy purge"
+        )
+    if phase_obj is not None:
+        try:
+            await phase_obj.delete(source_name, cat)
+            return True
+        except NotImplementedError:
+            # Built-in phase: its delete is the legacy dispatcher purge below.
+            pass
+    return await _purge_phase(
+        ccat, cat, collection_name, scope, source_name, chat_id, phase
+    )
+
+
 async def _recover_abandoned_phases(
     ccat, cat, collection_name, scope, source_name, chat_id, doc
 ) -> bool | None:
-    """Purge + reset every abandoned (expired-lease) processing phase.
+    """Delete + reset every ``processing`` phase owned by a PREVIOUS boot.
 
-    Called from the SAME dispatch loop where the periodic probe runs
-    (``reembed_sources``), BEFORE the pending phase is re-run. The earliest
-    expired ``processing`` entry in execution order is the abandoned phase; every
-    later phase that has a diary entry (its downstream products) is purged
-    with it, in REVERSE execution order (later phases first). The purged
-    entries are then reset so the phases are stale again and re-run from
-    scratch.
+    Called at startup (through the startup pass) and BEFORE a source is
+    dispatched (``reembed_sources``), never while a live owner holds the phase:
+    :func:`should_abandon` decides ownership, so an entry written by this
+    process (same ``BOOT_EPOCH``) or by a live pod/pid is left untouched.
+
+    The earliest abandoned ``processing`` entry in execution order is the
+    abandoned phase; every later phase that has a diary entry (its downstream
+    products) is deleted with it, in REVERSE execution order (later phases
+    first), because those products may depend on the abandoned one. Only after
+    every delete succeeds are the entries reset (dropped -> ``pending``) so the
+    normal dispatch re-runs them from zero. Recovery NEVER writes ``complete``.
+
+    A delete that raises is logged as a WARNING and that entry is left
+    ``processing`` (never reset, never re-run); the sweep continues instead of
+    failing as a whole. A phase with no purge implementation (``delete``
+    returns False) is NOT deleted blindly and stops this source, preserving the
+    existing conservative contract.
 
     Returns:
         ``None`` when nothing is abandoned (normal path), ``True`` after a
-        successful purge+reset, ``False`` when a phase has no purge
+        successful delete+reset, ``False`` when a phase has no purge
         implementation (its WARNING was logged; the caller must stop this
         source and leave the entry processing).
     """
@@ -990,16 +1034,15 @@ async def _recover_abandoned_phases(
         return None
     merged = await merged_phases(ccat, cat)
     order = list(merged.keys())
-    expired = [
+    abandoned = [
         phase for phase in order
         if isinstance(diary.get(phase), dict)
-        and phase_state(diary[phase]) == PHASE_STATE_PROCESSING
-        and is_phase_lease_expired(diary[phase])
+        and should_abandon(diary[phase])
     ]
-    if not expired:
+    if not abandoned:
         return None
 
-    first = expired[0]
+    first = abandoned[0]
     try:
         start = order.index(first)
     except ValueError:
@@ -1012,18 +1055,33 @@ async def _recover_abandoned_phases(
         if isinstance(diary.get(phase), dict)
     ]
 
+    failed = set()
     for phase in reversed(to_purge):
-        if not await _purge_phase(
-            ccat, cat, collection_name, scope, source_name, chat_id, phase
-        ):
+        try:
+            deleted = await _delete_phase(
+                ccat, cat, collection_name, scope, source_name, chat_id, phase
+            )
+        except Exception as exc:  # noqa: BLE001 - one delete must not fail the sweep
+            log.warning(
+                f"Agent id: {ccat._id}. delete() for phase {phase} of "
+                f"{source_name} raised ({exc}); leaving its entry processing "
+                f"and continuing the recovery sweep"
+            )
+            failed.add(phase)
+            continue
+        if not deleted:
             # No purge implementation: do NOT delete blindly and do NOT
             # re-run; the abandoned entry stays ``processing`` and visible.
             return False
 
-    await reset_phase_entries(ccat.agent_key, scope, source_name, to_purge)
+    to_reset = [phase for phase in to_purge if phase not in failed]
+    if not to_reset:
+        return True
+    await reset_phase_entries(ccat.agent_key, scope, source_name, to_reset)
     log.warning(
         f"Agent id: {ccat._id}. Abandoned phase {first} for {source_name} "
-        f"(expired lease); purged {list(reversed(to_purge))} and re-running it"
+        f"(previous boot/dead owner); deleted {list(reversed(to_purge))}, "
+        f"reset {to_reset} to pending and re-running it"
     )
     return True
 
@@ -1800,6 +1858,27 @@ async def reembed_sources(
         # machine writes ``state: error`` with the reason.
         current_phase = None
         try:
+            # ---- RECOVERY SWEEP: startup pass + before this source dispatch ----
+            # An entry left ``processing`` by a PREVIOUS boot / dead owner is
+            # abandoned: delete its products (later phases first) and reset the
+            # entries to ``pending`` BEFORE anything is dispatched, so the
+            # normal dispatch re-runs it from zero. A live owner (the CURRENT
+            # ``BOOT_EPOCH``, or a live pod/pid) is never touched. The startup
+            # pass (``after_lizard_bootstrap`` -> ``_startup_pass`` -> here)
+            # therefore sweeps every candidate source at boot, and every source
+            # is swept again immediately before it is dispatched.
+            recovered = await _recover_abandoned_phases(
+                ccat, cat, collection_name, scope, source_name, chat_id,
+                await get_status(ccat.agent_key, scope, source_name),
+            )
+            if recovered is False:
+                # No delete implementation: leave the entry ``processing`` and
+                # do not dispatch (or re-run) this source.
+                continue
+            if recovered is True:
+                doc = await get_status(ccat.agent_key, scope, source_name)
+                pending = await _probe_pending(ccat, cat, source_name, doc)
+
             # ---- SERIAL PROBE-DRIVEN PHASE DISPATCH ----
             # One phase at a time, in probe order. After each phase body
             # succeeds its diary entry (marker / settings_version / deps) is
@@ -1815,22 +1894,6 @@ async def reembed_sources(
                 if _should_stop_for_error(doc):
                     # ERROR absorbing: never advance a failed row
                     break
-                # ---- RECOVERY: the same place the periodic probe runs ----
-                # An expired ``processing`` entry is abandoned: purge its
-                # products (later phases first) and reset the entries BEFORE
-                # the phase is re-run from scratch below. ``False`` means a
-                # phase has no purge implementation: leave it processing, do not
-                # re-run, stop this source.
-                recovered = await _recover_abandoned_phases(
-                    ccat, cat, collection_name, scope, source_name, chat_id, doc
-                )
-                if recovered is False:
-                    break
-                if recovered is True:
-                    doc = await get_status(ccat.agent_key, scope, source_name)
-                    pending = await _probe_pending(ccat, cat, source_name, doc)
-                    if not pending:
-                        break
                 entry = pending[0]
                 phase = entry["phase"]
                 current_phase = None

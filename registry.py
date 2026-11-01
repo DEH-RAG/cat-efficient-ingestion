@@ -92,13 +92,39 @@ PHASE_STATE_RUNNING = PHASE_STATE_PROCESSING
 #: purged and re-run from scratch. Default 30 minutes.
 PHASE_LEASE_SECONDS_DEFAULT = 1800
 
-#: Identity of THIS process/boot, stable for the lifetime of the process.
-_BOOT_ID = str(uuid.uuid4())
+#: Identity of THIS process/boot, generated ONCE at import time and stable for
+#: the lifetime of the process. A restart (new process, or a new container)
+#: produces a DIFFERENT epoch, which is how recovery tells an entry left behind
+#: by a previous boot from one written by a live worker. It is written into
+#: every ``processing`` diary entry as ``owner.boot``.
+BOOT_EPOCH = uuid.uuid4().hex
+
+#: Backward-compatible alias for the previous private name.
+_BOOT_ID = BOOT_EPOCH
 
 
 def _pod_name() -> str:
     """Best-effort pod/container name of the current process."""
     return os.environ.get("HOSTNAME") or socket.gethostname()
+
+
+def _pid_alive(pid: object) -> bool:
+    """Whether ``pid`` is a live process on this host (best effort).
+
+    ``os.kill(pid, 0)`` performs the existence check without delivering a
+    signal. A ``PermissionError`` means the process exists but belongs to
+    another user (still alive); any other ``OSError`` (notably
+    ``ProcessLookupError``) means it is gone.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 
@@ -114,7 +140,7 @@ def current_phase_owner() -> Dict[str, object]:
     ``pod`` is the container/pod name, ``pid`` the process id and ``boot`` a
     per-process UUID generated at import time (a restart gets a new boot).
     """
-    return {"pod": _pod_name(), "pid": os.getpid(), "boot": _BOOT_ID}
+    return {"pod": _pod_name(), "pid": os.getpid(), "boot": BOOT_EPOCH}
 
 
 def phase_state(entry: Optional[Dict]) -> str:
@@ -211,6 +237,57 @@ def is_phase_lease_expired(entry: Optional[Dict], now: Optional[float] = None) -
     owner_expired = (not owner_is_current) and age is not None and age > lease
 
     return started_expired or owner_expired
+
+
+def should_abandon(entry: Optional[Dict], now: Optional[float] = None) -> bool:
+    """Whether a ``processing`` entry belongs to a PREVIOUS boot and may be
+    abandoned (purged, reset to ``pending`` and re-run from zero).
+
+    Pure decision function (no I/O) with strict precedence:
+
+    1. the entry is not ``processing`` -> ``False`` (terminal states are
+       never abandoned);
+    2. ``owner`` is missing/malformed -> lease fallback
+       (:func:`is_phase_lease_expired`): an entry without an owner can only be
+       judged by its age;
+    3. ``owner.boot == BOOT_EPOCH`` -> ``False``: this is the CURRENT process,
+       which is by definition alive — never touch it, even past the lease;
+    4. the owner lives in this pod (same pod name) AND its pid is alive ->
+       ``False``: another live worker of this pod owns the phase;
+    5. a foreign pod cannot be probed locally, so its lease is the liveness
+       signal: an unexpired lease keeps it untouched (alive), an expired one
+       marks a dead previous boot;
+    6. otherwise (previous boot, same pod, dead pid) -> ``True``.
+
+    A live owner is never abandoned; only an entry whose owner provably belongs
+    to a previous boot (or whose owner cannot be shown alive) is.
+    """
+    if phase_state(entry) != PHASE_STATE_PROCESSING:
+        return False
+    if not isinstance(entry, dict):
+        return False
+    now = time.time() if now is None else now
+
+    owner = entry.get("owner")
+    if not isinstance(owner, dict) or not owner.get("boot"):
+        return is_phase_lease_expired(entry, now)
+
+    if owner.get("boot") == BOOT_EPOCH:
+        return False
+
+    pod = owner.get("pod")
+    current_pod = _pod_name()
+    if pod == current_pod and _pid_alive(owner.get("pid")):
+        return False
+
+    if pod and pod != current_pod:
+        # Foreign pod: no local liveness probe is possible. The lease is the
+        # conservative signal — only an expired lease proves a dead boot.
+        return is_phase_lease_expired(entry, now)
+
+    # Same pod, previous boot, pid no longer alive.
+    return True
+
 
 
 

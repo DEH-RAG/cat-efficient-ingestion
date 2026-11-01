@@ -90,8 +90,8 @@ from .registry import (
     PHASE_STATE_PROCESSING,
     PHASE_STATE_SKIPPED,
     get_completed_phases,
-    is_phase_lease_expired,
     phase_state,
+    should_abandon,
 )
 
 
@@ -760,7 +760,7 @@ def is_phase_stale(
 
     state = phase_state(entry)
     if state == PHASE_STATE_PROCESSING:
-        return is_phase_lease_expired(entry)
+        return should_abandon(entry)
     if state in (PHASE_STATE_ERROR, PHASE_STATE_SKIPPED):
         return False
 
@@ -795,7 +795,7 @@ def has_live_running_phase(completed_phases: Any) -> bool:
     diary = _diary_from_completed_phases(completed_phases)
     return any(
         phase_state(entry) == PHASE_STATE_PROCESSING
-        and not is_phase_lease_expired(entry)
+        and not should_abandon(entry)
         for entry in diary.values()
     )
 
