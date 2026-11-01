@@ -259,11 +259,14 @@ turn a configuration problem into a quiet `skipped`.
 These are current limitations, stated plainly so consumers can plan around
 them:
 
-1. **Agent deletion per-file cascade.** The cascade fires the same
-   `before_file_manager_file_delete` hook, so every phase's `delete()` runs in
-   reverse order before the blanket wipe. The blanket wipe
-   (`delete_tenant_points`) still runs afterwards as a redundant catch-all; it
-   is not removed because that would require a CAT core change.
+1. **Agent deletion per-file cascade.** An agent teardown uses the standard
+   teardown path only: the per-source phase deletes are skipped (the
+   `agents:{agent_id}:ingestion:delete` marker short-circuits
+   `before_file_manager_file_delete`), because the standard teardown wipes the
+   vectors and the graph plugin wipes the whole tenant, so every artifact is
+   already covered. A single-file delete keeps using the phase path. If the
+   marker cannot be read the handler fails open and runs the phase delete, so
+   a genuine single-file delete is never skipped on a read error.
 2. **Graph purge ordering.** The graph purge walks from the source's
    `Document`s, so it must run **before** any vector wipe. Until entities
    carry their own source locator, removing the vectors first would leave the

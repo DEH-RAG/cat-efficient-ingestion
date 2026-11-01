@@ -44,6 +44,7 @@ from .registry import (
     clear_agent,
     delete_status,
     get_status,
+    has_delete_marker,
     ingestion_canceled,
     set_phase,
     set_status,
@@ -525,12 +526,39 @@ async def before_file_manager_file_delete(filename: str, scope: str, cat) -> Non
     uninstalled diary phase); otherwise it is a no-op and the standard wipe
     below proceeds unchanged.
 
+    During an AGENT teardown (the ``agents:{agent_id}:ingestion:delete``
+    marker is present) the per-source phase cascade is SKIPPED: the standard
+    teardown already wipes the vectors and the graph plugin wipes the whole
+    tenant, so re-running every phase delete only adds work and a failure
+    mode. The phase path is reserved for SINGLE-FILE deletion. A failure to
+    read the marker is fail-open: the phase delete proceeds so a genuine
+    single-file delete is never skipped on a read error.
+
     A phase delete raising leaves the file-level ``deleting`` row in place and
     propagates: the standard point wipe is skipped so the remaining upstream
     inputs stay resolvable and the operation is resumed on the next pass.
     """
     if cat is None:
         return
+
+    agent_id = getattr(cat, "agent_key", None)
+    marker_present = False
+    if agent_id:
+        try:
+            marker_present = await has_delete_marker(agent_id)
+        except Exception as exc:  # noqa: BLE001 - fail-open, never skip a delete
+            log.warning(
+                f"Agent id: {agent_id}. Could not read the ingestion teardown "
+                f"marker for {filename} ({exc}); proceeding with the phase delete."
+            )
+
+    if marker_present:
+        log.info(
+            f"Agent id: {agent_id}. Agent teardown in progress; leaving the "
+            f"deletion of {filename} to the standard teardown path."
+        )
+        return
+
     await delete_source(filename, cat, scope=scope)
 
 
