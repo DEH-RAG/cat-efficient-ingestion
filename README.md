@@ -2,6 +2,8 @@
 
 <p id="description">This is a core plugin for the <a href="https://github.com/Grinning-Cat-RAG/grinning-cat-core">Grinning Cat</a> Project which replaces the default ingestion engine with a two-phase, resumable one: it tracks the state of every ingested source, re-embeds the stored chunks instead of re-ingesting the files when the embedder changes, and recovers ingestions interrupted by a crash or a restart.</p>
 
+The phase-ingestion contract — states, recursive tags, propagation, recovery, locks, state/data lockstep, file deletion, plugin surface and known limitations — is documented in [`docs/phase-contract.md`](docs/phase-contract.md).
+
 <h2>🧐 What it does</h2>
 
 The plugin registers `EfficientIngestionEngine` through the `factory_allowed_ingestions` hook, so the core resolves it via the ServiceFactory (`ingestion` category) instead of the default engine. The same engine drives **one** state machine for the whole lifecycle — fresh uploads, recovery, re-embed and re-ingest:
