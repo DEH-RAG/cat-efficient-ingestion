@@ -78,8 +78,10 @@ from .hooks import (
 )
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import (
+    PhaseDeleteError,
     compute_tags,
     dependency_outcome,
+    downstream_phase_ids,
     execute_phase_on_owner,
     get_phases,
     has_live_running_phase,
@@ -103,6 +105,7 @@ from .registry import (
     record_phase_completed,
     record_phase_error,
     record_phase_processing,
+    record_phase_purge_failed,
     record_phase_skipped,
     reset_phase_entries,
     set_phase,
@@ -1001,6 +1004,16 @@ async def _delete_phase(
         except NotImplementedError:
             # Built-in phase: its delete is the legacy dispatcher purge below.
             pass
+        except PhaseDeleteError as exc:
+            # The adapter refuses to delete without an implementation. This is
+            # the "no purge implementation" contract (False), not a transient
+            # failure the caller should retry blindly with another strategy.
+            log.warning(
+                f"Agent id: {ccat._id}. Phase {phase} for {source_name} has no "
+                f"delete/purge implementation ({exc}); leaving its entry "
+                f"processing"
+            )
+            return False
     return await _purge_phase(
         ccat, cat, collection_name, scope, source_name, chat_id, phase
     )
@@ -1019,21 +1032,23 @@ async def _recover_abandoned_phases(
     The earliest abandoned ``processing`` entry in execution order is the
     abandoned phase; every later phase that has a diary entry (its downstream
     products) is deleted with it, in REVERSE execution order (later phases
-    first), because those products may depend on the abandoned one. Only after
-    every delete succeeds are the entries reset (dropped -> ``pending``) so the
-    normal dispatch re-runs them from zero. Recovery NEVER writes ``complete``.
+    first), because those products may depend on the abandoned one. After ALL
+    deletes ran, the successfully deleted entries are reset (dropped ->
+    ``pending``) so the normal dispatch re-runs them from zero. Recovery NEVER
+    writes ``complete``.
 
-    A delete that raises is logged as a WARNING and that entry is left
-    ``processing`` (never reset, never re-run); the sweep continues instead of
-    failing as a whole. A phase with no purge implementation (``delete``
-    returns False) is NOT deleted blindly and stops this source, preserving the
-    existing conservative contract.
+    A delete that raises (or reports no purge implementation) is logged as a
+    WARNING naming the phase and source, and that entry is left ``processing``
+    with an expired ownerless lease (:func:`registry.record_phase_purge_failed`)
+    so the NEXT pass retries it; the other deletes still run and their entries
+    are still reset. The source is never re-dispatched in this pass, because
+    that would run a body on un-purged products.
 
     Returns:
         ``None`` when nothing is abandoned (normal path), ``True`` after a
-        successful delete+reset, ``False`` when a phase has no purge
-        implementation (its WARNING was logged; the caller must stop this
-        source and leave the entry processing).
+        successful delete+reset of every phase, ``False`` when a phase could
+        not be deleted (its WARNING was logged; the caller must stop this
+        source and leave the failed entry processing for the next pass).
     """
     diary = get_completed_phases(doc)
     if not diary:
@@ -1061,6 +1076,12 @@ async def _recover_abandoned_phases(
         if isinstance(diary.get(phase), dict)
     ]
 
+    # DATA FIRST, STATE LAST: every delete runs before any diary write below.
+    # A successfully deleted phase is then reset (entry dropped -> pending); a
+    # phase whose delete raised or has no implementation is left ``processing``
+    # so the NEXT pass retries it. Nothing is ever recorded ``complete`` here,
+    # and one failure never suppresses the reset of the phases that DID delete.
+    purged = []
     failed = set()
     for phase in reversed(to_purge):
         try:
@@ -1071,23 +1092,47 @@ async def _recover_abandoned_phases(
             log.warning(
                 f"Agent id: {ccat._id}. delete() for phase {phase} of "
                 f"{source_name} raised ({exc}); leaving its entry processing "
-                f"and continuing the recovery sweep"
+                f"and retrying on the next pass"
             )
             failed.add(phase)
             continue
         if not deleted:
             # No purge implementation: do NOT delete blindly and do NOT
-            # re-run; the abandoned entry stays ``processing`` and visible.
-            return False
+            # re-run. Its entry stays ``processing`` and is retried next pass.
+            log.warning(
+                f"Agent id: {ccat._id}. delete() for phase {phase} of "
+                f"{source_name} reported no purge implementation; leaving its "
+                f"entry processing and retrying on the next pass"
+            )
+            failed.add(phase)
+            continue
+        purged.append(phase)
 
-    to_reset = [phase for phase in to_purge if phase not in failed]
-    if not to_reset:
-        return True
-    await reset_phase_entries(ccat.agent_key, scope, source_name, to_reset)
+    if purged:
+        await reset_phase_entries(ccat.agent_key, scope, source_name, purged)
+    for phase in to_purge:
+        if phase not in failed:
+            continue
+        try:
+            await record_phase_purge_failed(
+                ccat.agent_key, scope, source_name, phase,
+                reason="purge failed; retrying on the next pass",
+                type_="url" if is_url(source_name) else "file",
+                chat_id=chat_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed retry marker must be visible
+            log.error(
+                f"Agent id: {ccat._id}. Could not leave phase {phase} of "
+                f"{source_name} in a retryable processing state: {exc}"
+            )
+    if failed:
+        # Stop this source: dispatching now would run a phase body on
+        # un-purged (or partially purged) products.
+        return False
     log.warning(
         f"Agent id: {ccat._id}. Abandoned phase {first} for {source_name} "
-        f"(previous boot/dead owner); deleted {list(reversed(to_purge))}, "
-        f"reset {to_reset} to pending and re-running it"
+        f"(previous boot/dead owner); deleted {list(reversed(purged))}, "
+        f"reset {purged} to pending and re-running it"
     )
     return True
 
@@ -1544,6 +1589,7 @@ def _persisted_url_file_name(source_url: str, root_dir: str) -> str:
 
 async def _run_parsing_phase(
     ccat, collection_name, source, source_name, chat_id, cat, rabbit_hole, active_chunker_name,
+    scope=None,
 ):
     """Run the ``parsing_chunking`` phase body (clean-sweep -> parse -> store).
 
@@ -1554,16 +1600,38 @@ async def _run_parsing_phase(
     URL itself), parses + chunks ALWAYS extracting the images, and stores the
     text chunks and image points with EMPTY vectors.
 
+    **LOCKSTEP**: the clean-sweep deletes the products of every DOWNSTREAM
+    phase too, so when ``scope`` is provided their diary entries are dropped
+    right after the data is gone. Otherwise a phase whose settings tag did not
+    change (e.g. parsing re-run after an abandoned lease) would look fresh with
+    its data gone — notably ``embedding``, whose real vectors this sweep
+    deletes.
+
     Returns:
         ``(resolved_source_name, stored_points, expected, processed)`` — the
         (possibly re-resolved) source name, the stored empty-vector points
         (which the embedding phase consumes on the next loop iteration), the
-        number of text chunks the parser produced (``expected``) and the number
-        of those chunks actually stored (``processed``).
+        number of text chunks the parser produced (``expected``) and the
+        number of those chunks actually stored (``processed``).
     """
     # 1. clean-sweep: remove every artifact of this phase and the following ones.
     await _raise_if_canceled(ccat)
     await _clear_source_artifacts(ccat, collection_name, source_name, chat_id)
+    # DATA FIRST, STATE LAST: only now that the downstream products are gone do
+    # their diary entries stop claiming completeness.
+    if scope is not None:
+        try:
+            merged = await merged_phases(ccat, cat)
+            downstream = downstream_phase_ids(merged, PHASE_PARSING_CHUNKING)
+            if downstream:
+                await reset_phase_entries(
+                    ccat.agent_key, scope, source_name, downstream
+                )
+        except Exception as exc:  # noqa: BLE001 - the sweep must not abort the parse
+            log.warning(
+                f"Agent id: {ccat._id}. Could not reset the downstream phase "
+                f"entries of {source_name} after the parsing clean-sweep: {exc}"
+            )
 
     # Use a PER-CALL copy of the RabbitHole bound to this ccat. The lizard owns
     # ONE RabbitHole shared by every agent, and ``_split_text`` reads
@@ -2190,6 +2258,7 @@ async def reembed_sources(
                                 await _run_parsing_phase(
                                     ccat, collection_name, source, source_name,
                                     chat_id, cat, rabbit_hole, active_chunker_name,
+                                    scope=scope,
                                 )
                             )
                         )

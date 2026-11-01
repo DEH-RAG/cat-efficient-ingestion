@@ -722,6 +722,35 @@ def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:
     return {}
 
 
+def downstream_phase_ids(phases, phase_id: str) -> list[str]:
+    """Ids that TRANSITIVELY depend on ``phase_id`` (excluding it).
+
+    ``phases`` is the merged ``{id: spec}`` map. Order follows the mapping's
+    insertion order, so the result is deterministic. Used by the deletion
+    paths: when a phase's products are wiped, every phase that consumed them
+    (directly or through another dependency) has had its data invalidated and
+    must stop being recorded as ``complete``.
+
+    A malformed entry (no ``depends_on``) simply contributes no edges; the
+    function never raises.
+    """
+    deps_by_id = {
+        pid: tuple(getattr(spec, "depends_on", ()) or ())
+        for pid, spec in phases.items()
+    }
+    downstream = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, deps in deps_by_id.items():
+            if pid == phase_id or pid in downstream:
+                continue
+            if phase_id in deps or any(dep in downstream for dep in deps):
+                downstream.add(pid)
+                changed = True
+    return [pid for pid in phases if pid in downstream]
+
+
 def dependency_outcome(phase, diary) -> Optional[tuple[str, str]]:
     """Propagate a dependency's terminal outcome onto a dependent phase.
 

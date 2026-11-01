@@ -102,10 +102,17 @@ if __name__ == "__main__":
             self.merged = merged
             self.purge_phase = purge_phase
             self.reset_log = [] if reset_log is None else reset_log
+            self.retry_log = []
             self.saved = {}
 
         def __enter__(self):
-            for name in ("merged_phases", "_purge_phase", "reset_phase_entries", "log"):
+            for name in (
+                "merged_phases",
+                "_purge_phase",
+                "reset_phase_entries",
+                "record_phase_purge_failed",
+                "log",
+            ):
                 self.saved[name] = getattr(reembed, name)
 
             async def _merged(*args, **kwargs):
@@ -115,8 +122,13 @@ if __name__ == "__main__":
                 self.reset_log.append(list(phase_ids))
                 return {}
 
+            async def _purge_failed(agent_id, scope, source, phase, **kwargs):
+                self.retry_log.append(phase)
+                return {}
+
             reembed.merged_phases = _merged
             reembed.reset_phase_entries = _reset
+            reembed.record_phase_purge_failed = _purge_failed
             if self.purge_phase is not None:
                 async def _purge(*args, **kwargs):
                     self.purge_phase.append(args[-1])

@@ -87,7 +87,14 @@ if __name__ == "__main__":
     def _patch(doc, phase_obj, log):
         """Install the recovery seams on ``reembed``; return a restore callable."""
         saved = {}
-        for name in ("get_phases", "merged_phases", "reset_phase_entries", "_purge_phase", "log"):
+        for name in (
+            "get_phases",
+            "merged_phases",
+            "reset_phase_entries",
+            "record_phase_purge_failed",
+            "_purge_phase",
+            "log",
+        ):
             saved[name] = getattr(reembed, name)
 
         async def _get_phases(cat=None):
@@ -103,12 +110,19 @@ if __name__ == "__main__":
                 diary.pop(phase, None)
             return {}
 
+        async def _purge_failed(agent_id, scope, source, phase, **kwargs):
+            doc.setdefault("completed_phases", {}).setdefault(phase, {})
+            doc["completed_phases"][phase]["state"] = PROCESSING
+            phase_obj.order.append(("purge-failed", phase))
+            return {}
+
         async def _legacy_purge(*args, **kwargs):
             raise AssertionError("legacy purge must not run when delete() exists")
 
         reembed.get_phases = _get_phases
         reembed.merged_phases = _merged
         reembed.reset_phase_entries = _reset
+        reembed.record_phase_purge_failed = _purge_failed
         reembed._purge_phase = _legacy_purge
         reembed.log = log
 
@@ -219,14 +233,14 @@ if __name__ == "__main__":
         log = FakeLog()
         doc = {"completed_phases": {"fake_phase": _processing(time.time(), _previous_boot_owner())}}
         result = await _recover(doc, phase, log)
-        assert result is True, result
-        assert order == ["delete"], order
+        assert result is False, result
+        assert order == ["delete", ("purge-failed", "fake_phase")], order
         assert doc["completed_phases"]["fake_phase"]["state"] == PROCESSING
         assert any(
             "fake_phase" in msg and "doc.txt" in msg and "raised" in msg
             for msg in log.warnings
         ), log.warnings
-        print("PASS (e) delete() raising keeps processing, logs WARNING, sweep continues")
+        print("PASS (e) delete() raising keeps processing, logs WARNING, sweep stops")
 
     async def test_f_recovered_phase_is_pending_never_complete():
         order = []

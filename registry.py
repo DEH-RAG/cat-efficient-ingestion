@@ -896,6 +896,49 @@ async def record_phase_skipped(
 record_phase_running = record_phase_processing
 
 
+async def record_phase_purge_failed(
+    agent_id: str,
+    scope: str,
+    source: str,
+    phase: str,
+    *,
+    reason: Optional[str] = None,
+    type_: str = "file",
+    chat_id: Optional[str] = None,
+) -> dict:
+    """Leave a phase ``processing`` after a FAILED purge, so the next pass retries.
+
+    Purge and state must move in lockstep: a ``complete`` entry whose ``delete``
+    raised would keep describing data that may already be gone (or that the
+    next pass must still remove). The entry is therefore rewritten to
+    ``processing`` — never ``complete`` — with:
+
+    - ``owner = None`` and ``started_at`` already past the lease, so
+      :func:`should_abandon` reclaims it on the very next recovery sweep
+      (a live owner would make the retry wait for a lease that never expires
+      in this process);
+    - the previous ``tag`` / ``attempt`` carried over.
+
+    Completion is never implied by this write; the next successful purge drops
+    the entry (``pending``) and the normal dispatch re-runs the phase.
+    """
+    if not phase or not isinstance(phase, str):
+        return await get_status(agent_id, scope, source) or {}
+    previous = await _previous_diary_entry(agent_id, scope, source, phase)
+    expired_started_at = time.time() - phase_lease_seconds() - 1.0
+    entry = {
+        "state": PHASE_STATE_PROCESSING,
+        "reason": reason,
+        "started_at": expired_started_at,
+        "owner": None,
+        "tag": str((previous or {}).get("tag") or ""),
+        "attempt": _attempt(previous),
+    }
+    return await _write_phase_entry(
+        agent_id, scope, source, phase, entry, type_=type_, chat_id=chat_id
+    )
+
+
 async def reset_phase_entries(
     agent_id: str, scope: str, source: str, phases
 ) -> dict:
@@ -1106,24 +1149,132 @@ async def delete_status(agent_id: str, scope: str, source: str) -> None:
         await crud.delete(status_key(agent_id, scope, source))
 
 
-async def clear_completed_phases(agent_id: str, scope: str, source: str) -> bool:
+async def clear_completed_phases(
+    agent_id: str, scope: str, source: str, phase_ids=None
+) -> bool:
     """Clear the completed-phases diary of a source (crud-only, no raw Redis).
+
+    **ORDERING RULE**: this is a STATE write. The caller MUST already have
+    deleted the data it describes (points, graph artifacts, files); never call
+    it before the purge, or the diary would claim work that still exists is
+    pending (harmless) while the real risk is the opposite — a diary that keeps
+    claiming ``complete`` after the data is gone.
 
     The diary is BOOKKEEPING, not proof the points exist. ``--reingest`` wipes
     a source's points and must also clear its diary, so the phases re-run
     deterministically even if the status row survives (e.g. ``delete_status``
     fails after the points are gone) instead of looking fresh forever.
 
-    Returns True when a diary entry was cleared, False when the row/doc/diary
-    was absent.
+    With ``phase_ids`` omitted the WHOLE diary is cleared: the CLI reingest
+    wiped every phase's products, so every phase must look pending again
+    (never a hardcoded pair). Pass an explicit iterable only for a deletion
+    that invalidates a KNOWN subset (e.g. the ``--graph`` wipe resets just the
+    graph phases).
+
+    Returns True when at least one diary entry was cleared, False when the
+    row/doc/diary was absent (or none of ``phase_ids`` was present).
     """
     key = status_key(agent_id, scope, source)
     doc = await _read_doc(key)
     if not isinstance(doc, dict) or not doc.get("completed_phases"):
         return False
-    doc["completed_phases"] = {}
+    diary = doc["completed_phases"]
+    if not isinstance(diary, dict):
+        return False
+    if phase_ids is None:
+        doc["completed_phases"] = {}
+    else:
+        wanted = set(phase_ids)
+        before = len(diary)
+        for phase in wanted:
+            diary.pop(phase, None)
+        if len(diary) == before:
+            return False
+        doc["completed_phases"] = diary
     await crud.store(key, doc)
     return True
+
+
+async def reset_phase_entries_for_agent(agent_id: str, phases) -> int:
+    """Drop ``phases`` diary entries from EVERY status doc of an agent.
+
+    **ORDERING RULE**: a STATE write used after a deletion that is not
+    source-scoped (e.g. the manual ``--graph`` wipe removes the tenant's graph
+    artifacts, which invalidates the graph phases for every source). The caller
+    MUST delete the data first; this only makes the surviving diary stop
+    claiming it exists.
+
+    Enumerates the agent's whole ingestion namespace (all scopes, via
+    :func:`_list_status_keys`), so a conversation-scoped source is reset too.
+    The deletion marker is skipped. Each doc is read, its diary stripped of the
+    given phase ids and re-stored only when something actually changed.
+
+    Returns:
+        The number of status docs whose diary was changed.
+    """
+    wanted = set(phases or ())
+    if not wanted:
+        return 0
+    changed = 0
+    marker_key = delete_marker_key(agent_id)
+    for key in await _list_status_keys(agent_id):
+        if key == marker_key:
+            continue
+        doc = await _read_doc(key)
+        if not isinstance(doc, dict):
+            continue
+        diary = doc.get("completed_phases")
+        if not isinstance(diary, dict):
+            continue
+        if not any(phase in diary for phase in wanted):
+            continue
+        for phase in wanted:
+            diary.pop(phase, None)
+        doc["completed_phases"] = diary
+        await crud.store(key, doc)
+        changed += 1
+    return changed
+
+
+async def purge_source_for_reingest(
+    agent_id: str,
+    scope: str,
+    source: str,
+    delete_data,
+    *,
+    phase_ids=None,
+) -> None:
+    """Wipe a source's data, THEN its diary, THEN its status row.
+
+    **ORDERING INVARIANT**: the data deletion is awaited FIRST. Only after it
+    completed does this write any state (the diary clear, then the row delete),
+    so a crash between the steps can only leave state claiming LESS than the
+    data says — never a ``complete`` diary over wiped data. The CLI reingest
+    MUST go through this helper instead of hand-rolling the sequence: a
+    reordered sequence is exactly how wiped data silently keeps looking fresh.
+
+    ``delete_data`` is an async callable performing the actual wipe (e.g. the
+    vector handler's ``delete_tenant_points`` bound to the source). It MUST
+    raise on failure; this function never swallows it, so a failed wipe leaves
+    the diary intact and the source re-runs from its current checkpoint rather
+    than from a false ``pending``.
+
+    Args:
+        agent_id: The agent (chatbot) id.
+        scope: ``"agent"`` or a conversation ``chat_id``.
+        source: The ingested file name or URL.
+        delete_data: ``async () -> None`` that removes the source's data.
+        phase_ids: Optional subset for the diary clear; ``None`` clears every
+            phase (the reingest wiped every phase's products).
+    """
+    await delete_data()
+    if phase_ids is None:
+        await clear_completed_phases(agent_id, scope, source)
+    else:
+        await clear_completed_phases(
+            agent_id, scope, source, phase_ids=phase_ids
+        )
+    await delete_status(agent_id, scope, source)
 
 
 async def list_statuses(agent_id: str, chat_id: Optional[str] = None) -> List[Dict]:
