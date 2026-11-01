@@ -77,6 +77,7 @@ from .hooks import (
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import (
     compute_tags,
+    dependency_outcome,
     execute_phase_on_owner,
     get_phases,
     has_live_running_phase,
@@ -87,6 +88,7 @@ from .registry import (
     PHASE_PARSING_CHUNKING,
     PHASE_STATE_COMPLETE,
     PHASE_STATE_ERROR,
+    PHASE_STATE_SKIPPED,
     IngestionStatus,
     backfill_completed_phases,
     claim_source_for_resume,
@@ -1383,6 +1385,36 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
     )
 
 
+async def _apply_dependency_outcome(
+    ccat, cat, scope, source_name, phase, diary, chat_id, type_
+) -> bool:
+    """Record a dependency's outcome on ``phase`` BEFORE its body can run.
+
+    Looks the phase spec up in the merged set (built-in + external) and asks
+    the pure :func:`phases.dependency_outcome`. When a dependency is ``error``
+    the phase is recorded ``error`` (reason names that dependency); when it is
+    ``skipped`` the phase is recorded ``skipped``. Returns True when the phase
+    was terminalized (the caller must NOT run its body) and False when no
+    dependency is failed.
+    """
+    spec = (await merged_phases(ccat, cat)).get(phase)
+    if spec is None:
+        return False
+    outcome = dependency_outcome(spec, diary)
+    if outcome is None:
+        return False
+    state, reason = outcome
+    if state == PHASE_STATE_ERROR:
+        await _mark_phase_error(
+            ccat, scope, source_name, phase, reason, chat_id, type_
+        )
+    else:
+        await _mark_phase_skipped(
+            ccat, scope, source_name, phase, reason, chat_id, type_
+        )
+    return True
+
+
 async def _phase_applies(ccat, cat, phase, diary) -> tuple[bool, Optional[str]]:
     """Ask the registered phase whether it applies to this source.
 
@@ -1891,6 +1923,36 @@ async def reembed_sources(
             stored_points = None
             while pending:
                 doc = await get_status(ccat.agent_key, scope, source_name)
+                diary = get_completed_phases(doc)
+
+                # ---- DEPENDENCY PROPAGATION: BEFORE any phase body ----
+                # A phase whose dependency errored/skipped inherits that
+                # outcome — the reason names the offending dependency — and its
+                # body NEVER runs. Scanning the whole pending list (not only
+                # its head) makes the result independent of probe order; each
+                # pass terminalizes exactly one phase, so a chain propagates one
+                # link per iteration and always makes progress.
+                propagated = False
+                for candidate in pending:
+                    if await _apply_dependency_outcome(
+                        ccat, cat, scope, source_name, candidate["phase"],
+                        diary, chat_id, "url" if is_url(source_name) else "file",
+                    ):
+                        propagated = True
+                        break
+                if propagated:
+                    doc = await get_status(ccat.agent_key, scope, source_name)
+                    pending = await _probe_pending(ccat, cat, source_name, doc)
+                    if not pending:
+                        # The derived status reflects the propagated outcome:
+                        # any ``error`` -> source ``error``; all
+                        # terminal-non-error -> ``complete``.
+                        await _refresh_source_status(
+                            ccat, cat, scope, source_name, chat_id
+                        )
+                        break
+                    continue
+
                 if _should_stop_for_error(doc):
                     # ERROR absorbing: never advance a failed row
                     break

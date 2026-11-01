@@ -67,7 +67,7 @@ filesystem access at import time.
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from cat import hook
 from cat.log import log
@@ -720,6 +720,30 @@ def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:
             if isinstance(p, dict) and p.get("phase") is not None
         }
     return {}
+
+
+def dependency_outcome(phase, diary) -> Optional[tuple[str, str]]:
+    """Propagate a dependency's terminal outcome onto a dependent phase.
+
+    Pure, clock-free decision (no I/O). Iterates ``phase.depends_on`` in its
+    DECLARED order and returns the FIRST offending dependency:
+
+    - ``("error", "dependency <dep> is error")`` when that dependency's diary
+      entry is ``error``;
+    - ``("skipped", "dependency <dep> is skipped")`` when it is ``skipped``;
+    - ``None`` when no dependency is terminal-failed.
+
+    A dependent of a failed phase can never run its body or become
+    ``complete``; the dispatcher records the returned state instead.
+    """
+    diary = diary if isinstance(diary, dict) else {}
+    for dep in getattr(phase, "depends_on", ()) or ():
+        state = phase_state(diary.get(dep))
+        if state == PHASE_STATE_ERROR:
+            return PHASE_STATE_ERROR, f"dependency {dep} is error"
+        if state == PHASE_STATE_SKIPPED:
+            return PHASE_STATE_SKIPPED, f"dependency {dep} is skipped"
+    return None
 
 
 def is_phase_stale(
