@@ -172,10 +172,11 @@ depends on, and the machine decides *whether, when and in what order* it runs.
 These are current limitations, stated plainly so consumers can plan around
 them:
 
-1. **Agent deletion per-file cascade.** Deleting an agent still uses the
-   blanket wipe for its files. The reverse-order phase path described in
-   section 7 covers **single-file deletion only**, not the per-file cascade of
-   an agent teardown.
+1. **Agent deletion per-file cascade.** The cascade fires the same
+   `before_file_manager_file_delete` hook, so every phase's `delete()` runs in
+   reverse order before the blanket wipe. The blanket wipe
+   (`delete_tenant_points`) still runs afterwards as a redundant catch-all; it
+   is not removed because that would require a CAT core change.
 2. **Graph purge ordering.** The graph purge walks from the source's
    `Document`s, so it must run **before** any vector wipe. Until entities
    carry their own source locator, removing the vectors first would leave the
