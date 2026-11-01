@@ -66,6 +66,7 @@ filesystem access at import time.
 
 import contextvars
 import inspect
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
@@ -201,10 +202,14 @@ class IngestionPhase(ABC):
                 value = get_env_float(self.not_ready_budget_env)
             except (TypeError, ValueError):
                 value = None
-            if value is not None and value >= 0:
+            # A non-finite value (``inf``/``nan``) would either never expire or
+            # break the comparison, and a negative budget is meaningless: both
+            # are rejected so resolution falls through to the next step.
+            if value is not None and math.isfinite(value) and value >= 0:
                 return float(value)
-        if self.not_ready_budget_seconds is not None:
-            return float(self.not_ready_budget_seconds)
+        declared = self.not_ready_budget_seconds
+        if declared is not None and math.isfinite(declared) and declared >= 0:
+            return float(declared)
         return None
 
     @property

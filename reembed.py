@@ -147,10 +147,18 @@ def _not_ready_max_seconds() -> float:
     """Wall-clock budget a row may stay ``not_ready`` before it becomes ERROR.
 
     ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` (default 3600). An explicit ``0``
-    means "expire immediately" (used by tests); unset/negative falls back to
-    the default.
+    means "expire immediately" (used by tests); unset/negative/malformed falls
+    back to the default.
     """
-    value = get_env_int("CAT_INGESTION_NOT_READY_MAX_SECONDS")
+    raw = os.getenv("CAT_INGESTION_NOT_READY_MAX_SECONDS")
+    try:
+        value = get_env_int("CAT_INGESTION_NOT_READY_MAX_SECONDS")
+    except (TypeError, ValueError):
+        log.warning(
+            f"Invalid CAT_INGESTION_NOT_READY_MAX_SECONDS={raw!r}; "
+            f"falling back to {int(_NOT_READY_MAX_SECONDS_DEFAULT)}s"
+        )
+        return _NOT_READY_MAX_SECONDS_DEFAULT
     if value is not None and value >= 0:
         return float(value)
     return _NOT_READY_MAX_SECONDS_DEFAULT

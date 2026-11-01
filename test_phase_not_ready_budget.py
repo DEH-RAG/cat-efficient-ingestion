@@ -5,7 +5,12 @@ Covers:
       (the clock is driven, nothing sleeps);
   (b) a phase with no declaration still uses the generic 3600s;
   (c) the declared env override wins over the declared value;
-  (d) the reason string (and the WARNING log) names the budget actually used.
+  (d) the reason string (and the WARNING log) names the budget actually used;
+  (e) a non-finite env override (``inf``) is rejected, falling back to the
+      declared value and then to the generic 3600s;
+  (f) a malformed generic env value falls back to 3600s with a WARNING and
+      no exception;
+  (g) ``nan`` and negative values are rejected at both levels.
 
 The plugin loader imports EVERY ``.py`` under a plugin folder, so the whole
 body lives inside ``if __name__ == "__main__":`` and importing this file
@@ -245,11 +250,87 @@ if __name__ == "__main__":
         assert warnings and "max 300s" in warnings[0], log.warnings
         print("PASS (d) reason and WARNING name the 300s budget used")
 
+    async def test_e_inf_env_falls_back_to_declared_then_generic():
+        _clear_env()
+        os.environ[_LLM_ENV] = "inf"
+        declared = FakePhase(
+            "graph_llm_extraction",
+            budget=300.0,
+            env=_LLM_ENV,
+        )
+        ok, state, log, sleeps = await _run([declared], step=100.0)
+        assert ok is False
+        assert state.doc["status"] == "error", state.doc
+        assert len(sleeps) == 3, sleeps  # 0s, 100s, 200s -> 300s expires
+        error = state.doc.get("error") or ""
+        assert "max 300s" in error, error
+
+        undeclared = FakePhase("graph_llm_extraction", env=_LLM_ENV)
+        ok, state, log, sleeps = await _run([undeclared], step=1000.0)
+        assert ok is False
+        assert state.doc["status"] == "error", state.doc
+        assert len(sleeps) == 4, sleeps  # 0s..3000s -> 4000s
+        error = state.doc.get("error") or ""
+        assert "max 3600s" in error, error
+        print(
+            "PASS (e) env inf rejected -> declared 300s, then generic 3600s"
+        )
+
+    async def test_f_malformed_generic_env_falls_back_to_3600():
+        _clear_env()
+        os.environ[_GENERIC_ENV] = "not-a-number"
+        try:
+            phase = FakePhase("graph_llm_extraction")
+            ok, state, log, sleeps = await _run([phase], step=1000.0)
+            assert ok is False
+            assert state.doc["status"] == "error", state.doc
+            assert len(sleeps) == 4, sleeps  # 0s..3000s -> 4000s
+            error = state.doc.get("error") or ""
+            assert "max 3600s" in error, error
+            warnings = [
+                m for m in log.warnings if "CAT_INGESTION_NOT_READY_MAX_SECONDS" in m
+            ]
+            assert warnings, log.warnings
+            assert "not-a-number" in warnings[0], warnings[0]
+        finally:
+            _clear_env()
+        print("PASS (f) malformed generic env -> 3600s WARNING, no exception")
+
+    async def test_g_nan_and_negative_values_are_rejected():
+        _clear_env()
+        os.environ[_LLM_ENV] = "nan"
+        assert FakePhase("graph_llm_extraction", env=_LLM_ENV).not_ready_budget() is None
+        assert (
+            FakePhase(
+                "graph_llm_extraction", budget=300.0, env=_LLM_ENV
+            ).not_ready_budget()
+            == 300.0
+        )
+        os.environ[_LLM_ENV] = "-5"
+        assert FakePhase("graph_llm_extraction", env=_LLM_ENV).not_ready_budget() is None
+        assert (
+            FakePhase(
+                "graph_llm_extraction", budget=float("nan")
+            ).not_ready_budget()
+            is None
+        )
+        assert (
+            FakePhase(
+                "graph_llm_extraction", budget=-1.0
+            ).not_ready_budget()
+            is None
+        )
+        _clear_env()
+        print("PASS (g) nan and negative values rejected at env and declared levels")
+
     async def _main():
         await test_a_declared_budget_expires_at_300()
         await test_b_undeclared_phase_uses_generic_3600()
         await test_c_env_override_wins_over_declared_value()
         await test_d_reason_names_the_budget_actually_used()
+        await test_e_inf_env_falls_back_to_declared_then_generic()
+        await test_f_malformed_generic_env_falls_back_to_3600()
+        await test_g_nan_and_negative_values_are_rejected()
 
     try:
         asyncio.run(_main())
@@ -258,4 +339,4 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         _clear_env()
-    print("OK per-phase not-ready budget (four tests)")
+    print("OK per-phase not-ready budget (seven tests)")
