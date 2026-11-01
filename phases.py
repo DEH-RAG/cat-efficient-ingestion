@@ -71,6 +71,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 from cat import hook
+from cat.env import get_env_float
 from cat.log import log
 
 from .hooks import (
@@ -172,6 +173,39 @@ class IngestionPhase(ABC):
     #: Optional narrowing of the settings that feed :meth:`tag` (see
     #: :class:`PhaseSpec`). ``None`` uses the whole settings value.
     settings_check: Any = None
+    #: Optional wall-clock budget (seconds) this phase may stay ``not_ready``
+    #: before the machine marks it ``error``. ``None`` uses the generic
+    #: ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` budget. An LLM-backed phase sets
+    #: this (and :attr:`not_ready_budget_env`) so an upstream model failure
+    #: does not hold the source for the generic hour.
+    not_ready_budget_seconds: float | None = None
+    #: Optional env var overriding :attr:`not_ready_budget_seconds` when set to
+    #: a non-negative number. Unset/invalid falls back to the declared value.
+    not_ready_budget_env: str | None = None
+
+    def not_ready_budget(self) -> float | None:
+        """Resolve this phase's own not-ready budget, or ``None``.
+
+        Resolution order for the PHASE's budget:
+
+        1. :attr:`not_ready_budget_env`, when declared and set to a
+           non-negative number;
+        2. :attr:`not_ready_budget_seconds`, when declared.
+
+        Returns ``None`` when the phase declares no budget, which makes the
+        caller fall back to the generic
+        ``CAT_INGESTION_NOT_READY_MAX_SECONDS``.
+        """
+        if self.not_ready_budget_env:
+            try:
+                value = get_env_float(self.not_ready_budget_env)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value >= 0:
+                return float(value)
+        if self.not_ready_budget_seconds is not None:
+            return float(self.not_ready_budget_seconds)
+        return None
 
     @property
     def name(self) -> str:

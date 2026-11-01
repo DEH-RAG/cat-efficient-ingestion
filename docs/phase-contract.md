@@ -165,6 +165,8 @@ A phase plugin provides only this surface:
 | `delete` | Purges this phase's artifacts for a source. |
 | `tag` | Returns the configuration fingerprint of the settings the phase consumes. |
 | `applies_to` | CAPABILITY check: `(True, None)` when the phase applies, `(False, reason)` when it does not (recorded `skipped`). |
+| `not_ready_budget_seconds` | OPTIONAL wall-clock budget (seconds) this phase may stay `not_ready` before it is marked `error`. `None` (default) uses the generic `CAT_INGESTION_NOT_READY_MAX_SECONDS`. |
+| `not_ready_budget_env` | OPTIONAL env var that overrides `not_ready_budget_seconds` when set to a non-negative number. Resolution order: declared env var → declared value → generic budget. |
 
 The plugin owns **none** of the following: diary state, staleness detection,
 locks, retries, or error propagation. Those are owned by the phase machine. A

@@ -156,6 +156,43 @@ def _not_ready_max_seconds() -> float:
     return _NOT_READY_MAX_SECONDS_DEFAULT
 
 
+async def _not_ready_budget_for(phase_id: str, cat=None) -> float:
+    """Wall-clock budget for ``phase_id``, honoring a per-phase declaration.
+
+    Resolution order:
+
+    1. the phase's declared env var (``not_ready_budget_env``);
+    2. the phase's declared value (``not_ready_budget_seconds``);
+    3. the generic ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` (default 3600).
+
+    A phase is resolved through :func:`phases.get_phases` so both a built-in
+    and a plugin-declared (MyGRAPH/CATALOG) phase can carry its own budget.
+    Resolution failures fall back to the generic budget, never to an error.
+    """
+    try:
+        phases = await get_phases(cat)
+    except Exception as e:  # noqa: BLE001 - a budget lookup must not break ingestion
+        log.warning(
+            f"Could not resolve the phases for the not-ready budget of "
+            f"{phase_id}: {e}"
+        )
+        phases = []
+    for phase in phases:
+        if getattr(phase, "id", None) != phase_id:
+            continue
+        try:
+            declared = phase.not_ready_budget()
+        except Exception as e:  # noqa: BLE001 - same fallback as above
+            log.warning(
+                f"Phase {phase_id} not-ready budget lookup failed: {e}"
+            )
+            declared = None
+        if declared is not None:
+            return declared
+        break
+    return _not_ready_max_seconds()
+
+
 def _not_ready_retry_after(result) -> float:
     """Delay before re-running a not-ready phase (from the hook's ``retry_after``)."""
     value = (result or {}).get("retry_after") if isinstance(result, dict) else None
@@ -174,6 +211,7 @@ async def _wait_not_ready(
     chat_id,
     reason: str,
     retry_after: float,
+    cat=None,
 ) -> bool:
     """Keep a not-ready row NON-TERMINAL and bounded by wall-clock time.
 
@@ -190,6 +228,8 @@ async def _wait_not_ready(
         # never overwrite a terminal row (e.g. another worker finished it)
         return False
 
+    bound = await _not_ready_budget_for(phase, cat)
+
     now = time.time()
     hint = (doc or {}).get("phase_retry") if isinstance(doc, dict) else None
     hint = hint if isinstance(hint, dict) else {}
@@ -205,7 +245,7 @@ async def _wait_not_ready(
         log.info(
             f"Agent id: {ccat._id}. Phase {phase} for {source_name} is not ready; "
             f"keeping it pending (retry every {retry_after:.0f}s, max "
-            f"{_not_ready_max_seconds():.0f}s)"
+            f"{bound:.0f}s)"
         )
     else:
         try:
@@ -214,7 +254,6 @@ async def _wait_not_ready(
             attempts = 1
 
     elapsed = max(0.0, now - since)
-    bound = _not_ready_max_seconds()
     if elapsed >= bound:
         msg = (
             f"phase {phase} not ready after {elapsed:.0f}s (max {bound:.0f}s): {reason}"
@@ -1392,7 +1431,8 @@ async def _run_external_phase(
             retry_after = _not_ready_retry_after(result)
             reason = result.get("reason") or "external phase is not ready"
             if not await _wait_not_ready(
-                ccat, scope, source_name, phase, chat_id, reason, retry_after
+                ccat, scope, source_name, phase, chat_id, reason, retry_after,
+                cat=cat,
             ):
                 _set_outcome("error", reason)
                 return False
@@ -2331,6 +2371,7 @@ async def reembed_sources(
                                 if not await _wait_not_ready(
                                     ccat, scope, source_name, PHASE_EMBEDDING,
                                     chat_id, exc.reason, exc.retry_after,
+                                    cat=cat,
                                 ):
                                     break
                                 await asyncio.sleep(exc.retry_after)
