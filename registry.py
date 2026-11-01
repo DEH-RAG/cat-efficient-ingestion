@@ -102,6 +102,54 @@ BOOT_EPOCH = uuid.uuid4().hex
 #: Backward-compatible alias for the previous private name.
 _BOOT_ID = BOOT_EPOCH
 
+#: Default timeout (seconds) of the ingestion locks. ``distributed_lock`` uses
+#: the same value as the lock's auto-release TTL and as the acquisition
+#: blocking timeout. Generous because a phase body can run for minutes.
+#: Env-overridable through ``CAT_INGESTION_LOCK_TIMEOUT_SECONDS``.
+INGESTION_LOCK_TIMEOUT_DEFAULT = 300
+
+
+def ingestion_lock_timeout_seconds() -> float:
+    """Timeout used by :func:`source_lock` and :func:`phase_lock` (env-overridable)."""
+    value = get_env_int("CAT_INGESTION_LOCK_TIMEOUT_SECONDS")
+    return float(value) if value is not None and value > 0 else float(INGESTION_LOCK_TIMEOUT_DEFAULT)
+
+
+def source_lock(agent_id: str, source_key: str):
+    """Per-source ingestion lock.
+
+    **ORDERING RULE**: a caller acquires this SOURCE lock FIRST and, INSIDE it,
+    a :func:`phase_lock`; never the reverse. The delete path takes ONLY this
+    source lock (never a phase lock).
+
+    ``source_key`` is escaped with :func:`escape_glob`, so a source whose name
+    contains a glob metacharacter (``* ? [ ]``) cannot widen the lock key and
+    collide with another source. The lock is acquired through
+    ``cat.db.crud.distributed_lock`` — the only sanctioned locking primitive.
+    """
+    timeout = ingestion_lock_timeout_seconds()
+    return crud.distributed_lock(
+        f"ingestion-source:{agent_id}:{escape_glob(source_key)}",
+        timeout=timeout,
+        blocking_timeout=timeout,
+    )
+
+
+def phase_lock(agent_id: str, source_key: str, phase_id: str):
+    """Per-``(source, phase)`` ingestion lock.
+
+    **ORDERING RULE**: always acquired INSIDE :func:`source_lock` (source
+    FIRST, phase SECOND); never the reverse and never on its own in the delete
+    path. ``source_key`` is escaped with :func:`escape_glob` (see
+    :func:`source_lock`).
+    """
+    timeout = ingestion_lock_timeout_seconds()
+    return crud.distributed_lock(
+        f"ingestion-phase:{agent_id}:{escape_glob(source_key)}:{phase_id}",
+        timeout=timeout,
+        blocking_timeout=timeout,
+    )
+
 
 def _pod_name() -> str:
     """Best-effort pod/container name of the current process."""
@@ -1047,8 +1095,15 @@ async def claim_source_for_resume(
 
 
 async def delete_status(agent_id: str, scope: str, source: str) -> None:
-    """Delete the ingestion-status doc for a source."""
-    await crud.delete(status_key(agent_id, scope, source))
+    """Delete the ingestion-status doc for a source.
+
+    **ORDERING RULE**: the delete path takes ONLY the per-source lock and
+    NEVER a per-(source, phase) lock: it removes the whole row, not one phase.
+    Taking the source lock makes a delete wait for any in-flight per-source
+    phase sequence to finish instead of racing it.
+    """
+    async with source_lock(agent_id, source):
+        await crud.delete(status_key(agent_id, scope, source))
 
 
 async def clear_completed_phases(agent_id: str, scope: str, source: str) -> bool:

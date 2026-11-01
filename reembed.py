@@ -44,11 +44,13 @@ import mimetypes
 import os
 import time
 import uuid
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Optional
 from urllib.parse import urlparse
 
 from langchain_core.documents import Document
 from langchain_core.documents.base import Blob
+from redis.exceptions import LockError
 
 from cat.core_plugins.base_plugin.parsers import MimeTypeBasedParser
 from cat.db.cruds import settings as crud_settings
@@ -96,6 +98,7 @@ from .registry import (
     get_completed_phases,
     get_status,
     ingestion_canceled,
+    phase_lock,
     phase_state,
     record_phase_completed,
     record_phase_error,
@@ -105,6 +108,7 @@ from .registry import (
     set_phase,
     set_status,
     should_abandon,
+    source_lock,
 )
 from .split import split_oversized
 
@@ -1659,6 +1663,51 @@ async def _run_parsing_phase(
     return source_name, stored, len(docs), chunks_stored
 
 
+@asynccontextmanager
+async def _phase_guard(ccat, scope, source_name, phase):
+    """Acquire the per-``(source, phase)`` lock and re-check the diary under it.
+
+    Yields ``True`` when the caller must run the phase body and ``False`` when
+    the body must be skipped because another worker already terminalized the
+    entry (``complete`` / ``error`` / ``skipped``) or the lock timed out.
+
+    **ORDERING RULE** (see :func:`registry.source_lock`): the caller must
+    already hold the per-source lock. This guard takes the per-phase lock
+    INSIDE it — source FIRST, phase SECOND, never the reverse.
+
+    On a lock timeout the warning names agent/source/phase and the diary entry
+    is left EXACTLY as it was: no error write and no failure of the source.
+    """
+    lock_cm = phase_lock(ccat.agent_key, source_name, phase)
+    try:
+        await lock_cm.__aenter__()
+    except LockError as exc:
+        log.warning(
+            f"Agent id: {ccat._id}. Could not acquire the phase lock for "
+            f"source {source_name} phase {phase} within the timeout ({exc}); "
+            f"leaving the entry untouched and continuing with the next phase"
+        )
+        yield False
+        return
+    try:
+        # ---- RE-CHECK UNDER THE LOCK ----
+        # Between the probe that selected this phase and the lock acquisition
+        # another worker may have run it to completion. Re-read the diary and
+        # skip the body when the entry is already terminal.
+        doc = await get_status(ccat.agent_key, scope, source_name)
+        state = phase_state(get_completed_phases(doc).get(phase))
+        if state in (PHASE_STATE_COMPLETE, PHASE_STATE_ERROR, PHASE_STATE_SKIPPED):
+            log.info(
+                f"Agent id: {ccat._id}. Source {source_name}: phase {phase} is "
+                f"already {state!r} under the lock; skipping its body"
+            )
+            yield False
+            return
+        yield True
+    finally:
+        await lock_cm.__aexit__(None, None, None)
+
+
 async def reembed_sources(
     ccat,
     collection_name: VectorMemoryType,
@@ -1862,6 +1911,26 @@ async def reembed_sources(
             f"chunker {doc_chunker!r} -> {active_chunker_name!r})"
         )
 
+        # ---- ORDERING RULE: source lock FIRST, phase lock SECOND ----
+        # The per-source lock is held for the WHOLE per-source phase sequence
+        # (claim + every phase body). Each phase body then takes its own
+        # per-(source, phase) lock INSIDE it (see ``_phase_guard``) — never the
+        # reverse. The delete path takes ONLY this source lock, never a phase
+        # lock. A timeout here leaves nothing touched: continue with the next
+        # source instead of failing it.
+        source_locks = AsyncExitStack()
+        try:
+            await source_locks.enter_async_context(
+                source_lock(ccat.agent_key, source_name)
+            )
+        except LockError as exc:
+            log.warning(
+                f"Agent id: {ccat._id}. Could not acquire the source lock for "
+                f"{source_name} within the timeout ({exc}); leaving it "
+                f"untouched and continuing with the next source"
+            )
+            continue
+
         # ---- claim the per-source work (skip if another worker holds it) ----
         # A tracked source is claimed under its existing row; an UNTRACKED one
         # (legacy stored source with no status doc) has its row CREATED
@@ -1879,6 +1948,7 @@ async def reembed_sources(
         )
         if claimed is None:
             # another worker is already (re)processing this source
+            await source_locks.aclose()
             continue
 
         # Batch/recovery passes do not go through ``ingest_file``: keep the
@@ -1965,93 +2035,130 @@ async def reembed_sources(
                 phase_expected = None
                 phase_processed = None
 
-                # A phase may declare itself not applicable (e.g. a graph
-                # phase on a Qdrant agent): record ``skipped`` with the reason
-                # instead of running the body. The machine then re-probes; if
-                # every remaining phase is terminal-non-error the source
-                # completes through the derived-status path.
-                applies, skip_reason = await _phase_applies(
-                    ccat, cat, phase, get_completed_phases(doc)
-                )
-                if not applies:
-                    await _mark_phase_skipped(
-                        ccat, scope, source_name, phase, skip_reason, chat_id,
-                        "url" if is_url(source_name) else "file",
-                    )
-                    doc = await get_status(ccat.agent_key, scope, source_name)
-                    pending = await _probe_pending(ccat, cat, source_name, doc)
-                    if (
-                        not pending
-                        and not _should_stop_for_error(doc)
-                        and not has_live_running_phase(doc)
-                    ):
-                        await _refresh_source_status(
-                            ccat, cat, scope, source_name, chat_id
-                        )
-                        break
-                    continue
-
+                # Embedding with no reusable points is a full re-ingest: pick
+                # ``parsing_chunking`` BEFORE taking the phase lock, so no phase
+                # lock is ever held while another phase's body runs.
                 if phase == PHASE_EMBEDDING:
-                    # chunks (text) already stored for this source: chunk-reuse
-                    # path. For episodic sources, the chat must still exist.
-                    if chat_id and not (await ccat._find_stray_cat(str(chat_id))):
-                        log.warning(
-                            f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
-                        )
-                        await ccat.vector_memory_handler.delete_tenant_points(
-                            str(collection_name), metadata=_source_metadata(source_name, chat_id)
-                        )
-                        await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
-                        break
-
-                    await set_phase(
-                        ccat.agent_key, scope, source_name,
-                        PHASE_EMBEDDING,
-                        embedder_name=active_embedder_name,
-                        type_="url" if is_url(source_name) else "file",
-                        chat_id=chat_id,
-                    )
-                    source_points = stored_points or [
+                    embedding_points = stored_points or [
                         p for p in existing_points
                         if _point_matches_source(p, source_name, chat_id)
                     ]
-                    if source_points:
-                        # ``processing`` is written only for the phase body that
-                        # actually runs: the fall-through below re-parses
-                        # instead and must not leave a stale embedding entry.
-                        await _mark_phase_running(
-                            ccat, scope, source_name, PHASE_EMBEDDING, chat_id,
+                    if not embedding_points:
+                        phase = PHASE_PARSING_CHUNKING
+
+                # ---- ORDERING RULE: phase lock INSIDE the source lock ----
+                # The per-source lock is already held above. ``_phase_guard``
+                # takes this phase's own lock, then RE-READS the diary and
+                # returns False when another worker already terminalized the
+                # entry or the lock timed out (entry left untouched).
+                async with _phase_guard(
+                    ccat, scope, source_name, phase
+                ) as should_run:
+                    if not should_run:
+                        doc = await get_status(ccat.agent_key, scope, source_name)
+                        pending = await _probe_pending(ccat, cat, source_name, doc)
+                        if not pending:
+                            if (
+                                not _should_stop_for_error(doc)
+                                and not has_live_running_phase(doc)
+                            ):
+                                await _refresh_source_status(
+                                    ccat, cat, scope, source_name, chat_id
+                                )
+                            break
+                        continue
+
+                    # Use the post-lock diary for the applicability check.
+                    doc = await get_status(ccat.agent_key, scope, source_name)
+
+                    # A phase may declare itself not applicable (e.g. a graph
+                    # phase on a Qdrant agent): record ``skipped`` with the reason
+                    # instead of running the body. The machine then re-probes; if
+                    # every remaining phase is terminal-non-error the source
+                    # completes through the derived-status path.
+                    applies, skip_reason = await _phase_applies(
+                        ccat, cat, phase, get_completed_phases(doc)
+                    )
+                    if not applies:
+                        await _mark_phase_skipped(
+                            ccat, scope, source_name, phase, skip_reason, chat_id,
                             "url" if is_url(source_name) else "file",
                         )
-                        current_phase = PHASE_EMBEDDING
-                        try:
-                            embed_counts: dict = {}
-                            phase_products = await _embed_phase(
-                                ccat, collection_name, source_name, source_points,
-                                embedder, chat_id, cat, rabbit_hole,
-                                zero_norm_summary=zero_norm_summary,
-                                counts=embed_counts,
+                        doc = await get_status(ccat.agent_key, scope, source_name)
+                        pending = await _probe_pending(ccat, cat, source_name, doc)
+                        if (
+                            not pending
+                            and not _should_stop_for_error(doc)
+                            and not has_live_running_phase(doc)
+                        ):
+                            await _refresh_source_status(
+                                ccat, cat, scope, source_name, chat_id
                             )
-                            phase_expected = embed_counts.get("expected")
-                            phase_processed = embed_counts.get("processed")
-                        except _NothingStored as exc:
-                            # No valid vector at all: keep the row non-terminal
-                            # and retry the SAME phase until the time budget
-                            # expires (old points were NOT deleted). This is the
-                            # not_ready path, never a silent empty completion.
-                            if not await _wait_not_ready(
-                                ccat, scope, source_name, PHASE_EMBEDDING,
-                                chat_id, exc.reason, exc.retry_after,
-                            ):
-                                break
-                            await asyncio.sleep(exc.retry_after)
+                            break
+                        continue
+
+                    if phase == PHASE_EMBEDDING:
+                        # chunks (text) already stored for this source: chunk-reuse
+                        # path. For episodic sources, the chat must still exist.
+                        if chat_id and not (await ccat._find_stray_cat(str(chat_id))):
+                            log.warning(
+                                f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
+                            )
+                            await ccat.vector_memory_handler.delete_tenant_points(
+                                str(collection_name), metadata=_source_metadata(source_name, chat_id)
+                            )
+                            await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
+                            break
+
+                        await set_phase(
+                            ccat.agent_key, scope, source_name,
+                            PHASE_EMBEDDING,
+                            embedder_name=active_embedder_name,
+                            type_="url" if is_url(source_name) else "file",
+                            chat_id=chat_id,
+                        )
+                        source_points = embedding_points
+                        if source_points:
+                            # ``processing`` is written only for the phase body that
+                            # actually runs: the fall-through below re-parses
+                            # instead and must not leave a stale embedding entry.
+                            await _mark_phase_running(
+                                ccat, scope, source_name, PHASE_EMBEDDING, chat_id,
+                                "url" if is_url(source_name) else "file",
+                            )
+                            current_phase = PHASE_EMBEDDING
+                            try:
+                                embed_counts: dict = {}
+                                phase_products = await _embed_phase(
+                                    ccat, collection_name, source_name, source_points,
+                                    embedder, chat_id, cat, rabbit_hole,
+                                    zero_norm_summary=zero_norm_summary,
+                                    counts=embed_counts,
+                                )
+                                phase_expected = embed_counts.get("expected")
+                                phase_processed = embed_counts.get("processed")
+                            except _NothingStored as exc:
+                                # No valid vector at all: keep the row non-terminal
+                                # and retry the SAME phase until the time budget
+                                # expires (old points were NOT deleted). This is the
+                                # not_ready path, never a silent empty completion.
+                                if not await _wait_not_ready(
+                                    ccat, scope, source_name, PHASE_EMBEDDING,
+                                    chat_id, exc.reason, exc.retry_after,
+                                ):
+                                    break
+                                await asyncio.sleep(exc.retry_after)
+                                continue
+                            stored_points = None
+                            counter += 1
+                        else:
+                            # Unreachable: no reusable points is pre-selected as
+                            # ``parsing_chunking`` above, BEFORE the phase lock. If
+                            # it ever happens, re-probe instead of running another
+                            # phase's body while holding the embedding lock.
                             continue
-                        stored_points = None
-                        counter += 1
-                    else:
-                        # no stored points (fresh source / points were cleared):
-                        # fall through to a full re-ingest from parsing_chunking.
-                        phase = PHASE_PARSING_CHUNKING
+                    elif phase == PHASE_PARSING_CHUNKING:
+                        # ---- parsing_chunking phase body ----
                         await set_phase(
                             ccat.agent_key, scope, source_name,
                             PHASE_PARSING_CHUNKING,
@@ -2073,128 +2180,105 @@ async def reembed_sources(
                             )
                         )
                         phase_products = stored_points
-                elif phase == PHASE_PARSING_CHUNKING:
-                    # ---- parsing_chunking phase body ----
-                    await set_phase(
-                        ccat.agent_key, scope, source_name,
-                        PHASE_PARSING_CHUNKING,
-                        chunker_name=active_chunker_name,
-                        type_="url" if is_url(source_name) else "file",
-                        chat_id=chat_id,
-                    )
-                    await _mark_phase_running(
-                        ccat, scope, source_name, PHASE_PARSING_CHUNKING, chat_id,
-                        "url" if is_url(source_name) else "file",
-                    )
-                    current_phase = PHASE_PARSING_CHUNKING
-                    source_name, stored_points, phase_expected, phase_processed = (
-                        _unpack_parsing_result(
-                            await _run_parsing_phase(
-                                ccat, collection_name, source, source_name,
-                                chat_id, cat, rabbit_hole, active_chunker_name,
-                            )
+                    else:
+                        # external phase (e.g. MyGRAPH): dispatched through the
+                        # ``ingestion_phase_run`` hook (tri-state, hooks.py).
+                        # A phase nobody implements (hook returns None) fails hard
+                        # — it is an error, never a silent success. A phase that
+                        # reports ``done`` is recorded by the shared ATOMIC
+                        # completion write below and re-probed; ``not_ready`` is
+                        # retried (bounded) and an exceeded bound marks the row
+                        # ERROR. The machine stops on any ERROR (absorbing).
+                        await set_phase(
+                            ccat.agent_key, scope, source_name, phase,
+                            type_="url" if is_url(source_name) else "file",
+                            chat_id=chat_id,
                         )
-                    )
-                    phase_products = stored_points
-                else:
-                    # external phase (e.g. MyGRAPH): dispatched through the
-                    # ``ingestion_phase_run`` hook (tri-state, hooks.py).
-                    # A phase nobody implements (hook returns None) fails hard
-                    # — it is an error, never a silent success. A phase that
-                    # reports ``done`` is recorded by the shared ATOMIC
-                    # completion write below and re-probed; ``not_ready`` is
-                    # retried (bounded) and an exceeded bound marks the row
-                    # ERROR. The machine stops on any ERROR (absorbing).
-                    await set_phase(
-                        ccat.agent_key, scope, source_name, phase,
-                        type_="url" if is_url(source_name) else "file",
-                        chat_id=chat_id,
-                    )
-                    await _mark_phase_running(
-                        ccat, scope, source_name, phase, chat_id,
-                        "url" if is_url(source_name) else "file",
-                    )
-                    current_phase = phase
-                    external_counts: dict = {}
-                    external_outcome: dict = {}
-                    if not await _run_external_phase(
-                        ccat, cat, scope, source_name, phase, chat_id,
-                        counts=external_counts, outcome=external_outcome,
-                    ):
-                        # the row was marked ERROR (fail-hard / retry bound):
-                        # write the matching diary state and stop the machine;
-                        # the ERROR-absorbing check above never advances nor
-                        # resurrects it.
-                        await _mark_phase_error(
-                            ccat, scope, source_name, phase,
-                            external_outcome.get("reason")
-                            or f"external phase {phase} failed",
-                            chat_id, "url" if is_url(source_name) else "file",
-                        )
-                        current_phase = None
-                        break
-                    if external_outcome.get("status") == "skipped":
-                        await _mark_phase_skipped(
-                            ccat, scope, source_name, phase,
-                            external_outcome.get("reason"), chat_id,
+                        await _mark_phase_running(
+                            ccat, scope, source_name, phase, chat_id,
                             "url" if is_url(source_name) else "file",
                         )
-                        current_phase = None
-                        doc = await get_status(ccat.agent_key, scope, source_name)
-                        pending = await _probe_pending(ccat, cat, source_name, doc)
-                        if (
-                            not pending
-                            and not _should_stop_for_error(doc)
-                            and not has_live_running_phase(doc)
+                        current_phase = phase
+                        external_counts: dict = {}
+                        external_outcome: dict = {}
+                        if not await _run_external_phase(
+                            ccat, cat, scope, source_name, phase, chat_id,
+                            counts=external_counts, outcome=external_outcome,
                         ):
-                            await _refresh_source_status(
-                                ccat, cat, scope, source_name, chat_id
+                            # the row was marked ERROR (fail-hard / retry bound):
+                            # write the matching diary state and stop the machine;
+                            # the ERROR-absorbing check above never advances nor
+                            # resurrects it.
+                            await _mark_phase_error(
+                                ccat, scope, source_name, phase,
+                                external_outcome.get("reason")
+                                or f"external phase {phase} failed",
+                                chat_id, "url" if is_url(source_name) else "file",
                             )
+                            current_phase = None
                             break
-                        continue
-                    phase_products = True
-                    phase_expected = external_counts.get("expected")
-                    phase_processed = external_counts.get("processed")
+                        if external_outcome.get("status") == "skipped":
+                            await _mark_phase_skipped(
+                                ccat, scope, source_name, phase,
+                                external_outcome.get("reason"), chat_id,
+                                "url" if is_url(source_name) else "file",
+                            )
+                            current_phase = None
+                            doc = await get_status(ccat.agent_key, scope, source_name)
+                            pending = await _probe_pending(ccat, cat, source_name, doc)
+                            if (
+                                not pending
+                                and not _should_stop_for_error(doc)
+                                and not has_live_running_phase(doc)
+                            ):
+                                await _refresh_source_status(
+                                    ccat, cat, scope, source_name, chat_id
+                                )
+                                break
+                            continue
+                        phase_products = True
+                        phase_expected = external_counts.get("expected")
+                        phase_processed = external_counts.get("processed")
 
-                # ---- ATOMIC COMPLETION: the body returned ``done``, so the
-                # ---- phase is complete regardless of how many items it made
-                # ---- (item counts are telemetry only).
-                if not await _finish_phase(
-                    ccat, cat, scope, source_name, phase, chat_id, phase_products,
-                    expected=phase_expected, processed=phase_processed,
-                ):
-                    break
-                current_phase = None
+                    # ---- ATOMIC COMPLETION: the body returned ``done``, so the
+                    # ---- phase is complete regardless of how many items it made
+                    # ---- (item counts are telemetry only).
+                    if not await _finish_phase(
+                        ccat, cat, scope, source_name, phase, chat_id, phase_products,
+                        expected=phase_expected, processed=phase_processed,
+                    ):
+                        break
+                    current_phase = None
 
-                # ---- re-probe with the updated diary ----
-                doc = await get_status(ccat.agent_key, scope, source_name)
-                pending = await _probe_pending(ccat, cat, source_name, doc)
+                    # ---- re-probe with the updated diary ----
+                    doc = await get_status(ccat.agent_key, scope, source_name)
+                    pending = await _probe_pending(ccat, cat, source_name, doc)
 
-                # The diary was fresh while the store was empty: the re-parse
-                # just repopulated the points, but the diary still says
-                # ``embedding`` is fresh (its dependency marker did not change),
-                # so force the matching re-embed in THIS pass. The store check
-                # alone cannot catch this: the staging pass writes empty-vector
-                # points, which the store probe counts as present.
-                if store_empty_forced and phase == PHASE_PARSING_CHUNKING:
-                    if not any(p.get("phase") == PHASE_EMBEDDING for p in pending):
-                        pending = [{"phase": PHASE_EMBEDDING}, *pending]
+                    # The diary was fresh while the store was empty: the re-parse
+                    # just repopulated the points, but the diary still says
+                    # ``embedding`` is fresh (its dependency marker did not change),
+                    # so force the matching re-embed in THIS pass. The store check
+                    # alone cannot catch this: the staging pass writes empty-vector
+                    # points, which the store probe counts as present.
+                    if store_empty_forced and phase == PHASE_PARSING_CHUNKING:
+                        if not any(p.get("phase") == PHASE_EMBEDDING for p in pending):
+                            pending = [{"phase": PHASE_EMBEDDING}, *pending]
 
-                # ---- terminal COMPLETED when nothing is stale anymore ----
-                if (
-                    not pending
-                    and not _should_stop_for_error(doc)
-                    and not has_live_running_phase(doc)
-                ):
-                    # Derived source status: ``complete`` only because no
-                    # phase is pending/processing and none errored.
-                    await _refresh_source_status(
-                        ccat, cat, scope, source_name, chat_id
-                    )
-                    break
-                if not pending:
-                    # an error row appeared while recording: never resurrect it
-                    break
+                    # ---- terminal COMPLETED when nothing is stale anymore ----
+                    if (
+                        not pending
+                        and not _should_stop_for_error(doc)
+                        and not has_live_running_phase(doc)
+                    ):
+                        # Derived source status: ``complete`` only because no
+                        # phase is pending/processing and none errored.
+                        await _refresh_source_status(
+                            ccat, cat, scope, source_name, chat_id
+                        )
+                        break
+                    if not pending:
+                        # an error row appeared while recording: never resurrect it
+                        break
 
         except _IngestionCanceled:
             # The agent was deleted mid-phase: stop this source (and the pass)
@@ -2228,6 +2312,7 @@ async def reembed_sources(
                 await _set_status(ccat, source_name, IngestionStatus.ERROR, error=str(e), chat_id=chat_id)
         finally:
             await _stop_heartbeat(ccat, source_name, scope, cat)
+            await source_locks.aclose()
 
     log.info(f"Agent id: {ccat._id}. Embedded {counter} files to the vector memory")
     for source_name, info in zero_norm_summary.items():
