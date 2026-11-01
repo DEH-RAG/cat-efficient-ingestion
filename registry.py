@@ -1144,6 +1144,17 @@ async def claim_source_for_resume(
         return doc
 
 
+async def _delete_status_doc(agent_id: str, scope: str, source: str) -> None:
+    """Remove the status doc WITHOUT taking the source lock.
+
+    Only for callers that already HOLD :func:`source_lock` for the whole
+    delete operation (see ``phases.delete_source``); taking the lock twice in
+    the same task would deadlock. Every other caller uses
+    :func:`delete_status`.
+    """
+    await crud.delete(status_key(agent_id, scope, source))
+
+
 async def delete_status(agent_id: str, scope: str, source: str) -> None:
     """Delete the ingestion-status doc for a source.
 
@@ -1153,7 +1164,7 @@ async def delete_status(agent_id: str, scope: str, source: str) -> None:
     phase sequence to finish instead of racing it.
     """
     async with source_lock(agent_id, source):
-        await crud.delete(status_key(agent_id, scope, source))
+        await _delete_status_doc(agent_id, scope, source)
 
 
 async def clear_completed_phases(

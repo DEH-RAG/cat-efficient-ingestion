@@ -115,8 +115,12 @@ ingestion-phase:<agent>:<source>:<phase>
 
 Ordering is strict: the source lock is always acquired **first**, and the
 phase lock is acquired **inside** it. The reverse is never done. The delete
-path takes only the source lock. Lock keys escape the (untrusted) source and
-agent identifiers with `escape_glob`, so a source name containing glob
+path takes only the source lock, held for the **whole operation** (the
+`deleting` write, every phase `delete()` and the final row removal), so a
+per-source phase sequence and a deletion can never interleave. A dispatching
+pass also aborts a source whose status is `deleting`, so an interrupted
+deletion is never dispatched against. Lock keys escape the (untrusted) source
+and agent identifiers with `escape_glob`, so a source name containing glob
 metacharacters cannot collide with another source's key space.
 
 ## 6. State/data lockstep

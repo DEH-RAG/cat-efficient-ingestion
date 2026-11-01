@@ -108,7 +108,15 @@ if __name__ == "__main__":
             self.saved = {}
 
         def __enter__(self):
-            for name in ("phase_delete_active", "get_phases", "get_status", "set_status", "delete_status", "log"):
+            for name in (
+                "phase_delete_active",
+                "get_phases",
+                "get_status",
+                "set_status",
+                "_delete_status_doc",
+                "source_lock",
+                "log",
+            ):
                 self.saved[name] = getattr(phases, name)
 
             async def _gate(cat):
@@ -117,11 +125,19 @@ if __name__ == "__main__":
             async def _phases(cat):
                 return list(self.phase_list)
 
+            class _NullLock:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *exc):
+                    return False
+
             phases.phase_delete_active = _gate
             phases.get_phases = _phases
             phases.get_status = self.store.get_status
             phases.set_status = self.store.set_status
-            phases.delete_status = self.store.delete_status
+            phases._delete_status_doc = self.store.delete_status
+            phases.source_lock = lambda agent_id, source: _NullLock()
             phases.log = self.log
             return self
 

@@ -91,12 +91,13 @@ from .registry import (
     PHASE_STATE_PROCESSING,
     PHASE_STATE_SKIPPED,
     IngestionStatus,
-    delete_status,
+    _delete_status_doc,
     get_completed_phases,
     get_status,
     phase_state,
     set_status,
     should_abandon,
+    source_lock,
 )
 
 #: Scope (``"agent"`` or a chat id) of the file deletion currently running.
@@ -889,10 +890,24 @@ async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
 
     scope = _delete_scope(cat, scope)
 
+    # ORDERING RULE: the delete path takes ONLY the per-source lock (never a
+    # phase lock) and holds it for the WHOLE operation — the ``deleting``
+    # write, every phase ``delete()`` and the final row removal. A concurrent
+    # re-embed pass holds the same lock for its whole per-source sequence, so
+    # it cannot write artifacts that this purge has just removed (and cannot
+    # re-create them after the row is gone).
+    async with source_lock(agent_id, source):
+        return await _delete_source_locked(source, cat, agent_id, scope)
+
+
+async def _delete_source_locked(
+    source: str, cat, agent_id: str, scope: str
+) -> bool:
+    """The phase-path body of :func:`delete_source`, run under the source lock."""
     if not await phase_delete_active(cat):
         # Gate FALSE: STANDARD deletion. No ``deleting`` row, no error, and
         # the record (including a stale ``deleting`` one) is removed.
-        await delete_status(agent_id, scope, source)
+        await _delete_status_doc(agent_id, scope, source)
         return False
 
     try:
@@ -909,7 +924,7 @@ async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
     plugin_phases = [phase for phase in phases if phase.id not in PHASES]
     if not plugin_phases:
         # Only the always-present built-ins: the standard wipe owns them.
-        await delete_status(agent_id, scope, source)
+        await _delete_status_doc(agent_id, scope, source)
         return False
 
     doc = await get_status(agent_id, scope, source)
@@ -922,7 +937,7 @@ async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
             f"Agent id: {agent_id}. Source {source} has diary phases that are "
             f"no longer installed ({uninstalled}); using the standard deletion."
         )
-        await delete_status(agent_id, scope, source)
+        await _delete_status_doc(agent_id, scope, source)
         return False
 
     already: set[str] = set()
@@ -998,7 +1013,7 @@ async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
         _DELETE_SCOPE.reset(token)
 
     # STATE LAST: the row is removed only after every phase delete succeeded.
-    await delete_status(agent_id, scope, source)
+    await _delete_status_doc(agent_id, scope, source)
     return True
 
 

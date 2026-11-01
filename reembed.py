@@ -895,15 +895,67 @@ def _point_meta(record) -> dict:
     return (record.payload or {}).get("metadata", {}) or {}
 
 
+def _catalogue_card_point_id(
+    agent_key: str,
+    chat_id,
+    source: str,
+    index: int = 0,
+    start_index=None,
+) -> str:
+    """The deterministic card point id, mirrored from the catalogue writer.
+
+    Kept byte-for-byte identical to ``cat_alog._catalogue_card_point_id`` so
+    this plugin can recognise a card by IDENTITY without importing the
+    catalogue plugin (an optional dependency that may be absent).
+    """
+    if start_index is not None:
+        suffix = "" if start_index == 0 else f":s{int(start_index)}"
+    else:
+        suffix = "" if index == 0 else f":{index}"
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"catalogue_card:{agent_key}:{chat_id or ''}:{source}{suffix}",
+    ).hex
+
+
+def _is_catalogue_card_record(meta: dict, point_id, agent_key) -> bool:
+    """Whether a stored record IS a catalogue card, by IDENTITY (not the flag).
+
+    The ``is_catalogue_card`` flag alone is not authoritative: a real source
+    chunk can carry it when stale card metadata was merged onto the chunk.
+    Only a point stored at the deterministic card id is a card (or a card
+    segment), so the id — derived from the record's own
+    ``source``/``chat_id``/``chunk_index``/``start_index`` — is the test.
+    """
+    if not meta.get("is_catalogue_card") or point_id is None:
+        return False
+    source = meta.get("source")
+    if not source:
+        return False
+    index = meta.get("chunk_index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        index = 0
+    start_index = meta.get("start_index")
+    if isinstance(start_index, bool) or not isinstance(start_index, int):
+        start_index = None
+    expected = _catalogue_card_point_id(
+        agent_key, meta.get("chat_id"), str(source), index, start_index=start_index,
+    )
+    return str(point_id) == expected
+
+
 async def _purge_parsing_phase(ccat, collection_name, source_name, chat_id) -> int:
     """PURGE ``parsing_chunking``: the source's staging/chunk artifacts only.
 
     Deletes every stored point of THIS source in THIS collection EXCEPT the
-    catalogue-card segments (``is_catalogue_card``), which are another phase's
-    product. Image points/files are parsing products too, so the saved image
-    files are cleaned up first. Never touches other sources.
+    catalogue-card segments, which are another phase's product. A card is
+    recognised by IDENTITY (its deterministic point id), not by the
+    ``is_catalogue_card`` flag: a real chunk can carry a stale flag and must
+    still be purged. Image points/files are parsing products too, so the saved
+    image files are cleaned up first. Never touches other sources.
     """
     handler = ccat.vector_memory_handler
+    agent_key = getattr(ccat, "agent_key", None)
     await _cleanup_orphan_images(ccat, collection_name, source_name, chat_id)
     records, _ = await handler.get_all_tenant_points(
         str(collection_name),
@@ -912,7 +964,9 @@ async def _purge_parsing_phase(ccat, collection_name, source_name, chat_id) -> i
     )
     ids = []
     for record in records or []:
-        if _point_meta(record).get("is_catalogue_card") is True:
+        if _is_catalogue_card_record(
+            _point_meta(record), _point_id(record), agent_key
+        ):
             continue
         point_id = _point_id(record)
         if point_id is not None:
@@ -926,10 +980,13 @@ async def _purge_embedding_phase(ccat, collection_name, source_name, chat_id) ->
     """PURGE ``embedding``: ONLY the source's points with a REAL vector.
 
     A staging point carries ``vector={}`` (payload only) and MUST survive: it
-    is parsing's product and the parsing purge cleans it. Graph artifacts are
-    not vector points and are never touched here.
+    is parsing's product and the parsing purge cleans it. Catalogue-card
+    points belong to another phase and are excluded by IDENTITY (their
+    deterministic point id), never by the flag. Graph artifacts are not vector
+    points and are never touched here.
     """
     handler = ccat.vector_memory_handler
+    agent_key = getattr(ccat, "agent_key", None)
     records, _ = await handler.get_all_tenant_points(
         str(collection_name),
         metadata=_source_metadata(source_name, chat_id),
@@ -937,6 +994,10 @@ async def _purge_embedding_phase(ccat, collection_name, source_name, chat_id) ->
     )
     ids = []
     for record in records or []:
+        if _is_catalogue_card_record(
+            _point_meta(record), _point_id(record), agent_key
+        ):
+            continue
         if not _is_valid_embedding_vector(getattr(record, "vector", None)):
             continue
         point_id = _point_id(record)
@@ -1909,6 +1970,18 @@ async def reembed_sources(
         doc_chunker = (doc or {}).get("chunker_name")
         doc_phase = (doc or {}).get("phase")
 
+        # A ``deleting`` row means a concurrent (or previously interrupted)
+        # phase-path deletion owns this source. Never dispatch a phase body
+        # against it: even with the source lock closing the main race, an
+        # abandoned ``deleting`` row must abort the pass instead of writing
+        # artifacts the delete is removing.
+        if doc_status == IngestionStatus.DELETING.value:
+            log.info(
+                f"Agent id: {ccat._id}. Source {source_name}: deletion in "
+                f"progress (status 'deleting'); skipping this pass"
+            )
+            continue
+
         # Set when the diary says fresh but the store holds no chunk point: the
         # forced re-parse must be followed by a forced re-embed in THIS pass
         # (the diary's own re-probe cannot see the wipe).
@@ -2084,6 +2157,19 @@ async def reembed_sources(
             while pending:
                 doc = await get_status(ccat.agent_key, scope, source_name)
                 diary = get_completed_phases(doc)
+
+                # ---- DELETION GUARD: BEFORE any phase body ----
+                # Re-read the status under the source lock: a ``deleting`` row
+                # (set by a delete that raced a previous pass, or left behind
+                # by an interrupted one) must abort the pass for this source
+                # instead of letting the phase body write artifacts the delete
+                # is about to remove.
+                if (doc or {}).get("status") == IngestionStatus.DELETING.value:
+                    log.info(
+                        f"Agent id: {ccat._id}. Source {source_name}: deletion "
+                        f"in progress (status 'deleting'); aborting the pass"
+                    )
+                    break
 
                 # ---- DEPENDENCY PROPAGATION: BEFORE any phase body ----
                 # A phase whose dependency errored/skipped inherits that

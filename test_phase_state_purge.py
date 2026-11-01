@@ -143,20 +143,24 @@ if __name__ == "__main__":
 
     async def test_a_expired_lease_purges_then_reruns():
         old = time.time() - (registry.phase_lease_seconds() + 60)
+        card_id = reembed._catalogue_card_point_id("phase_agent", None, "doc.txt")
         handler = FakeHandler([
             Point("staging"),
-            Point("card", vector=[1.0, 0.0], is_catalogue_card=True),
+            Point(card_id, vector=[1.0, 0.0], is_catalogue_card=True),
+            # a real chunk carrying a STALE card flag: identity says chunk
+            Point("stale", is_catalogue_card=True),
         ])
         doc = {"completed_phases": {"parsing_chunking": _running(old)}}
         reset_log = []
         merged = {"parsing_chunking": object(), "embedding": object()}
         with Seams(merged, reset_log=reset_log):
             result = await reembed._recover_abandoned_phases(
-                _ccat(handler), None, "declarative", "agent", "doc.txt", None, doc
+                _ccat(handler), _ccat(handler), "declarative", "agent",
+                "doc.txt", None, doc,
             )
         assert result is True, result
-        assert handler.deleted_ids == ["staging"], handler.deleted_ids
-        assert [p.id for p in handler.points] == ["card"], handler.points
+        assert handler.deleted_ids == ["staging", "stale"], handler.deleted_ids
+        assert [p.id for p in handler.points] == [card_id], handler.points
         assert reset_log == [["parsing_chunking"]], reset_log
         # The reset entry is stale again -> the machine re-runs it from scratch
         # only AFTER the purge removed its products above.
@@ -267,19 +271,25 @@ if __name__ == "__main__":
         print("PASS (e) missing purge logs WARNING and leaves the entry running")
 
     async def test_f_embedding_purge_only_real_vectors():
+        card_id = reembed._catalogue_card_point_id("phase_agent", None, "doc.txt")
         handler = FakeHandler([
             Point("staging", vector={}),
             Point("real", vector=[0.5, 0.5]),
-            Point("card", vector=[1.0, 0.0], is_catalogue_card=True),
+            Point(card_id, vector=[1.0, 0.0], is_catalogue_card=True),
+            # a real chunk carrying a STALE card flag: identity says chunk
+            Point("stale", vector=[0.2, 0.8], is_catalogue_card=True),
         ])
         removed = await reembed._purge_embedding_phase(
             _ccat(handler), "declarative", "doc.txt", None
         )
         assert removed == 2, removed
-        assert sorted(handler.deleted_ids) == ["card", "real"], handler.deleted_ids
+        assert sorted(handler.deleted_ids) == ["real", "stale"], handler.deleted_ids
         remaining = [p.id for p in handler.points]
-        assert remaining == ["staging"], remaining
-        print("PASS (f) embedding purge deletes only real-vector points; staging survives")
+        assert remaining == ["staging", card_id], remaining
+        print(
+            "PASS (f) embedding purge deletes real-vector chunks only; "
+            "staging + catalogue card survive"
+        )
 
     async def _main():
         await test_a_expired_lease_purges_then_reruns()

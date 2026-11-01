@@ -8,7 +8,10 @@ Covers:
   (c) a phase-lock timeout leaves the diary entry unchanged and logs a
       WARNING naming agent/source/phase;
   (d) the delete path takes ONLY the per-source lock (never a phase lock);
-  (e) lock keys escape glob metacharacters in the source name.
+  (e) lock keys escape glob metacharacters in the source name;
+  (f) ``phases.delete_source`` requests the source lock (and no phase lock);
+  (g) a concurrent per-source pass cannot interleave with ``delete_source``;
+  (h) the dispatch loop aborts a source whose status is ``deleting``.
 
 The plugin loader imports EVERY ``.py`` under a plugin folder, so the whole
 body lives inside ``if __name__ == "__main__":`` and importing this file
@@ -28,7 +31,7 @@ if __name__ == "__main__":
     from redis.exceptions import LockError
 
     from cat.db import crud as crud_module
-    from cat.core_plugins.cat_efficient_ingestion import reembed, registry
+    from cat.core_plugins.cat_efficient_ingestion import phases, reembed, registry
 
     AGENT = "lock_agent"
     SCOPE = "agent"
@@ -64,6 +67,11 @@ if __name__ == "__main__":
             self.blocking_override: float | None = None
             self.log = FakeLog()
             self.saved = {}
+            # delete_source seams
+            self.delete_gate = True
+            self.phase_objects = []
+            self.status_writes = []
+            self.status_deletes = []
 
         @asynccontextmanager
         async def distributed_lock(self, key_pattern, timeout=10.0, blocking_timeout=15.0):
@@ -93,6 +101,12 @@ if __name__ == "__main__":
                 "canceled": registry.ingestion_canceled,
                 "get_status": reembed.get_status,
                 "log": reembed.log,
+                "phases_delete_active": phases.phase_delete_active,
+                "phases_get_phases": phases.get_phases,
+                "phases_get_status": phases.get_status,
+                "phases_set_status": phases.set_status,
+                "phases_delete_status_doc": phases._delete_status_doc,
+                "phases_log": phases.log,
             }
 
             async def _store(key, doc, *args, **kwargs):
@@ -111,6 +125,26 @@ if __name__ == "__main__":
             async def _get_status(agent_id, scope, source):
                 return self.docs.get(registry.status_key(agent_id, scope, source))
 
+            async def _delete_active(cat):
+                return self.delete_gate
+
+            async def _get_phases(cat):
+                return list(self.phase_objects)
+
+            async def _phases_set_status(agent_id, scope, source, **kwargs):
+                self.status_writes.append((source, kwargs.get("status")))
+                doc = self.docs.setdefault(
+                    registry.status_key(agent_id, scope, source),
+                    {"source": source, "scope": scope, "completed_phases": {}},
+                )
+                if kwargs.get("status") is not None:
+                    doc["status"] = kwargs["status"].value
+                return doc
+
+            async def _phases_delete_status_doc(agent_id, scope, source):
+                self.status_deletes.append(source)
+                self.docs.pop(registry.status_key(agent_id, scope, source), None)
+
             crud_module.distributed_lock = self.distributed_lock
             crud_module.store = _store
             crud_module.delete = _delete
@@ -118,6 +152,12 @@ if __name__ == "__main__":
             registry.ingestion_canceled = _never_canceled
             reembed.get_status = _get_status
             reembed.log = self.log
+            phases.phase_delete_active = _delete_active
+            phases.get_phases = _get_phases
+            phases.get_status = _get_status
+            phases.set_status = _phases_set_status
+            phases._delete_status_doc = _phases_delete_status_doc
+            phases.log = self.log
             return self
 
         def __exit__(self, *exc):
@@ -128,6 +168,12 @@ if __name__ == "__main__":
             registry.ingestion_canceled = self.saved["canceled"]
             reembed.get_status = self.saved["get_status"]
             reembed.log = self.saved["log"]
+            phases.phase_delete_active = self.saved["phases_delete_active"]
+            phases.get_phases = self.saved["phases_get_phases"]
+            phases.get_status = self.saved["phases_get_status"]
+            phases.set_status = self.saved["phases_set_status"]
+            phases._delete_status_doc = self.saved["phases_delete_status_doc"]
+            phases.log = self.saved["phases_log"]
             return False
 
         def doc(self, diary=None):
@@ -280,12 +326,137 @@ if __name__ == "__main__":
                 assert "?" not in key.replace("\\?", ""), key
         print("PASS (e) lock keys escape source glob metacharacters")
 
+    class FakePhase:
+        """A plugin phase whose delete just records the call."""
+
+        depends_on = ()
+
+        def __init__(self, phase_id, events):
+            self.id = phase_id
+            self.events = events
+
+        async def delete(self, source, cat):
+            self.events.append(("delete_enter", source, time.perf_counter()))
+            await asyncio.sleep(0.01)
+            self.events.append(("delete_exit", source, time.perf_counter()))
+
+    async def test_f_delete_source_takes_only_the_source_lock():
+        events = []
+        with Harness() as h:
+            h.doc()
+            h.phase_objects = [FakePhase("fake_phase", events)]
+            ok = await phases.delete_source(SRC, _ccat())
+            assert ok is True, "the phase path must report success"
+
+            source_key = f"ingestion-source:{AGENT}:{crud_module.escape_glob(SRC)}"
+            assert h.requested == [source_key], h.requested
+            assert not any(
+                key.startswith("ingestion-phase:") for key in h.requested
+            ), f"delete path took a phase lock: {h.requested}"
+            assert [e[0] for e in events] == ["delete_enter", "delete_exit"], events
+            assert [w[1] for w in h.status_writes] == [
+                registry.IngestionStatus.DELETING,
+                registry.IngestionStatus.DELETING,
+            ], h.status_writes
+            assert h.status_deletes == [SRC], h.status_deletes
+        print("PASS (f) delete_source takes ONLY the source lock, no phase lock")
+
+    async def test_g_delete_cannot_interleave_with_a_pass():
+        events = []
+        with Harness() as h:
+            h.doc()
+            h.phase_objects = [FakePhase("fake_phase", events)]
+
+            async def pass_worker():
+                # what reembed_sources holds for the whole per-source sequence
+                async with registry.source_lock(AGENT, SRC):
+                    events.append(("pass_enter", time.perf_counter()))
+                    await asyncio.sleep(0.05)
+                    events.append(("pass_exit", time.perf_counter()))
+
+            task = asyncio.create_task(pass_worker())
+            await asyncio.sleep(0.01)
+            ok = await phases.delete_source(SRC, _ccat())
+            await task
+            assert ok is True, "the delete must wait and then succeed"
+
+            names = [e[0] for e in events]
+            assert names == [
+                "pass_enter",
+                "pass_exit",
+                "delete_enter",
+                "delete_exit",
+            ], events
+        print("PASS (g) the pass and delete_source never overlap")
+
+    async def test_h_dispatch_aborts_on_deleting():
+        import types
+
+        with Harness() as h:
+            key = registry.status_key(AGENT, SCOPE, SRC)
+            h.docs[key] = {
+                "source": SRC,
+                "scope": SCOPE,
+                "status": registry.IngestionStatus.DELETING.value,
+                "completed_phases": {},
+            }
+            claimed = []
+
+            async def _claim(*args, **kwargs):
+                claimed.append(args)
+                return None
+
+            async def _get_phases(*args, **kwargs):
+                return []
+
+            async def _rabbit(*args, **kwargs):
+                return object()
+
+            names = ("get_phases", "_resolve_rabbit_hole", "claim_source_for_resume")
+            saved = {name: getattr(reembed, name) for name in names}
+            reembed.get_phases = _get_phases
+            reembed._resolve_rabbit_hole = _rabbit
+            reembed.claim_source_for_resume = _claim
+            try:
+                class _Handler:
+                    async def get_all_tenant_points(self, *args, **kwargs):
+                        return [], None
+
+                async def _embedder():
+                    return types.SimpleNamespace(name="stub-embedder")
+
+                ccat = types.SimpleNamespace(
+                    agent_key=AGENT,
+                    _id=AGENT,
+                    vector_memory_handler=_Handler(),
+                    chunker=None,
+                )
+                ccat.embedder = _embedder
+                await reembed.reembed_sources(
+                    ccat,
+                    "declarative",
+                    [types.SimpleNamespace(name=SRC, metadata={}, path="/x")],
+                    caller_cat=types.SimpleNamespace(id=None),
+                )
+            finally:
+                for name, value in saved.items():
+                    setattr(reembed, name, value)
+
+            assert claimed == [], f"a deleting source must not be claimed: {claimed}"
+            assert any(
+                "deleting" in message for message in h.log.infos
+            ), h.log.infos
+        print("PASS (h) the dispatch loop aborts on a deleting status")
+
     async def main():
         await test_a_same_phase_runs_once()
         await test_b_different_phases_never_overlap()
         await test_c_timeout_leaves_entry_unchanged_and_warns()
         await test_d_delete_path_takes_only_the_source_lock()
         await test_e_keys_escape_glob_metacharacters()
+        await test_f_delete_source_takes_only_the_source_lock()
+        await test_g_delete_cannot_interleave_with_a_pass()
+        await test_h_dispatch_aborts_on_deleting()
         print("ALL PHASE-LOCK TESTS PASSED")
 
     asyncio.run(main())
