@@ -191,7 +191,8 @@ class IngestionPhase(ABC):
 
         1. :attr:`not_ready_budget_env`, when declared and set to a
            non-negative number;
-        2. :attr:`not_ready_budget_seconds`, when declared.
+        2. :attr:`not_ready_budget_seconds`, when declared and coercible to
+           a non-negative finite number.
 
         Returns ``None`` when the phase declares no budget, which makes the
         caller fall back to the generic
@@ -208,9 +209,34 @@ class IngestionPhase(ABC):
             if value is not None and math.isfinite(value) and value >= 0:
                 return float(value)
         declared = self.not_ready_budget_seconds
-        if declared is not None and math.isfinite(declared) and declared >= 0:
-            return float(declared)
-        return None
+        if declared is None:
+            return None
+        try:
+            # The attribute is typed ``float | None``, but it is a class
+            # attribute a third-party phase may set to anything. A numeric
+            # string ("300") is coerced; a genuinely wrong type is rejected
+            # instead of raising out of the resolver.
+            if isinstance(declared, bool):
+                raise TypeError("a bool is not a numeric budget")
+            value = float(declared)
+        except (TypeError, ValueError):
+            log.warning(
+                f"Phase '{self.id}' declares an invalid "
+                f"not_ready_budget_seconds {declared!r}; ignoring it and "
+                "falling back to the generic budget."
+            )
+            return None
+        # The same rules as the env path: a non-finite value would never
+        # expire (or break the comparison) and a negative budget is
+        # meaningless, so warn about the bad declared value and fall through.
+        if not math.isfinite(value) or value < 0:
+            log.warning(
+                f"Phase '{self.id}' declares an invalid "
+                f"not_ready_budget_seconds {declared!r}; ignoring it and "
+                "falling back to the generic budget."
+            )
+            return None
+        return value
 
     @property
     def name(self) -> str:

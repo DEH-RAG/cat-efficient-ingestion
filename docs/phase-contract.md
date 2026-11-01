@@ -173,6 +173,31 @@ locks, retries, or error propagation. Those are owned by the phase machine. A
 plugin therefore declares *what* the phase does and *what configuration* it
 depends on, and the machine decides *whether, when and in what order* it runs.
 
+### Result normalization: small, intentional duplication
+
+Each phase plugin normalizes its own legacy return value into the shared
+`PhaseResult` with a private helper (`_to_result` / `_coerce_phase_result`) and
+a private count helper (`_as_count`). This duplication is **intentional**:
+plugins are independently shippable and never import each other, so EffING,
+MyGRAPH and MyALOG cannot share a helper module without coupling their release
+cycles. The copies are small; the contract is the semantics below, not one
+source location. Every copy MUST agree on:
+
+- a `PhaseResult` instance is returned unchanged;
+- a legacy dict whose `status` is exactly one of `done`, `not_ready`, `error`
+  or `skipped` is converted with that status and its `reason`;
+- any other status becomes `error` with a reason naming the invalid status
+  (`phase '<id>' returned invalid status <repr>`);
+- `None` (no run implementation) becomes `error` with a reason naming the
+  phase; any other non-dict value becomes `error` naming the unexpected value;
+- `processed` / `expected` are counts ONLY when the value is an `int` that is
+  not a `bool`; every other type (string, float, bool, object) normalizes to
+  `None`. Never coerce a numeric string or float into a count;
+- counts are telemetry only (section 1) and never change the phase state.
+
+If this contract changes, every copy must be updated in the same release; the
+duplication is the reason there is no single place to edit.
+
 ### LLM-backed phases
 
 A phase whose body calls a language model is still an ordinary phase to the

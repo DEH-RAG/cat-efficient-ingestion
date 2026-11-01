@@ -10,7 +10,11 @@ Covers:
       declared value and then to the generic 3600s;
   (f) a malformed generic env value falls back to 3600s with a WARNING and
       no exception;
-  (g) ``nan`` and negative values are rejected at both levels.
+  (g) ``nan`` and negative values are rejected at both levels;
+  (h) a declared numeric string (``"300"``) is coerced and used;
+  (i) a declared value of the wrong type (``None``, object, list, bool,
+      ``nan``, ``inf``, negative, garbage) never raises: it is ignored with a
+      WARNING and resolution falls through to the generic 3600s.
 
 The plugin loader imports EVERY ``.py`` under a plugin folder, so the whole
 body lives inside ``if __name__ == "__main__":`` and importing this file
@@ -29,6 +33,7 @@ if __name__ == "__main__":
     import sys
     import types
 
+    from cat.core_plugins.cat_efficient_ingestion import phases as phases_module
     from cat.core_plugins.cat_efficient_ingestion import reembed
     from cat.core_plugins.cat_efficient_ingestion.phases import (
         IngestionPhase,
@@ -323,6 +328,55 @@ if __name__ == "__main__":
         _clear_env()
         print("PASS (g) nan and negative values rejected at env and declared levels")
 
+    async def test_h_declared_string_is_coerced():
+        _clear_env()
+        phase = FakePhase("graph_llm_extraction", budget="300")
+        assert phase.not_ready_budget() == 300.0
+        ok, state, log, sleeps = await _run([phase], step=100.0)
+        assert ok is False
+        assert state.doc["status"] == "error", state.doc
+        assert len(sleeps) == 3, sleeps  # 0s, 100s, 200s -> 300s expires
+        error = state.doc.get("error") or ""
+        assert "max 300s" in error, error
+        print("PASS (h) declared string '300' coerced to 300.0 and used")
+
+    async def test_i_declared_garbage_never_raises():
+        _clear_env()
+        original_log = phases_module.log
+        phases_module.log = FakeLog()
+        bad_values = (
+            object(), "", "abc", [300], {"seconds": 300}, True,
+            float("nan"), float("inf"), -1.0,
+        )
+        try:
+            for bad in bad_values:
+                phase = FakePhase("graph_llm_extraction", budget=bad)
+                assert phase.not_ready_budget() is None, bad
+            warnings = phases_module.log.warnings
+            assert len(warnings) >= len(bad_values), warnings
+            assert all("not_ready_budget_seconds" in w for w in warnings), warnings
+            # A declared None is "not declared", not a bad value: no warning.
+            assert (
+                FakePhase("graph_llm_extraction", budget=None).not_ready_budget()
+                is None
+            )
+            assert len(phases_module.log.warnings) == len(bad_values)
+        finally:
+            phases_module.log = original_log
+
+        # In a real run a garbage declared value falls back to the generic
+        # 3600s instead of raising out of the resolver.
+        phase = FakePhase("graph_llm_extraction", budget="garbage")
+        ok, state, log, sleeps = await _run([phase], step=1000.0)
+        assert ok is False
+        assert state.doc["status"] == "error", state.doc
+        assert len(sleeps) == 4, sleeps  # 0s..3000s -> 4000s
+        assert "max 3600s" in (state.doc.get("error") or ""), state.doc
+        print(
+            "PASS (i) declared garbage/None never raises; "
+            "garbage falls back to generic 3600s"
+        )
+
     async def _main():
         await test_a_declared_budget_expires_at_300()
         await test_b_undeclared_phase_uses_generic_3600()
@@ -331,6 +385,8 @@ if __name__ == "__main__":
         await test_e_inf_env_falls_back_to_declared_then_generic()
         await test_f_malformed_generic_env_falls_back_to_3600()
         await test_g_nan_and_negative_values_are_rejected()
+        await test_h_declared_string_is_coerced()
+        await test_i_declared_garbage_never_raises()
 
     try:
         asyncio.run(_main())
@@ -339,4 +395,4 @@ if __name__ == "__main__":
         sys.exit(1)
     finally:
         _clear_env()
-    print("OK per-phase not-ready budget (seven tests)")
+    print("OK per-phase not-ready budget (nine tests)")
