@@ -389,6 +389,41 @@ if __name__ == "__main__":
             restore()
         print("PASS (e) --graph invalidation resets only the graph phases")
 
+    class _FakeVectorHandler:
+        """Records the data wipe and touches no real vector store."""
+
+        def __init__(self, store):
+            self.store = store
+
+        async def delete_tenant_points(self, collection, metadata=None):
+            self.store.events.append(("data", (metadata or {}).get("source")))
+
+    async def test_f_orphaned_source_cleanup_resets_the_diary():
+        store = MemoryStore()
+        restore = _patch_registry(store)
+        try:
+            merged = await _merged_ids()
+            await _seed(store, merged)
+            store.events.clear()
+            ccat = types.SimpleNamespace(
+                agent_key=AGENT,
+                _id=AGENT,
+                vector_memory_handler=_FakeVectorHandler(store),
+            )
+            await reembed._cleanup_orphaned_source(
+                ccat, "declarative", SRC, None, SCOPE
+            )
+            assert _diary(store) == {}, _diary(store)
+            assert store.docs[KEY]["status"] == "completed", store.docs[KEY]
+            kinds = [event[0] for event in store.events]
+            assert kinds.index("data") < min(
+                i for i, kind in enumerate(kinds) if kind == "state"
+            ), store.events
+        finally:
+            restore()
+        print("PASS (f) orphaned-source cleanup wipes data BEFORE resetting the diary")
+
+
     async def _main():
         await _merged_ids()
         await test_a_cli_wipe_clears_every_merged_phase()
@@ -396,10 +431,11 @@ if __name__ == "__main__":
         await test_c_no_state_survives_its_deleted_data()
         await test_d_state_never_written_before_its_data()
         await test_e_graph_invalidation_resets_every_graph_phase()
+        await test_f_orphaned_source_cleanup_resets_the_diary()
 
     try:
         asyncio.run(_main())
     except AssertionError as exc:
         print(f"FAIL {exc}")
         sys.exit(1)
-    print("OK phase state + data atomicity (five tests)")
+    print("OK phase state + data atomicity (six tests)")

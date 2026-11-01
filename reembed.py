@@ -96,6 +96,7 @@ from .registry import (
     IngestionStatus,
     backfill_completed_phases,
     claim_source_for_resume,
+    clear_completed_phases,
     derive_source_status,
     get_completed_phases,
     get_status,
@@ -513,6 +514,28 @@ async def _clear_source_artifacts(ccat, collection_name, source_name, chat_id) -
     await ccat.vector_memory_handler.delete_tenant_points(
         str(collection_name), metadata=_source_metadata(source_name, chat_id)
     )
+
+
+async def _cleanup_orphaned_source(
+    ccat, collection_name, source_name, chat_id, scope
+) -> None:
+    """Delete a source whose conversation no longer exists, then reset its state.
+
+    The chat that scoped this source is gone, so its points are garbage and its
+    diary must stop describing them.
+
+    **ORDERING INVARIANT — DATA FIRST, STATE LAST**: the points are deleted
+    first; only then is the diary cleared. A failure between the two steps can
+    therefore only leave the diary claiming MORE than the store holds (the
+    phases re-run and rebuild), never a ``complete`` diary over wiped points.
+    The row is then terminalized as ``completed``: a source whose conversation
+    is gone has nothing left to do.
+    """
+    await ccat.vector_memory_handler.delete_tenant_points(
+        str(collection_name), metadata=_source_metadata(source_name, chat_id)
+    )
+    await clear_completed_phases(ccat.agent_key, scope, source_name)
+    await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
 
 
 async def _chunk_without_finalize(ccat, rabbit_hole, super_docs):
@@ -1874,10 +1897,9 @@ async def reembed_sources(
                 log.warning(
                     f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
                 )
-                await ccat.vector_memory_handler.delete_tenant_points(
-                    str(collection_name), metadata=_source_metadata(source_name, chat_id)
+                await _cleanup_orphaned_source(
+                    ccat, collection_name, source_name, chat_id, scope
                 )
-                await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
                 continue
 
         # ---- decide the start phase from the status doc + phase probe ----
@@ -2186,10 +2208,9 @@ async def reembed_sources(
                             log.warning(
                                 f"Stray cat with id {chat_id} not found. Cleaning up {source.path}/{source.name}"
                             )
-                            await ccat.vector_memory_handler.delete_tenant_points(
-                                str(collection_name), metadata=_source_metadata(source_name, chat_id)
+                            await _cleanup_orphaned_source(
+                                ccat, collection_name, source_name, chat_id, scope
                             )
-                            await _set_status(ccat, source_name, IngestionStatus.COMPLETED, chat_id=chat_id)
                             break
 
                         await set_phase(
