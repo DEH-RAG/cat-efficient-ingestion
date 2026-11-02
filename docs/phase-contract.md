@@ -55,17 +55,19 @@ value participates.
 
 Dependencies are resolved before their dependents, so a change deep in the
 chain invalidates every dependent transitively. A cycle is rejected with
-`PhaseTagCycleError` naming the cycle. The legacy flat `settings_version`
-field remains readable on old entries but is not part of the staleness
-decision.
+`PhaseTagCycleError` naming the cycle. A legacy (v1) entry has no `tag`; it is
+compared against the current `marker` / `settings_version` / `deps` (as the
+pre-tag machine did), and a current one is backfilled with its tag in place
+instead of being re-run.
 
 A phase is stale when any of the following holds:
 
 - its own entry is `pending` (absent) or `processing` with an expired lease;
 - a dependency is `pending`, `processing`, `error` or `skipped` — there is no
   completed upstream work to consume;
-- its stored `tag` differs from the freshly computed recursive tag, or the
-  stored tag is missing (a legacy entry is stale exactly once, until rewritten).
+- its stored `tag` differs from the freshly computed recursive tag;
+- a legacy (v1) entry's recorded `marker` / `settings_version` / `deps` no
+  longer match the current values.
 
 ## 3. Propagation
 

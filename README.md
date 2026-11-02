@@ -43,13 +43,14 @@ tag      = sha256(own_tag + "|" + "|".join(f"{dep}={dep_tag}" for dep in sorted(
 
 `relevant_settings` is the whole settings value unless the phase declares a `settings_check`: a key collection keeps only those keys, while a (possibly async) callable returns the value that participates. Tag computation reads configuration only — never an LLM call.
 
-Because dependencies are resolved first, **any change deep in the chain changes every dependent's tag**, transitively. A cycle raises `PhaseTagCycleError` naming the cycle. The legacy flat `settings_version` field remains readable on old entries but is **not** part of the decision.
+Because dependencies are resolved first, **any change deep in the chain changes every dependent's tag**, transitively. A cycle raises `PhaseTagCycleError` naming the cycle. A legacy (v1) entry has no `tag`; it is compared against the current `marker` / `settings_version` / `deps` (as the pre-tag machine did), and a current one is backfilled with its tag in place instead of being re-run.
 
 A phase is stale when any of these hold:
 
 - its own diary entry is absent (pending) or its `processing` lease expired;
 - a dependency is absent (pending), `processing`, `error` or `skipped` — there is no completed upstream work to consume;
-- the stored `tag` differs from the current recursive tag, or is missing (a legacy entry, stale exactly once until rewritten).
+- the stored `tag` differs from the current recursive tag;
+- a legacy (v1) entry's recorded `marker` / `settings_version` / `deps` no longer match the current values.
 
 The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) → `embedding` (depends on the embedder settings **and** the `parsing_chunking` tag). So an embedder-only change re-runs only `embedding`, while a chunker change re-runs `parsing_chunking` first and `embedding` follows on the next probe (its tag now includes the new parsing tag).
 
