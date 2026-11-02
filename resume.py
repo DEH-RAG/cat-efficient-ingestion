@@ -53,7 +53,7 @@ from cat.services.memory.models import VectorMemoryType
 from cat.utils import is_url
 
 from .hooks import execute_phase_accumulator
-from .phases import PHASES
+from .phases import PHASES, recover_reindexing_source
 from .reconcile import reconcile_agent
 from .reembed import reembed_sources
 from .registry import (
@@ -261,6 +261,35 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
     entries = await list_statuses(agent_id)
     for entry in entries:
         status = entry.get("status")
+        source = entry.get("source")
+        scope = entry.get("scope")
+
+        if status == IngestionStatus.REINDEXING.value:
+            # A re-ingest writes ``reindexing`` BEFORE the artifact wipe: a
+            # crash leaves this row behind. Re-run the reset only when the
+            # owner is provably gone (``should_abandon`` reuses the phase
+            # lease/boot/pid precedence); a live owner is never touched.
+            if not source:
+                continue
+            try:
+                reset = await recover_reindexing_source(
+                    source, ccat, scope=str(scope or "agent")
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad row never aborts
+                log.warning(
+                    f"Ingestion resume: could not reset reindexing source "
+                    f"{source} (agent {agent_id}): {exc}"
+                )
+                continue
+            if reset:
+                log.info(
+                    f"Ingestion resume: re-ran the reindexing reset for "
+                    f"{source} (agent {agent_id}) -> processing"
+                )
+            # The row is now ``processing`` (or owned by a live worker): the
+            # normal stale-PROCESSING sweep re-dispatches it on a later pass.
+            continue
+
         if status not in (
             IngestionStatus.UPLOADED.value,
             IngestionStatus.DOWNLOADING.value,

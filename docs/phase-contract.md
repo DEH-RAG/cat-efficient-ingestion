@@ -118,10 +118,11 @@ ingestion-phase:<agent>:<source>:<phase>
 Ordering is strict: the source lock is always acquired **first**, and the
 phase lock is acquired **inside** it. The reverse is never done. The delete
 path takes only the source lock, held for the **whole operation** (the
-`deleting` write, every phase `delete()` and the final row removal), so a
-per-source phase sequence and a deletion can never interleave. A dispatching
-pass also aborts a source whose status is `deleting`, so an interrupted
-deletion is never dispatched against. Lock keys escape the (untrusted) source
+`deleting`/`reindexing` write, every phase `delete()` and the final row
+removal when deleting), so a per-source phase sequence and a deletion/re-ingest
+can never interleave. A dispatching pass also aborts a source whose status is
+`deleting` or `reindexing`, so an interrupted operation is never dispatched
+against. Lock keys escape the (untrusted) source
 and agent identifiers with `escape_glob`, so a source name containing glob
 metacharacters cannot collide with another source's key space.
 
@@ -139,21 +140,33 @@ that described the data:
   deletion is retried; the failure is not swallowed and no terminal state is
   written over it.
 
-## 7. File deletion
+## 7. File deletion and re-ingest
 
-A single-file deletion runs through the phases:
+Two routines share one artifact wipe:
 
-- a file-level `deleting` state is written before any phase delete starts;
-- every phase's `delete()` runs in **reverse execution order** (dependents
-  first, dependencies last), so a phase is torn down before the data it
-  consumes;
-- the deletion record is removed **last**, after every phase delete succeeded;
-- if a `delete()` fails, the row stays `deleting` and the next pass retries the
-  remaining phases (already-deleted phases are not re-run).
+- `delete_artifacts(source, cat)` removes every artifact of the source —
+  derived images first (through the multimodal plugin's
+  `delete_source_image_files`), then every phase `delete()` in **reverse
+  execution order** (dependents first, dependencies last) — and touches
+  neither the source file, the file record, nor the status row. It is
+  idempotent and never takes a nested source lock.
+- `delete_file(source, cat)` is used only by the `deleting` path:
+  `delete_artifacts` → source file → status row **last**.
 
-The whole path is gated by `phase_delete_active(cat)`, which is true only when
-EffING is active and phases are registered. When the gate is false, the
-**standard deletion** applies and no `deleting` state is written.
+A single-file deletion therefore writes a file-level `deleting` state before
+any phase delete starts and removes the record only after every phase delete
+succeeded; a failure leaves the row `deleting` and the next pass retries the
+remaining phases. The whole path is gated by `phase_delete_active(cat)`, which
+is true only when EffING is active and phases are registered. When the gate is
+false, the **standard deletion** applies and no `deleting` state is written.
+
+A re-ingest (`purge_source_for_reingest`) never removes the row. It writes
+`reindexing` **before** the first destructive step, calls `delete_artifacts`,
+clears the diary and then writes `processing` for the phase machine. A
+`reindexing` row left by a crash is re-run from the start (idempotent wipe →
+diary clear → `processing`) once its owner is provably gone (`should_abandon`);
+a live owner is never touched, and the dispatch loop skips both `deleting` and
+`reindexing`.
 
 ## 8. Plugin surface
 

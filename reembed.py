@@ -1699,6 +1699,15 @@ async def _refresh_source_status(ccat, cat, scope, source_name, chat_id) -> Opti
     doc = await get_status(ccat.agent_key, scope, source_name)
     if not doc:
         return None
+    # ``deleting`` and ``reindexing`` are EXPLICIT, owner-driven states: the
+    # derived diary status must never overwrite them (a deletion / re-ingest
+    # is in progress and the driver owns the next transition).
+    explicit = doc.get("status")
+    if explicit in (
+        IngestionStatus.DELETING.value,
+        IngestionStatus.REINDEXING.value,
+    ):
+        return explicit
     await _backfill_legacy_tags(ccat, cat, scope, source_name, chat_id, doc)
     phase_ids = list((await merged_phases(ccat, cat)).keys())
     diary = get_completed_phases(doc)
@@ -2146,14 +2155,18 @@ async def reembed_sources(
         doc_phase = (doc or {}).get("phase")
 
         # A ``deleting`` row means a concurrent (or previously interrupted)
-        # phase-path deletion owns this source. Never dispatch a phase body
-        # against it: even with the source lock closing the main race, an
-        # abandoned ``deleting`` row must abort the pass instead of writing
-        # artifacts the delete is removing.
-        if doc_status == IngestionStatus.DELETING.value:
+        # phase-path deletion owns this source; a ``reindexing`` row means the
+        # re-ingest driver owns it (it is about to wipe the artifacts and write
+        # ``processing``). Never dispatch a phase body against either: even
+        # with the source lock closing the main race, an abandoned row must
+        # abort the pass instead of writing artifacts the wipe is removing.
+        if doc_status in (
+            IngestionStatus.DELETING.value,
+            IngestionStatus.REINDEXING.value,
+        ):
             log.info(
-                f"Agent id: {ccat._id}. Source {source_name}: deletion in "
-                f"progress (status 'deleting'); skipping this pass"
+                f"Agent id: {ccat._id}. Source {source_name}: "
+                f"{doc_status} in progress; skipping this pass"
             )
             continue
 
@@ -2333,16 +2346,20 @@ async def reembed_sources(
                 doc = await get_status(ccat.agent_key, scope, source_name)
                 diary = get_completed_phases(doc)
 
-                # ---- DELETION GUARD: BEFORE any phase body ----
-                # Re-read the status under the source lock: a ``deleting`` row
-                # (set by a delete that raced a previous pass, or left behind
-                # by an interrupted one) must abort the pass for this source
-                # instead of letting the phase body write artifacts the delete
-                # is about to remove.
-                if (doc or {}).get("status") == IngestionStatus.DELETING.value:
+                # ---- DELETION / REINDEX GUARD: BEFORE any phase body ----
+                # Re-read the status under the source lock: a ``deleting`` or
+                # ``reindexing`` row (set by a delete/re-ingest that raced a
+                # previous pass, or left behind by an interrupted one) must
+                # abort the pass for this source instead of letting the phase
+                # body write artifacts the wipe is about to remove.
+                if (doc or {}).get("status") in (
+                    IngestionStatus.DELETING.value,
+                    IngestionStatus.REINDEXING.value,
+                ):
                     log.info(
-                        f"Agent id: {ccat._id}. Source {source_name}: deletion "
-                        f"in progress (status 'deleting'); aborting the pass"
+                        f"Agent id: {ccat._id}. Source {source_name}: "
+                        f"{(doc or {}).get('status')} in progress; aborting "
+                        f"the pass"
                     )
                     break
 

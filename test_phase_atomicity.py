@@ -343,7 +343,7 @@ if __name__ == "__main__":
             restore()
         print("PASS (c) property: no state entry survives the deletion of its data")
 
-    async def test_d_state_never_written_before_its_data():
+    async def test_d_reindexing_row_is_never_absent():
         store = MemoryStore()
         restore = _patch_registry(store)
         try:
@@ -359,17 +359,25 @@ if __name__ == "__main__":
             )
             kinds = [event[0] for event in store.events]
             first_data = kinds.index("data")
-            first_state = min(
-                (i for i, kind in enumerate(kinds) if kind in ("state", "delete-row")),
-                default=len(kinds),
-            )
-            # DATA FIRST: every state write (diary clear + row delete) happens
-            # after the wipe, never before it.
-            assert first_data < first_state, store.events
+            last_data = len(kinds) - 1 - kinds[::-1].index("data")
+            state_indexes = [
+                i for i, kind in enumerate(kinds) if kind == "state"
+            ]
+            # STATE BEFORE THE WIPE: ``reindexing`` is written first, so a crash
+            # leaves a recoverable row instead of no row at all. (Reads precede
+            # the write; the first STATE write is what matters.)
+            assert state_indexes, store.events
+            assert state_indexes[0] < first_data, store.events
+            # STATE AFTER THE WIPE: the final ``processing`` write is last.
+            assert state_indexes[-1] > last_data, store.events
+            # The re-ingest NEVER removes the status row.
+            assert "delete-row" not in kinds, store.events
+            assert store.docs.get(KEY) is not None, store.docs
+            assert store.docs[KEY]["status"] == "processing", store.docs[KEY]
             assert kinds.count("data") == 1, store.events
         finally:
             restore()
-        print("PASS (d) reingest writes state only after the data wipe")
+        print("PASS (d) reindexing is written before the wipe and the row never disappears")
 
     async def test_e_graph_invalidation_resets_every_graph_phase():
         store = MemoryStore()
@@ -429,7 +437,7 @@ if __name__ == "__main__":
         await test_a_cli_wipe_clears_every_merged_phase()
         await test_b_failing_delete_keeps_processing_and_retries()
         await test_c_no_state_survives_its_deleted_data()
-        await test_d_state_never_written_before_its_data()
+        await test_d_reindexing_row_is_never_absent()
         await test_e_graph_invalidation_resets_every_graph_phase()
         await test_f_orphaned_source_cleanup_resets_the_diary()
 

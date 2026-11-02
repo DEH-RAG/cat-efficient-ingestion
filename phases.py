@@ -67,6 +67,7 @@ filesystem access at import time.
 import contextvars
 import inspect
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
@@ -95,6 +96,7 @@ from .registry import (
     PHASE_STATE_SKIPPED,
     IngestionStatus,
     _delete_status_doc,
+    clear_completed_phases,
     get_completed_phases,
     get_status,
     phase_state,
@@ -983,26 +985,292 @@ def phase_execution_order(phases) -> list:
     return [phase for _index, phase in indexed]
 
 
+def _scope_storage_path(cat, scope: str) -> str:
+    """Relative file-storage path of a source scope (agent or conversation)."""
+    root = getattr(cat, "agent_key", None) or ""
+    if scope and scope != "agent":
+        root = os.path.join(root, str(scope))
+    return root
+
+
+async def _delete_derived_images(source: str, cat, scope: str) -> None:
+    """Remove the saved ``*_img_*`` files through the multimodal plugin.
+
+    Derived images are owned by ``cat_multimodal_ingestion``, not EffING. Its
+    documented stable helper ``delete_source_image_files`` enumerates the
+    source's image points (which carry ``metadata.image_file``), removes the
+    files from agent storage and is designed to run BEFORE the points are
+    wiped. We call that helper instead of reimplementing it. The helper only
+    removes files, so the subsequent phase deletes still remove the points.
+
+    Best effort: a missing plugin/helper, or a file already gone, never breaks
+    the artifact deletion (it is idempotent by contract).
+    """
+    try:
+        from cat.core_plugins.cat_multimodal_ingestion.ingestion import (
+            delete_source_image_files,
+        )
+    except Exception as exc:  # noqa: BLE001 - plugin not installed: nothing to own
+        log.debug(
+            f"Agent id: {getattr(cat, 'agent_key', None)}. Multimodal plugin "
+            f"unavailable, skipping its derived-image cleanup for {source}: {exc}"
+        )
+        return
+
+    from cat.services.memory.models import VectorMemoryType
+
+    chat_id = None if scope == "agent" else scope
+    collection = (
+        VectorMemoryType.DECLARATIVE if chat_id is None else VectorMemoryType.EPISODIC
+    )
+    path = _scope_storage_path(cat, scope)
+    try:
+        await delete_source_image_files(cat, str(collection), path, source)
+    except Exception as exc:  # noqa: BLE001 - already gone / best effort
+        log.warning(
+            f"Agent id: {getattr(cat, 'agent_key', None)}. Derived-image "
+            f"cleanup for {source} failed ({exc}); continuing"
+        )
+
+
+async def _delete_artifacts_locked(
+    source: str,
+    cat,
+    agent_id: str,
+    scope: str,
+    *,
+    progress_status: Optional[IngestionStatus] = None,
+    already: Optional[set[str]] = None,
+) -> None:
+    """Shared reverse-order artifact wipe; the caller HOLDS the source lock.
+
+    Removes every artifact of ``source`` (derived images first, then every
+    registered phase's products in REVERSE execution order) but NEVER the
+    source file, the file record or the status row. ``progress_status`` is the
+    lifecycle row to keep while deleting (``deleting`` for a real delete,
+    ``reindexing`` for a re-ingest); ``None`` leaves the row untouched.
+
+    No lock is taken here on purpose: both callers (:func:`delete_file` and
+    :func:`delete_artifacts`) own the ONE per-operation source-lock
+    acquisition, so an internal acquisition would deadlock/nest.
+    """
+    try:
+        phases = await get_phases(cat)
+    except Exception as exc:  # noqa: BLE001 - a broken registry is an error
+        log.error(
+            f"Agent id: {agent_id}. Could not resolve the ingestion phases "
+            f"for {source}: {exc}"
+        )
+        raise PhaseDeleteError(
+            f"Could not resolve the ingestion phases for {source}: {exc}"
+        ) from exc
+
+    already = set(already or ())
+
+    # Derived image files BEFORE any phase delete: their names live in the
+    # image-point metadata, so they must be resolved while the points exist.
+    await _delete_derived_images(source, cat, scope)
+
+    token = _DELETE_SCOPE.set(scope)
+    try:
+        for phase in reversed(phase_execution_order(phases)):
+            if phase.id in already:
+                continue
+
+            delete = getattr(phase, "delete", None)
+            if not callable(delete):
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete implementation; refusing to delete {source} silently"
+                )
+                raise PhaseDeleteError(
+                    f"Ingestion phase '{phase.id}' has no delete implementation"
+                )
+
+            try:
+                await delete(source, cat)
+            except PhaseDeleteError as exc:
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete/purge implementation for {source}: {exc}"
+                )
+                raise
+            except NotImplementedError as exc:
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete implementation for {source}: {exc}"
+                )
+                raise PhaseDeleteError(
+                    f"Ingestion phase '{phase.id}' has no delete implementation"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - surface, never skip
+                log.error(
+                    f"Agent id: {agent_id}. delete() for phase '{phase.id}' of "
+                    f"{source} raised ({exc}); leaving the row for the next pass"
+                )
+                raise PhaseDeleteError(
+                    f"delete() for phase '{phase.id}' of {source} failed: {exc}"
+                ) from exc
+
+            already.add(phase.id)
+            if progress_status is not None:
+                await set_status(
+                    agent_id,
+                    scope,
+                    source,
+                    type_=_delete_source_type(source),
+                    status=progress_status,
+                    chat_id=None if scope == "agent" else scope,
+                    clear_phase=True,
+                    extra={"deleted_phases": sorted(already)},
+                )
+    finally:
+        _DELETE_SCOPE.reset(token)
+
+
+async def _remove_source_file(source: str, cat, scope: str) -> None:
+    """Remove the source file itself (idempotent: absent -> False)."""
+    file_manager = getattr(cat, "file_manager", None)
+    if file_manager is None:
+        return
+    path = _scope_storage_path(cat, scope)
+    try:
+        file_manager.remove_file(os.path.join(path, source))
+    except Exception as exc:  # noqa: BLE001 - already gone / best effort
+        log.warning(
+            f"Agent id: {getattr(cat, 'agent_key', None)}. Could not remove "
+            f"source file {source}: {exc}"
+        )
+
+
+async def delete_artifacts(source: str, cat, scope: Optional[str] = None) -> bool:
+    """Remove EVERY artifact of ``source``; shared by deleting and reindexing.
+
+    Acquires the per-source lock internally (the one and only acquisition of
+    the operation) and calls the locked body. Does NOT touch the source file,
+    the file record or the status row: the row stays whatever it was
+    (``deleting`` / ``reindexing`` / ...), so a re-ingest never loses it.
+
+    Idempotent: every phase delete tolerates "already gone", so this can be
+    re-run after a crash.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return False
+    scope = _delete_scope(cat, scope)
+    async with source_lock(agent_id, source):
+        await _delete_artifacts_locked(source, cat, agent_id, scope)
+    return True
+
+
+async def _delete_file_locked(
+    source: str, cat, agent_id: str, scope: str
+) -> None:
+    """The locked ``deleting`` body: artifacts -> file -> status row LAST."""
+    doc = await get_status(agent_id, scope, source)
+    already: set[str] = set()
+    stored_deleted = (doc or {}).get("deleted_phases")
+    if isinstance(stored_deleted, (list, tuple, set)):
+        already = {str(phase_id) for phase_id in stored_deleted}
+
+    await set_status(
+        agent_id,
+        scope,
+        source,
+        type_=_delete_source_type(source),
+        status=IngestionStatus.DELETING,
+        chat_id=None if scope == "agent" else scope,
+        clear_phase=True,
+        extra={"deleted_phases": sorted(already)},
+    )
+
+    await _delete_artifacts_locked(
+        source,
+        cat,
+        agent_id,
+        scope,
+        progress_status=IngestionStatus.DELETING,
+        already=already,
+    )
+    await _remove_source_file(source, cat, scope)
+    # STATE LAST: the row is removed only after every artifact and the file.
+    await _delete_status_doc(agent_id, scope, source)
+
+
+async def delete_file(source: str, cat, scope: Optional[str] = None) -> bool:
+    """Delete ONE source for the ``deleting`` path: artifacts + file + row.
+
+    Used ONLY by :func:`delete_source` (the gated file-deletion path). The
+    status row is removed LAST and the shared artifact wipe runs first.
+    Acquires the per-source lock internally exactly once.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return False
+    scope = _delete_scope(cat, scope)
+    async with source_lock(agent_id, source):
+        await _delete_file_locked(source, cat, agent_id, scope)
+    return True
+
+
+async def recover_reindexing_source(
+    source: str, cat, scope: Optional[str] = None
+) -> Optional[bool]:
+    """Re-run an abandoned ``reindexing`` reset (crash recovery).
+
+    Returns ``None`` when the row is not ``reindexing``, ``False`` when a LIVE
+    owner still holds it (never touched), ``True`` after the reset completed:
+    :func:`delete_artifacts` again (idempotent) -> clear the diary -> write
+    ``processing``. Ownership reuses :func:`should_abandon` on the row's
+    ``reindex`` marker, so the CURRENT boot, a live same-pod pid or a foreign
+    pod with an unexpired lease is never touched.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return None
+    scope = _delete_scope(cat, scope)
+    async with source_lock(agent_id, source):
+        doc = await get_status(agent_id, scope, source)
+        if not doc or doc.get("status") != IngestionStatus.REINDEXING.value:
+            return None
+        if not should_abandon(doc.get("reindex")):
+            return False
+
+        await _delete_artifacts_locked(
+            source,
+            cat,
+            agent_id,
+            scope,
+            progress_status=IngestionStatus.REINDEXING,
+        )
+        await clear_completed_phases(agent_id, scope, source)
+        await set_status(
+            agent_id,
+            scope,
+            source,
+            type_=_delete_source_type(source),
+            status=IngestionStatus.PROCESSING,
+            chat_id=None if scope == "agent" else scope,
+            clear_phase=True,
+            extra={"reindex": None, "deleted_phases": []},
+        )
+        return True
+
+
 async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
     """Delete ONE source through EVERY registered phase in REVERSE order.
 
-    This is EffING's single deletion path: it applies its own gate and falls
-    back to the STANDARD deletion when the phase path does not apply. The steps
-    of the phase path are the contract:
+    This is EffING's file-deletion path: it applies its own gate and falls
+    back to the STANDARD deletion when the phase path does not apply. When the
+    phase path applies it delegates to :func:`delete_file`, whose contract is:
+    the ``deleting`` state is written BEFORE any phase delete, every phase
+    ``delete(source, cat)`` runs in REVERSE execution order (recording each
+    completed phase so a re-run resumes with the rest), then the source file
+    record is removed, and the status record is removed LAST.
 
-    1. gate: :func:`phase_delete_active` must be True, at least one
-       plugin-registered phase (beyond the always-present built-ins) must be in
-       :func:`get_phases`, and the status diary must not reference an
-       UNINSTALLED phase. Otherwise ``False`` is returned and the STANDARD
-       deletion (the core wipe + :func:`delete_status`) applies unchanged.
-    2. write the file-level ``deleting`` state BEFORE any phase delete.
-    3. call each phase's ``delete(source, cat)`` in REVERSE execution order,
-       recording every completed phase so a re-run resumes with the remaining
-       ones. A phase without a delete implementation (or whose delete raises)
-       is surfaced as :class:`PhaseDeleteError`; the ``deleting`` row stays so
-       the operation is retried, and no later delete runs (the remaining
-       upstream inputs must stay resolvable).
-    4. remove the status record LAST, after every delete succeeded.
+    The gate requires :func:`phase_delete_active`, at least one
+    plugin-registered phase and no UNINSTALLED diary phase; otherwise ``False``
+    is returned and the STANDARD deletion applies unchanged.
 
     Returns:
         ``True`` when the phase path ran and the record was removed, ``False``
@@ -1016,10 +1284,10 @@ async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
 
     # ORDERING RULE: the delete path takes ONLY the per-source lock (never a
     # phase lock) and holds it for the WHOLE operation — the ``deleting``
-    # write, every phase ``delete()`` and the final row removal. A concurrent
-    # re-embed pass holds the same lock for its whole per-source sequence, so
-    # it cannot write artifacts that this purge has just removed (and cannot
-    # re-create them after the row is gone).
+    # write, every phase ``delete()``, the file removal and the final row
+    # removal. A concurrent re-embed pass holds the same lock for its whole
+    # per-source sequence, so it cannot write artifacts that this purge has
+    # just removed (and cannot re-create them after the row is gone).
     async with source_lock(agent_id, source):
         return await _delete_source_locked(source, cat, agent_id, scope)
 
@@ -1064,80 +1332,7 @@ async def _delete_source_locked(
         await _delete_status_doc(agent_id, scope, source)
         return False
 
-    already: set[str] = set()
-    stored_deleted = (doc or {}).get("deleted_phases")
-    if isinstance(stored_deleted, (list, tuple, set)):
-        already = {str(phase_id) for phase_id in stored_deleted}
-
-    await set_status(
-        agent_id,
-        scope,
-        source,
-        type_=_delete_source_type(source),
-        status=IngestionStatus.DELETING,
-        chat_id=None if scope == "agent" else scope,
-        clear_phase=True,
-        extra={"deleted_phases": sorted(already)},
-    )
-
-    token = _DELETE_SCOPE.set(scope)
-    try:
-        for phase in reversed(phase_execution_order(phases)):
-            if phase.id in already:
-                continue
-
-            delete = getattr(phase, "delete", None)
-            if not callable(delete):
-                log.error(
-                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
-                    f"delete implementation; refusing to delete {source} silently"
-                )
-                raise PhaseDeleteError(
-                    f"Ingestion phase '{phase.id}' has no delete implementation"
-                )
-
-            try:
-                await delete(source, cat)
-            except PhaseDeleteError as exc:
-                log.error(
-                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
-                    f"delete/purge implementation for {source}: {exc}"
-                )
-                raise
-            except NotImplementedError as exc:
-                log.error(
-                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
-                    f"delete implementation for {source}: {exc}"
-                )
-                raise PhaseDeleteError(
-                    f"Ingestion phase '{phase.id}' has no delete implementation"
-                ) from exc
-            except Exception as exc:  # noqa: BLE001 - surface, never skip
-                log.error(
-                    f"Agent id: {agent_id}. delete() for phase '{phase.id}' of "
-                    f"{source} raised ({exc}); leaving the row deleting for the "
-                    f"next pass"
-                )
-                raise PhaseDeleteError(
-                    f"delete() for phase '{phase.id}' of {source} failed: {exc}"
-                ) from exc
-
-            already.add(phase.id)
-            await set_status(
-                agent_id,
-                scope,
-                source,
-                type_=_delete_source_type(source),
-                status=IngestionStatus.DELETING,
-                chat_id=None if scope == "agent" else scope,
-                clear_phase=True,
-                extra={"deleted_phases": sorted(already)},
-            )
-    finally:
-        _DELETE_SCOPE.reset(token)
-
-    # STATE LAST: the row is removed only after every phase delete succeeded.
-    await _delete_status_doc(agent_id, scope, source)
+    await _delete_file_locked(source, cat, agent_id, scope)
     return True
 
 

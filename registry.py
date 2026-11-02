@@ -50,6 +50,13 @@ class IngestionStatus(Enum):
     succeeded. A crash therefore leaves the row ``deleting`` (resumable) instead
     of claiming a state the artifacts no longer match. It is never claimable by
     the resume sweep (it is not an in-flight ingestion status).
+
+    ``reindexing`` is the source-level re-ingest state: written BEFORE the
+    artifact wipe, kept while :func:`phases.delete_artifacts` runs, and replaced
+    by ``processing`` before the phases start. The status row is NEVER removed
+    by a re-ingest, so a crash leaves ``reindexing`` (recovery re-runs the
+    reset) instead of a missing row. Like ``deleting`` it is explicit and is
+    never overridden by the derived diary status; the dispatch loop skips it.
     """
     UPLOADED = "uploaded"
     DOWNLOADING = "downloading"
@@ -58,6 +65,7 @@ class IngestionStatus(Enum):
     COMPLETED = "completed"
     ERROR = "error"
     DELETING = "deleting"
+    REINDEXING = "reindexing"
 
 
 #: Work phases (diary of what the source is doing), stored in ``doc["phase"]``.
@@ -1304,45 +1312,119 @@ async def reset_phase_entries_for_agent(agent_id: str, phases) -> int:
     return changed
 
 
+async def _resolve_reingest_cat(agent_id: str):
+    """Best-effort CheshireCat for the re-ingest wipe (never raises).
+
+    The maintenance CLI calls :func:`purge_source_for_reingest` with only the
+    agent id. The phase wipe (:func:`phases.delete_artifacts`) needs the live
+    caller, so resolve it from the agent id when the caller did not pass one.
+    A missing/ghost agent returns ``None`` and the caller's legacy
+    ``delete_data`` is used instead.
+    """
+    try:
+        from cat import BillTheLizard
+
+        return await BillTheLizard.get_cheshire_cat(agent_id)
+    except Exception:  # noqa: BLE001 - resolution is best-effort
+        return None
+
+
 async def purge_source_for_reingest(
     agent_id: str,
     scope: str,
     source: str,
-    delete_data,
+    delete_data=None,
     *,
     phase_ids=None,
+    cat=None,
 ) -> None:
-    """Wipe a source's data, THEN its diary, THEN its status row.
+    """Reset a source for a full re-ingest WITHOUT ever removing its row.
 
-    **ORDERING INVARIANT**: the data deletion is awaited FIRST. Only after it
-    completed does this write any state (the diary clear, then the row delete),
-    so a crash between the steps can only leave state claiming LESS than the
-    data says — never a ``complete`` diary over wiped data. The CLI reingest
-    MUST go through this helper instead of hand-rolling the sequence: a
-    reordered sequence is exactly how wiped data silently keeps looking fresh.
+    **STATE TRANSITIONS** (the row is never absent)::
 
-    ``delete_data`` is an async callable performing the actual wipe (e.g. the
-    vector handler's ``delete_tenant_points`` bound to the source). It MUST
-    raise on failure; this function never swallows it, so a failed wipe leaves
-    the diary intact and the source re-runs from its current checkpoint rather
-    than from a false ``pending``.
+        reindexing -> delete_artifacts -> clear diary -> processing
+
+    ``reindexing`` is written BEFORE the first destructive step, so a crash
+    anywhere in the reset leaves an explicit, recoverable row instead of no
+    row at all (the old sequence deleted the status doc and relied on the
+    absence of points). The wipe reuses :func:`phases.delete_artifacts`, the
+    SAME reverse-order artifact path as ``deleting``; only after it succeeds is
+    the diary cleared and ``processing`` written for the CLI's following
+    ``reembed_sources`` run.
+
+    The whole reset runs under the per-source lock (ONE acquisition), and the
+    locked artifact body is used directly so no nested source lock is taken.
+
+    ``cat`` is the live caller. When omitted it is resolved from ``agent_id``
+    (the maintenance CLI path). If no caller can be resolved, ``delete_data``
+    (the legacy ``async () -> None`` wipe) is used as a fallback; it must raise
+    on failure.
 
     Args:
         agent_id: The agent (chatbot) id.
         scope: ``"agent"`` or a conversation ``chat_id``.
         source: The ingested file name or URL.
-        delete_data: ``async () -> None`` that removes the source's data.
+        delete_data: Legacy ``async () -> None`` wipe, used only when no
+            ``cat`` can be resolved.
         phase_ids: Optional subset for the diary clear; ``None`` clears every
-            phase (the reingest wiped every phase's products).
+            phase (the re-ingest wiped every phase's products).
+        cat: Optional live caller for the phase-path wipe.
     """
-    await delete_data()
-    if phase_ids is None:
-        await clear_completed_phases(agent_id, scope, source)
-    else:
-        await clear_completed_phases(
-            agent_id, scope, source, phase_ids=phase_ids
+    async with source_lock(agent_id, source):
+        chat_id = None if scope == "agent" else scope
+        type_ = "url" if source.startswith("http") else "file"
+
+        await set_status(
+            agent_id,
+            scope,
+            source,
+            type_=type_,
+            status=IngestionStatus.REINDEXING,
+            chat_id=chat_id,
+            extra={
+                "reindex": {
+                    "state": PHASE_STATE_PROCESSING,
+                    "owner": current_phase_owner(),
+                    "started_at": time.time(),
+                }
+            },
         )
-    await delete_status(agent_id, scope, source)
+
+        resolved_cat = cat if cat is not None else await _resolve_reingest_cat(agent_id)
+        if resolved_cat is not None:
+            from . import phases as phases_module
+
+            await phases_module._delete_artifacts_locked(
+                source,
+                resolved_cat,
+                agent_id,
+                scope,
+                progress_status=IngestionStatus.REINDEXING,
+            )
+        elif delete_data is not None:
+            await delete_data()
+        else:
+            raise RuntimeError(
+                f"Cannot re-ingest {source} for agent {agent_id}: no live "
+                "caller and no delete_data wipe"
+            )
+
+        if phase_ids is None:
+            await clear_completed_phases(agent_id, scope, source)
+        else:
+            await clear_completed_phases(
+                agent_id, scope, source, phase_ids=phase_ids
+            )
+        await set_status(
+            agent_id,
+            scope,
+            source,
+            type_=type_,
+            status=IngestionStatus.PROCESSING,
+            chat_id=chat_id,
+            clear_phase=True,
+            extra={"reindex": None, "deleted_phases": []},
+        )
 
 
 async def list_statuses(agent_id: str, chat_id: Optional[str] = None) -> List[Dict]:
