@@ -31,6 +31,7 @@ if __name__ == "__main__":
     from redis.exceptions import LockError
 
     from cat.db import crud as crud_module
+    from cat.db.cruds import settings as crud_settings
     from cat.core_plugins.cat_efficient_ingestion import phases, reembed, registry
 
     AGENT = "lock_agent"
@@ -107,6 +108,7 @@ if __name__ == "__main__":
                 "phases_set_status": phases.set_status,
                 "phases_delete_status_doc": phases._delete_status_doc,
                 "phases_log": phases.log,
+                "settings_by_category": crud_settings.get_settings_by_category,
             }
 
             async def _store(key, doc, *args, **kwargs):
@@ -158,6 +160,11 @@ if __name__ == "__main__":
             phases.set_status = _phases_set_status
             phases._delete_status_doc = _phases_delete_status_doc
             phases.log = self.log
+
+            async def _settings_by_category(*args, **kwargs):
+                return None
+
+            crud_settings.get_settings_by_category = _settings_by_category
             return self
 
         def __exit__(self, *exc):
@@ -174,6 +181,7 @@ if __name__ == "__main__":
             phases.set_status = self.saved["phases_set_status"]
             phases._delete_status_doc = self.saved["phases_delete_status_doc"]
             phases.log = self.saved["phases_log"]
+            crud_settings.get_settings_by_category = self.saved["settings_by_category"]
             return False
 
         def doc(self, diary=None):
@@ -195,25 +203,26 @@ if __name__ == "__main__":
         return types.SimpleNamespace(agent_key=AGENT, _id=AGENT)
 
     async def test_a_same_phase_runs_once():
+        phase = "parsing_chunking"
         with Harness() as h:
             h.doc()
             counter = [0]
 
             async def worker():
                 async with reembed._phase_guard(
-                    _ccat(), SCOPE, SRC, PHASE
+                    _ccat(), None, SCOPE, SRC, phase
                 ) as should_run:
                     if not should_run:
                         return
                     await asyncio.sleep(0.02)
                     counter[0] += 1
                     await registry.record_phase_completed(
-                        AGENT, SCOPE, SRC, PHASE
+                        AGENT, SCOPE, SRC, phase
                     )
 
             await asyncio.gather(worker(), worker())
             assert counter[0] == 1, f"phase body ran {counter[0]} times, expected 1"
-            entry = registry.get_completed_phases(h.doc())[PHASE]
+            entry = registry.get_completed_phases(h.doc())[phase]
             assert entry["state"] == registry.PHASE_STATE_COMPLETE, entry
         print("PASS (a) two workers on the same (source, phase) -> body runs once")
 
@@ -226,7 +235,7 @@ if __name__ == "__main__":
                 # ORDERING: source lock FIRST, phase lock INSIDE it.
                 async with registry.source_lock(AGENT, SRC):
                     async with reembed._phase_guard(
-                        _ccat(), SCOPE, SRC, phase
+                        _ccat(), None, SCOPE, SRC, phase
                     ) as should_run:
                         if not should_run:
                             return
@@ -278,7 +287,7 @@ if __name__ == "__main__":
             h.blocking_override = 0.05
             try:
                 async with reembed._phase_guard(
-                    _ccat(), SCOPE, SRC, PHASE
+                    _ccat(), None, SCOPE, SRC, PHASE
                 ) as should_run:
                     assert should_run is False, "a timed-out lock must skip the body"
             finally:

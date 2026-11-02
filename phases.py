@@ -79,9 +79,9 @@ from .hooks import (
     _accepts_caller,
     execute_hook_compat,
     phase_managers,
+    phase_settings_key,
 )
 from .phase_tag_resolver import (
-    PhaseTagCycleError,
     PhaseTagError,
     compose_tag,
     own_tag,
@@ -89,6 +89,7 @@ from .phase_tag_resolver import (
     resolve_tags,
 )
 from .registry import (
+    PHASE_STATE_COMPLETE,
     PHASE_STATE_ERROR,
     PHASE_STATE_PROCESSING,
     PHASE_STATE_SKIPPED,
@@ -453,6 +454,69 @@ async def compute_tags(cat, phases) -> dict[str, str]:
         phase.id: await _material_settings(cat, phase) for phase in phase_list
     }
     return await resolve_tags(settings, phase_list)
+
+
+def _fallback_current_tag(spec: PhaseSpec) -> str:
+    """Declared-input tag used when the live tag graph cannot be resolved."""
+    return compose_tag(
+        own_tag(
+            spec.id,
+            _declared_tag(spec.id, spec.settings_category, spec.depends_on),
+        ),
+        (),
+        {},
+    )
+
+
+async def current_phase_tag(cat, spec: PhaseSpec) -> str:
+    """The current recursive tag for ``spec`` (same fallback as the probe).
+
+    Used by the dispatch guard so it evaluates staleness with EXACTLY the tag
+    the probe used; a tag-resolution failure degrades to the declared tag
+    instead of raising (mirrors :func:`_probe_pending`).
+    """
+    try:
+        tags = await compute_tags(cat, await get_phases(cat))
+        tag = tags.get(spec.id)
+    except PhaseTagError as exc:
+        log.error(f"Cannot compute phase tags: {exc}")
+        tag = None
+    return tag if isinstance(tag, str) and tag else _fallback_current_tag(spec)
+
+
+async def current_legacy_inputs(cat, spec: PhaseSpec) -> tuple[object, object]:
+    """Current material inputs for comparing a v1 (tagless) diary entry.
+
+    Returns ``(marker, settings_version)`` resolved from the SAME sources the
+    completion writer used, or ``_MISSING`` when ``cat`` is unknown / the read
+    fails (the legacy comparison then stays conservatively stale).
+    """
+    if cat is None:
+        return _MISSING, _MISSING
+    marker = await execute_phase_on_owner(
+        cat,
+        "ingestion_phase_settings_marker",
+        spec.id,
+        default=None,
+        caller=cat,
+    )
+    if spec.settings_category is None:
+        return marker, _MISSING
+    try:
+        from cat.db.cruds import settings as crud_settings
+
+        settings_key = phase_settings_key(
+            spec.id, getattr(cat, "agent_key", None)
+        )
+        settings_doc = await crud_settings.get_settings_by_category(
+            settings_key, spec.settings_category
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown inputs stay conservative
+        log.debug(f"Could not read current settings for phase {spec.id}: {exc}")
+        return marker, _MISSING
+    if not isinstance(settings_doc, dict):
+        return marker, None
+    return marker, settings_doc.get("updated_at")
 
 
 def _as_count(value: Any) -> int | None:
@@ -1163,6 +1227,9 @@ def is_phase_stale(
     spec: PhaseSpec,
     completed_phases: dict[str, Any],
     current_tag: object,
+    *,
+    current_marker: object = _MISSING,
+    current_settings_version: object = _MISSING,
 ) -> bool:
     """Decide whether one phase is stale, purely (no I/O).
 
@@ -1175,18 +1242,33 @@ def is_phase_stale(
     - a dependency that is absent (pending), ``processing``, ``error`` or
       ``skipped`` makes this phase stale — it cannot have consumed completed
       upstream work;
-    - the stored ``tag`` (a recursive hash of this phase's own material plus
-      every dependency's tag) must equal ``current_tag``. A MISSING/empty tag
-      is a legacy entry and is stale exactly once (the rewrite stores a tag).
+    - a v2 entry stores a ``tag`` (a recursive hash of this phase's own
+      material plus every dependency's tag); it is stale when that tag differs
+      from ``current_tag``;
+    - a LEGACY (v1) entry has no ``tag`` but carries ``marker`` /
+      ``settings_version`` / ``deps``. It is compared against the CURRENT
+      values exactly like the pre-tag machine did: the recorded upstream
+      markers in ``deps`` must equal the current upstream diary markers, and
+      the recorded ``marker`` (or, as a fast path, ``settings_version``) must
+      equal the current ones. A legacy entry whose configuration is unchanged
+      is therefore NOT stale (no re-parse), while a changed one IS stale (the
+      guard then lets its body re-run and write the v2 ``tag``). When the
+      current values are unknown (``_MISSING``, e.g. no ``cat`` in a unit
+      test), a legacy entry stays conservatively stale.
 
-    ``settings_version`` is deliberately NOT consulted: the tag already folds
-    in every material input, so the old flat version comparison is redundant.
-    The field stays readable on legacy entries but never drives the decision.
+    ``settings_version`` is only a FRESH fast path for legacy entries: the
+    recursive tag already folds in every material input, so it never drives
+    the v2 decision.
 
     Args:
         spec: The phase declaration to evaluate.
         completed_phases: The diary dict keyed by phase id.
         current_tag: The recursively computed tag for ``spec.id`` now.
+        current_marker: The current material marker for ``spec.id`` (v1
+            comparison). ``_MISSING`` = unknown.
+        current_settings_version: The current settings entry ``updated_at``
+            for ``spec.settings_category`` (v1 fast path). ``_MISSING`` /
+            ``None`` = unknown.
 
     Returns:
         True when the phase must be re-run, False when it is fresh.
@@ -1216,9 +1298,36 @@ def is_phase_stale(
             return True
 
     stored_tag = entry.get("tag")
-    if not isinstance(stored_tag, str) or not stored_tag:
+    if isinstance(stored_tag, str) and stored_tag:
+        return stored_tag != current_tag
+
+    # ---- LEGACY (v1) entry: no tag, compare the recorded material inputs ----
+    # Dependency markers: the upstream markers this phase consumed must still
+    # be the CURRENT upstream markers. ``None == None`` is a legitimate match
+    # (an upstream with no marker), so it never forces a livelock.
+    deps = entry.get("deps")
+    for upstream in spec.depends_on:
+        upstream_entry = completed_phases.get(upstream)
+        current_upstream_marker = (
+            upstream_entry.get("marker") if isinstance(upstream_entry, dict) else None
+        )
+        recorded = deps.get(upstream) if isinstance(deps, dict) else None
+        if recorded != current_upstream_marker:
+            return True
+
+    # Settings fast path: an unchanged settings entry proves freshness.
+    if (
+        spec.settings_category is not None
+        and current_settings_version is not _MISSING
+        and current_settings_version is not None
+        and entry.get("settings_version") == current_settings_version
+    ):
+        return False
+
+    # Slow path: compare the plugin material marker.
+    if current_marker is _MISSING:
         return True
-    return stored_tag != current_tag
+    return entry.get("marker") != current_marker
 
 
 def has_live_running_phase(completed_phases: Any) -> bool:
@@ -1287,16 +1396,27 @@ async def ingestion_phase_pending(
     for spec in (await merged_phases(cat, cat)).values():
         current_tag = tags.get(spec.id)
         if current_tag is None:
-            current_tag = compose_tag(
-                own_tag(
-                    spec.id,
-                    _declared_tag(
-                        spec.id, spec.settings_category, spec.depends_on
-                    ),
-                ),
-                (),
-                {},
+            current_tag = _fallback_current_tag(spec)
+        entry = diary.get(spec.id)
+        if (
+            isinstance(entry, dict)
+            and not entry.get("tag")
+            and phase_state(entry) == PHASE_STATE_COMPLETE
+        ):
+            # Legacy (v1) entry: compare its recorded marker/deps against the
+            # CURRENT values instead of treating "no tag" as always stale.
+            current_marker, current_settings_version = (
+                await current_legacy_inputs(cat, spec)
             )
-        if is_phase_stale(spec, diary, current_tag):
+            stale = is_phase_stale(
+                spec,
+                diary,
+                current_tag,
+                current_marker=current_marker,
+                current_settings_version=current_settings_version,
+            )
+        else:
+            stale = is_phase_stale(spec, diary, current_tag)
+        if stale:
             pending.append({"phase": spec.id})
     return pending

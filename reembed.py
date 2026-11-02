@@ -80,11 +80,14 @@ from .ingestion_executor import run_in_ingestion_executor
 from .phases import (
     PhaseDeleteError,
     compute_tags,
+    current_legacy_inputs,
+    current_phase_tag,
     dependency_outcome,
     downstream_phase_ids,
     execute_phase_on_owner,
     get_phases,
     has_live_running_phase,
+    is_phase_stale,
     merged_phases,
 )
 from .registry import (
@@ -95,6 +98,7 @@ from .registry import (
     PHASE_STATE_SKIPPED,
     IngestionStatus,
     backfill_completed_phases,
+    backfill_phase_tag,
     claim_source_for_resume,
     clear_completed_phases,
     derive_source_status,
@@ -1625,6 +1629,65 @@ def _first_error_reason(diary) -> Optional[str]:
     return None
 
 
+async def _backfill_legacy_tags(ccat, cat, scope, source_name, chat_id, doc) -> None:
+    """Migrate CURRENT v1 diary entries to the v2 shape by writing their tag.
+
+    A legacy entry with no ``tag`` whose recorded ``marker`` / ``deps`` still
+    match the current values is NOT stale: the phase body must not re-run.
+    This writes the v2 ``tag`` in place (one diary write, same merge path),
+    so the entry stops being treated as legacy. Stale legacy entries are left
+    ALONE here: their body must run and write the tag itself.
+    """
+    diary = get_completed_phases(doc)
+    if not diary:
+        return
+    caller = cat if cat is not None else ccat
+    try:
+        specs = await merged_phases(ccat, caller)
+        tags = await compute_tags(caller, await get_phases(caller))
+    except Exception as exc:  # noqa: BLE001 - migration is best-effort
+        log.debug(f"Agent id: {ccat._id}. Cannot resolve tags for backfill: {exc}")
+        return
+    type_ = (doc or {}).get("type") or (
+        "url" if is_url(source_name) else "file"
+    )
+    for phase_id, entry in diary.items():
+        if not isinstance(entry, dict) or entry.get("tag"):
+            continue
+        if phase_state(entry) != PHASE_STATE_COMPLETE:
+            continue
+        spec = specs.get(phase_id)
+        current_tag = tags.get(phase_id)
+        if spec is None or not current_tag:
+            continue
+        current_marker, current_settings_version = await current_legacy_inputs(
+            caller, spec
+        )
+        if is_phase_stale(
+            spec,
+            diary,
+            current_tag,
+            current_marker=current_marker,
+            current_settings_version=current_settings_version,
+        ):
+            continue
+        try:
+            await backfill_phase_tag(
+                ccat.agent_key,
+                scope,
+                source_name,
+                phase_id,
+                current_tag,
+                type_=type_,
+                chat_id=chat_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - migration is best-effort
+            log.debug(
+                f"Agent id: {ccat._id}. Could not backfill tag for "
+                f"source {source_name} phase {phase_id}: {exc}"
+            )
+
+
 async def _refresh_source_status(ccat, cat, scope, source_name, chat_id) -> Optional[str]:
     """Derive the source status from the diary and write it (dispatcher-owned).
 
@@ -1636,6 +1699,7 @@ async def _refresh_source_status(ccat, cat, scope, source_name, chat_id) -> Opti
     doc = await get_status(ccat.agent_key, scope, source_name)
     if not doc:
         return None
+    await _backfill_legacy_tags(ccat, cat, scope, source_name, chat_id, doc)
     phase_ids = list((await merged_phases(ccat, cat)).keys())
     diary = get_completed_phases(doc)
     derived = derive_source_status(diary, phase_ids)
@@ -1861,12 +1925,22 @@ async def _run_parsing_phase(
 
 
 @asynccontextmanager
-async def _phase_guard(ccat, scope, source_name, phase):
+async def _phase_guard(ccat, cat, scope, source_name, phase):
     """Acquire the per-``(source, phase)`` lock and re-check the diary under it.
 
     Yields ``True`` when the caller must run the phase body and ``False`` when
     the body must be skipped because another worker already terminalized the
-    entry (``complete`` / ``error`` / ``skipped``) or the lock timed out.
+    entry (``complete`` / ``error`` / ``skipped``) **and it is not stale** — or
+    the lock timed out.
+
+    Terminal is NOT the same as fresh: a LEGACY (v1) entry that some recorded
+    material input changed is stale even though it reads ``complete``. The
+    guard therefore evaluates :func:`phases.is_phase_stale` with the SAME
+    current inputs the probe uses, so the two can never contradict each other
+    (the old "probe says stale, guard says complete" split livelocked the
+    dispatch loop). A terminal-but-stale entry runs its body once, which
+    writes the v2 ``tag``; a terminal-and-fresh legacy entry is migrated in
+    place (:func:`registry.backfill_phase_tag`) without re-running the body.
 
     **ORDERING RULE** (see :func:`registry.source_lock`): the caller must
     already hold the per-source lock. This guard takes the per-phase lock
@@ -1890,10 +1964,66 @@ async def _phase_guard(ccat, scope, source_name, phase):
         # ---- RE-CHECK UNDER THE LOCK ----
         # Between the probe that selected this phase and the lock acquisition
         # another worker may have run it to completion. Re-read the diary and
-        # skip the body when the entry is already terminal.
+        # skip the body ONLY when the entry is terminal AND fresh.
         doc = await get_status(ccat.agent_key, scope, source_name)
-        state = phase_state(get_completed_phases(doc).get(phase))
+        diary = get_completed_phases(doc)
+        entry = diary.get(phase)
+        state = phase_state(entry)
         if state in (PHASE_STATE_COMPLETE, PHASE_STATE_ERROR, PHASE_STATE_SKIPPED):
+            caller = cat if cat is not None else ccat
+            spec = (await merged_phases(ccat, caller)).get(phase)
+            if spec is None:
+                # No declaration to compare against: preserve the historical
+                # "terminal means done" behaviour for an unknown phase.
+                stale = False
+                current_tag = ""
+            else:
+                current_tag = await current_phase_tag(caller, spec)
+                current_marker, current_settings_version = (
+                    await current_legacy_inputs(caller, spec)
+                )
+                stale = is_phase_stale(
+                    spec,
+                    diary,
+                    current_tag,
+                    current_marker=current_marker,
+                    current_settings_version=current_settings_version,
+                )
+            if stale:
+                # Terminal but some material input changed: run the body so it
+                # rewrites the diary (and the v2 tag) exactly once.
+                log.info(
+                    f"Agent id: {ccat._id}. Source {source_name}: phase {phase} "
+                    f"is {state!r} under the lock but STALE; running its body "
+                    f"to refresh the diary"
+                )
+                yield True
+                return
+            if (
+                spec is not None
+                and current_tag
+                and state == PHASE_STATE_COMPLETE
+                and isinstance(entry, dict)
+                and not entry.get("tag")
+            ):
+                # Migration: the v1 entry is current, so backfill its tag
+                # instead of re-running the body (no re-parse).
+                try:
+                    await backfill_phase_tag(
+                        ccat.agent_key,
+                        scope,
+                        source_name,
+                        phase,
+                        current_tag,
+                        type_=(doc or {}).get("type")
+                        or ("url" if is_url(source_name) else "file"),
+                        chat_id=(doc or {}).get("chat_id"),
+                    )
+                except Exception as exc:  # noqa: BLE001 - migration is best-effort
+                    log.debug(
+                        f"Agent id: {ccat._id}. Could not backfill tag for "
+                        f"source {source_name} phase {phase}: {exc}"
+                    )
             log.info(
                 f"Agent id: {ccat._id}. Source {source_name}: phase {phase} is "
                 f"already {state!r} under the lock; skipping its body"
@@ -2273,7 +2403,7 @@ async def reembed_sources(
                 # returns False when another worker already terminalized the
                 # entry or the lock timed out (entry left untouched).
                 async with _phase_guard(
-                    ccat, scope, source_name, phase
+                    ccat, cat, scope, source_name, phase
                 ) as should_run:
                     if not should_run:
                         doc = await get_status(ccat.agent_key, scope, source_name)

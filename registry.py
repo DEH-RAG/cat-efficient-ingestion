@@ -216,12 +216,21 @@ def phase_state(entry: Optional[Dict]) -> str:
     return PHASE_STATE_COMPLETE
 
 
-def normalize_phase_entry(entry: Optional[Dict]) -> Optional[Dict]:
+def normalize_phase_entry(
+    entry: Optional[Dict], current_tag: Optional[str] = None
+) -> Optional[Dict]:
     """Return ``entry`` with the explicit five-state shape, without mutating it.
 
     Legacy entries (no ``state``) gain ``state: complete`` and the missing
     shape fields with their neutral defaults, so the next diary write persists
     the normalized contract.
+
+    ``current_tag`` is the migration path for a v1 entry (``marker`` /
+    ``settings_version`` / ``deps`` but no ``tag``) whose configuration is
+    still current: when supplied and the entry carries no ``tag``, it is
+    stored so the diary becomes v2 WITHOUT re-running the phase body. The
+    caller must have established freshness first (the marker matched); this
+    function never decides staleness.
     """
     if not isinstance(entry, dict):
         return entry
@@ -230,9 +239,50 @@ def normalize_phase_entry(entry: Optional[Dict]) -> Optional[Dict]:
     normalized.setdefault("reason", None)
     normalized.setdefault("started_at", None)
     normalized.setdefault("owner", None)
+    if current_tag and not normalized.get("tag"):
+        normalized["tag"] = current_tag
     normalized.setdefault("tag", "")
     normalized.setdefault("attempt", 1)
     return normalized
+
+
+async def backfill_phase_tag(
+    agent_id: str,
+    scope: str,
+    source: str,
+    phase: str,
+    tag: str,
+    *,
+    type_: str = "file",
+    chat_id: Optional[str] = None,
+) -> bool:
+    """Backfill ``tag`` on a v1 ``complete`` diary entry (migration, one write).
+
+    Only acts when the entry exists, is ``complete`` and has NO ``tag``: the
+    normalized entry (v2 shape + ``tag``) is written through the same
+    single-entry merge used by the phase machine. Returns True when a write
+    happened. Never raises on a malformed/absent entry.
+
+    The caller must confirm the entry is NOT stale before calling: a stale
+    entry must be re-run (its body writes the tag), never migrated.
+    """
+    if not tag:
+        return False
+    try:
+        entry = await _previous_diary_entry(agent_id, scope, source, phase)
+    except Exception:  # noqa: BLE001 - migration must never break a pass
+        return False
+    if not isinstance(entry, dict) or entry.get("tag"):
+        return False
+    if phase_state(entry) != PHASE_STATE_COMPLETE:
+        return False
+    normalized = normalize_phase_entry(entry, current_tag=tag)
+    if normalized == entry:
+        return False
+    await _write_phase_entry(
+        agent_id, scope, source, phase, normalized, type_=type_, chat_id=chat_id
+    )
+    return True
 
 
 def derive_source_status(diary: Optional[Dict], phase_ids=None) -> str:
