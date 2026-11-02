@@ -22,12 +22,40 @@ from cat import (
     endpoint,
 )
 
+from .phases import phase_catalog
 from .reconcile import reconcile_agent
 from .registry import (
     delete_status,
     get_status,
     list_statuses,
+    status_catalog,
+    status_label,
 )
+
+
+def _decorate_entries(
+    entries: List[Dict],
+    phase_labels: Dict[str, str],
+    state_labels: Dict[str, str],
+) -> List[Dict]:
+    """Add the display-only ``phase_label`` / ``status_label`` to every entry.
+
+    ``phase`` and ``status`` are kept untouched: they remain the machine
+    fields. ``phase_label`` is the current phase's label, or ``None`` when the
+    entry has no phase. A work phase that is not a registered ingestion phase
+    (``downloading`` for URLs) falls back to its lifecycle label.
+    """
+    decorated: List[Dict] = []
+    for entry in entries:
+        row = dict(entry)
+        phase = row.get("phase")
+        phase_label_value = phase_labels.get(phase) if phase else None
+        if phase and phase_label_value is None:
+            phase_label_value = state_labels.get(phase)
+        row["phase_label"] = phase_label_value
+        row["status_label"] = status_label(row.get("status"))
+        decorated.append(row)
+    return decorated
 
 
 @endpoint.get("/status", prefix="/ingestion", tags=["Ingestion"])
@@ -48,15 +76,37 @@ async def get_ingestion_status(
     if agent_id is None:
         return []
 
-    statuses = await list_statuses(agent_id, chat_id)
+    catalog = await phase_catalog(info.cheshire_cat)
+    phase_labels = {row["id"]: row["label"] for row in catalog}
+    state_labels = {row["id"]: row["label"] for row in status_catalog()}
 
     if info.cheshire_cat is None:
-        return statuses
+        statuses = await list_statuses(agent_id, chat_id)
+        return _decorate_entries(statuses, phase_labels, state_labels)
 
     # One reconcile implementation for both the endpoint and the recovery
     # sweep: purge the vanished sources, then return the post-purge list.
     await reconcile_agent(agent_id, chat_id=chat_id, ccat=info.cheshire_cat)
-    return await list_statuses(agent_id, chat_id)
+    statuses = await list_statuses(agent_id, chat_id)
+    return _decorate_entries(statuses, phase_labels, state_labels)
+
+
+@endpoint.get("/phases", prefix="/ingestion", tags=["Ingestion"])
+async def get_ingestion_phases(
+    info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.READ),
+) -> Dict:
+    """Return the phase catalog and the lifecycle-state catalog.
+
+    ``phases`` lists every registered phase in dependency order (every
+    dependency before its dependents), each row
+    ``{"id", "label", "order", "depends_on"}``. ``states`` lists the
+    lifecycle states as ``{"id", "label"}``. Labels are English display
+    defaults; clients localize by ``id`` and never use a label as a key.
+    """
+    return {
+        "phases": await phase_catalog(info.cheshire_cat),
+        "states": status_catalog(),
+    }
 
 
 @endpoint.delete("/status", prefix="/ingestion", tags=["Ingestion"])

@@ -170,6 +170,9 @@ class IngestionPhase(ABC):
 
     #: Stable phase id (the diary key, e.g. ``"embedding"``).
     id: str = ""
+    #: Human-readable label for display only. Never a key: the machine
+    #: identity is always :attr:`id`. ``None`` falls back to :attr:`id`.
+    label: str | None = None
     #: Upstream phase ids this phase consumes.
     depends_on: tuple[str, ...] = ()
     #: Settings category whose material configuration feeds :meth:`tag`.
@@ -245,6 +248,15 @@ class IngestionPhase(ABC):
     def name(self) -> str:
         """Stable phase name (alias of :attr:`id`)."""
         return self.id
+
+    def display_label(self) -> str:
+        """Human-readable label for this phase.
+
+        Returns :attr:`label` when declared, else :attr:`id`. The label is
+        display-only: clients localize by ``id`` and the machine never uses
+        the label as a key.
+        """
+        return self.label or self.id
 
     @abstractmethod
     async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
@@ -349,12 +361,14 @@ class _BuiltinPhase(IngestionPhase):
 
 class ParsingChunkingPhase(_BuiltinPhase):
     id = "parsing_chunking"
+    label = "Parsing and chunking"
     depends_on = ()
     settings_category = "chunker"
 
 
 class EmbeddingPhase(_BuiltinPhase):
     id = "embedding"
+    label = "Computing embeddings"
     depends_on = ("parsing_chunking",)
     settings_category = "embedder"
 
@@ -620,6 +634,7 @@ class HookPhase(IngestionPhase):
     ):
         self.spec = spec
         self.id = spec.id
+        self.label = getattr(spec, "label", None)
         self.depends_on = tuple(spec.depends_on)
         self.settings_category = spec.settings_category
         self.settings_check = getattr(spec, "settings_check", None)
@@ -866,6 +881,57 @@ async def get_phases(cat) -> list[IngestionPhase]:
         seeded.add(spec.id)
         phases.append(HookPhase(spec, cat=cat, manager=manager))
     return phases
+
+
+def _dependency_ordered(phases: list[IngestionPhase]) -> list[IngestionPhase]:
+    """Return ``phases`` with every dependency before its dependents.
+
+    The sort is stable: phases with no declared relationship keep their
+    registration order. A dependency cycle (impossible for the built-ins, but
+    a third-party plugin could declare one) is broken at the first repeated
+    visit instead of recursing forever or raising.
+    """
+    by_id = {phase.id: phase for phase in phases}
+    ordered: list[IngestionPhase] = []
+    visited: set[str] = set()
+    visiting: set[str] = set()
+
+    def visit(phase: IngestionPhase) -> None:
+        if phase.id in visited or phase.id in visiting:
+            return
+        visiting.add(phase.id)
+        for dep_id in phase.depends_on:
+            dep = by_id.get(dep_id)
+            if dep is not None:
+                visit(dep)
+        visiting.discard(phase.id)
+        visited.add(phase.id)
+        ordered.append(phase)
+
+    for phase in phases:
+        visit(phase)
+    return ordered
+
+
+async def phase_catalog(cat) -> list[dict]:
+    """Describe every registered phase in dependency order.
+
+    Built-ins and plugin phases come from :func:`get_phases`; the result is
+    sorted so a dependency is always listed before its dependents. Each row is
+    ``{"id", "label", "order", "depends_on"}`` where ``order`` is 1-based and
+    ``label`` is :meth:`IngestionPhase.display_label`. The ``id`` remains the
+    only machine identity; labels are display-only English defaults.
+    """
+    ordered = _dependency_ordered(await get_phases(cat))
+    return [
+        {
+            "id": phase.id,
+            "label": phase.display_label(),
+            "order": index,
+            "depends_on": list(phase.depends_on),
+        }
+        for index, phase in enumerate(ordered, start=1)
+    ]
 
 
 async def _resolved_system_ingestion_config_name(cat) -> Optional[str]:

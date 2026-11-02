@@ -129,7 +129,8 @@ After each phase succeeds, its diary entry (`tag`, plus `marker` / `deps` for co
 
 <h2>🔌 Endpoints</h2>
 
-- `GET /ingestion/status` — the registry, reconciled against the canonical sources (files on disk, URLs in the vector store, existing conversations); pass `?chat_id=<id>` for a conversation scope. In-flight and `error` entries are never purged; only terminal `completed` entries whose source has vanished are removed.
+- `GET /ingestion/status` — the registry, reconciled against the canonical sources (files on disk, URLs in the vector store, existing conversations); pass `?chat_id=<id>` for a conversation scope. In-flight and `error` entries are never purged; only terminal `completed` entries whose source has vanished are removed. Every entry also carries two display-only fields: `phase_label` (the human-readable label of its current `phase`, or `null` when it has none) and `status_label` (the lifecycle-state label). The machine fields `phase` and `status` are unchanged.
+- `GET /ingestion/phases` — the phase catalog and the lifecycle-state catalog. `phases` lists every registered phase (built-ins plus plugin phases from `get_phases`) in dependency order — each dependency before its dependents — as `{"id", "label", "order", "depends_on"}` with a 1-based `order`. `states` lists the lifecycle states as `{"id", "label"}`. Labels are English display defaults; the frontend localizes by `id` and a label is never used as a key.
 - `DELETE /ingestion/status?source=<name>[&scope=<chat_id>]` — dismiss one terminal row (`error` or `completed`); an in-flight source is refused, remove the file to abandon it.
 - `GET /ingestion/settings` — list the available ingestion engines with their schemes and the effective choice (SYSTEM READ).
 - `GET /ingestion/settings/{name}` — settings and scheme of one ingestion engine configuration (SYSTEM READ).

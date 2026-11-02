@@ -175,6 +175,8 @@ A phase plugin provides only this surface:
 | Member | Responsibility |
 | --- | --- |
 | `id` | The phase id, used as the diary key. |
+| `label` | OPTIONAL human-readable display label (`None` defaults to `id`). Display-only: the machine identity is always `id`. |
+| `display_label()` | Returns `label` when declared, else `id`. |
 | `depends_on` | Upstream phase ids whose tags are folded into this phase's tag. |
 | `process` | The phase body: parse/embed/purge, returning a phase result. |
 | `delete` | Purges this phase's artifacts for a source. |
@@ -182,6 +184,14 @@ A phase plugin provides only this surface:
 | `applies_to` | CAPABILITY check: `(True, None)` when the phase applies, `(False, reason)` when it does not (recorded `skipped`). |
 | `not_ready_budget_seconds` | OPTIONAL wall-clock budget (seconds) this phase may stay `not_ready` before it is marked `error`. `None` (default) uses the generic `CAT_INGESTION_NOT_READY_MAX_SECONDS`. |
 | `not_ready_budget_env` | OPTIONAL env var that overrides `not_ready_budget_seconds` when set to a non-negative number. Resolution order: declared env var → declared value → generic budget. |
+
+Built-in labels are `parsing_chunking` → "Parsing and chunking" and
+`embedding` → "Computing embeddings". `GET /ingestion/phases` returns them in
+dependency order as `{"id", "label", "order", "depends_on"}` rows, plus the
+lifecycle states as `{"id", "label"}` rows under `states`. A status entry
+carries the matching `phase_label` / `status_label` alongside the unchanged
+machine fields `phase` / `status`. Labels are backend English defaults only:
+there is no i18n here, and clients localize by `id`.
 
 The plugin owns **none** of the following: diary state, staleness detection,
 locks, retries, or error propagation. Those are owned by the phase machine. A

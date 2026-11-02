@@ -68,6 +68,33 @@ class IngestionStatus(Enum):
     REINDEXING = "reindexing"
 
 
+#: English display defaults for the lifecycle states, in pipeline order.
+#: Display-only: the machine identity is always the enum value. The frontend
+#: localizes by the state id, so a label is never used as a key.
+STATUS_LABELS: dict[str, str] = {
+    IngestionStatus.UPLOADED.value: "Uploaded",
+    IngestionStatus.DOWNLOADING.value: "Downloading",
+    IngestionStatus.DOWNLOADED.value: "Downloaded",
+    IngestionStatus.PROCESSING.value: "Processing",
+    IngestionStatus.REINDEXING.value: "Re-indexing",
+    IngestionStatus.DELETING.value: "Deleting",
+    IngestionStatus.COMPLETED.value: "Completed",
+    IngestionStatus.ERROR.value: "Error",
+}
+
+
+def status_label(status: Optional[str]) -> Optional[str]:
+    """Human-readable label for a lifecycle state, or ``None`` when unknown."""
+    if not status:
+        return None
+    return STATUS_LABELS.get(status)
+
+
+def status_catalog() -> list[dict]:
+    """Describe the lifecycle states as ``{"id", "label"}`` rows."""
+    return [{"id": status, "label": label} for status, label in STATUS_LABELS.items()]
+
+
 #: Work phases (diary of what the source is doing), stored in ``doc["phase"]``.
 #: ``parsing_chunking`` and ``embedding`` are the recovery-relevant phases: a
 #: crash while ``phase=embedding`` means chunks are intact and only the vectors
