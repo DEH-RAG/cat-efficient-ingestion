@@ -424,6 +424,62 @@ def phase_settings_key(phase: str, agent_key: str | None) -> str:
     return agent_key or DEFAULT_SYSTEM_KEY
 
 
+def chunker_name_from_settings_doc(settings_doc: object) -> str | None:
+    """Return the real chunker identity from a saved ``chunker`` settings entry.
+
+    The active chunker INSTANCE carries no ``name`` attribute, so reading it
+    produced the meaningless ``"default_chunker"`` fallback. The saved setting
+    is authoritative: its ``name`` (or ``config``) is the selected
+    configuration class, e.g. ``MathAwareSemanticChunkerSettings``; the
+    ``Settings`` suffix is stripped so the stored identity matches the chunker
+    class name.
+    """
+    if not isinstance(settings_doc, dict):
+        return None
+    raw = settings_doc.get("name") or settings_doc.get("config")
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if not name:
+        return None
+    if name.endswith("Settings") and len(name) > len("Settings"):
+        name = name[: -len("Settings")]
+    return name or None
+
+
+async def resolve_chunker_name(cat) -> str | None:
+    """Name of the active chunker, read from the saved settings.
+
+    The chunker is resolved lazily by the core; its instance has no ``name``,
+    so the saved ``chunker`` category is the source of truth. A failure here
+    must never break a status write, and genuinely unresolvable settings
+    return ``None`` (never the old ``"default_chunker"`` literal).
+    """
+    if cat is None:
+        return None
+    try:
+        settings_key = phase_settings_key(
+            "parsing_chunking", getattr(cat, "agent_key", None)
+        )
+        settings_doc = await crud_settings.get_settings_by_category(
+            settings_key, "chunker"
+        )
+        name = chunker_name_from_settings_doc(settings_doc)
+        if name:
+            return name
+    except Exception as exc:  # noqa: BLE001 - a status write must never fail
+        log.warning(
+            f"Could not read the chunker settings for "
+            f"{getattr(cat, 'agent_key', None)!r}: {exc}"
+        )
+    try:
+        chunker = getattr(cat, "chunker", None)
+        name = getattr(chunker, "name", None)
+        return str(name) if name else None
+    except Exception:  # noqa: BLE001 - status writes must never fail
+        return None
+
+
 def _material_settings(value: object) -> dict:
     """Return the non-secret settings fields that materially affect a phase.
 

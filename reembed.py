@@ -75,6 +75,7 @@ from .hooks import (
     execute_phase_hook_on_all,
     execute_shared_hook,
     phase_settings_key,
+    resolve_chunker_name,
 )
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import (
@@ -2110,11 +2111,7 @@ async def reembed_sources(
     rabbit_hole = await _resolve_rabbit_hole(ccat)
     embedder = await ccat.embedder()
     active_embedder_name = getattr(embedder, "name", None) or get_nlp_object_name(embedder, "default_embedder")
-    chunker = getattr(ccat, "chunker", None)
-    active_chunker_name = (
-        str(chunker.name) if chunker is not None and getattr(chunker, "name", None) else
-        get_nlp_object_name(chunker, "default_chunker")
-    )
+    active_chunker_name = await resolve_chunker_name(ccat)
     owner = f"reembed-{os.getpid()}"
     counter = 0
     # Per-source zero/non-finite vector counts, reported in the run summary so

@@ -446,10 +446,16 @@ async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = No
             revalidated += 1
         except Exception as e:  # noqa: BLE001 - a failing row must not abort the pass
             log.error(f"Ingestion revalidation failed for {source} (agent {agent_id}): {e}")
-    log.info(
-        f"Ingestion revalidation for agent {agent_id}: {revalidated} completed "
-        f"row(s) re-ingested"
-    )
+    if revalidated:
+        log.info(
+            f"Ingestion revalidation for agent {agent_id}: {revalidated} completed "
+            f"row(s) re-ingested"
+        )
+    else:
+        log.debug(
+            f"Ingestion revalidation for agent {agent_id}: 0 completed "
+            f"row(s) re-ingested"
+        )
 
 
 async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
@@ -489,8 +495,8 @@ async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
                 await reconcile_agent(agent_id, ccat=ccat)
     except crud.LockError:
         # Another replica is already running this sweep: expected contention
-        # across workers, not a fault. Log as info and move on.
-        log.info(f"Ingestion sweep for agent {agent_id} skipped: lock held by another worker")
+        # across workers, not a fault, and absence of this line is normal.
+        log.debug(f"Ingestion sweep for agent {agent_id} skipped: lock held by another worker")
     except Exception as e:
         log.error(f"Ingestion startup pass failed for agent {agent_id}: {e}")
 

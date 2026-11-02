@@ -34,6 +34,7 @@ from .hooks import (
     _caller,
     execute_phase_accumulator,
     execute_phase_hook_on_all,
+    resolve_chunker_name,
 )
 from .phases import PHASES, delete_source, has_live_running_phase
 from .registry import (
@@ -68,22 +69,6 @@ def _source_type(source: str, is_url: bool = False) -> str:
     if is_url or source.startswith("http"):
         return "url"
     return "file"
-
-
-def _chunker_name(cat) -> str | None:
-    """Best-effort name of the active chunker, read from the caller.
-
-    The chunker is resolved lazily by the core (``cat.chunker`` on
-    BotMixin); a failure here must never break a status write.
-    """
-    try:
-        chunker = getattr(cat, "chunker", None)
-        if chunker is None:
-            return None
-        name = getattr(chunker, "name", None)
-        return str(name) if name else None
-    except Exception:  # noqa: BLE001 - status writes must never fail
-        return None
 
 
 _heartbeat_tasks: dict = {}
@@ -360,7 +345,7 @@ async def rabbithole_ingestion_processing(source, cat=None, lizard=None) -> None
         status=IngestionStatus.PROCESSING,
         chat_id=chat_id,
         phase=PHASE_PARSING_CHUNKING,
-        chunker_name=_chunker_name(cat),
+        chunker_name=await resolve_chunker_name(cat),
     )
 
 

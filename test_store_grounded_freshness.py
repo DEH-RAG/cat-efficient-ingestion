@@ -112,7 +112,7 @@ if __name__ == "__main__":
             "_probe_pending", "claim_source_for_resume",
             "_start_heartbeat", "_stop_heartbeat", "_resolve_rabbit_hole",
             "_run_parsing_phase", "ingestion_canceled", "execute_shared_hook",
-            "split_oversized", "log",
+            "split_oversized", "log", "resolve_chunker_name",
         )
 
         def __init__(self):
@@ -135,6 +135,7 @@ if __name__ == "__main__":
 
     def _install_seams(log, parse_points):
         reembed.log = log
+        reembed.resolve_chunker_name = _async_return("chunker")
         reembed.get_status = _async_return(
             {"status": "completed", "phase": None, "source": "doc.txt"}
         )
