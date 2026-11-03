@@ -31,6 +31,53 @@ every phase is `complete` or `skipped`; it is `error` when any phase is `error`
 is in flight. An `error` or `skipped` phase is terminal for itself, but it is
 not "complete work" and therefore keeps its dependents stale (see section 3).
 
+### Warnings: ran, but degraded
+
+A warning is **not** a phase state. It is an optional list attached to a
+successful (`complete`) diary entry, for a phase that RAN correctly but
+produced nothing, or less than it should have. The distinction from a failure
+is structural, never a size threshold:
+
+| Situation | Result |
+| --- | --- |
+| ran, the call succeeded, produced nothing or less than expected | `done` + one or more warnings |
+| could not run (timeout, transport error, LLM unavailable) | `not_ready` (retried) then `error` |
+
+The **phase owns the decision**: it knows whether it really ran and whether an
+empty product is valid. The machine applies no input-size or item-count
+threshold. A phase that returns `done` with warnings is COMPLETE: it is not
+retried and its dependents are not blocked. Only `error` keeps the propagation
+of section 3.
+
+Each warning is:
+
+```json
+{"code": "empty-extraction", "message": "the parser returned 0 chunks"}
+```
+
+Documented codes are `empty-extraction`, `partial-extraction` and `degraded`.
+The vocabulary is descriptive, not an enforcement allow-list.
+
+A diary entry gains `warnings: [...]` only when its phase returned `done` with
+warnings; a clean (or legacy) phase has no `warnings` key at all. Warnings are
+persisted in the diary, so they survive a restart and remain visible after the
+fact.
+
+The source-level status entry **aggregates** every phase's warnings and adds:
+
+```json
+"warnings": [
+  {"phase": "graph_concepts", "code": "empty-extraction", "message": "..."}
+],
+"warning_count": 1,
+"has_warnings": true
+```
+
+`status` is unchanged: warnings never change the derived state, so a source
+whose phases all completed is `completed`, never `error`. The aggregate is
+exposed by `GET /ingestion/status` and backs the file manager's fourth counter
+alongside processing/error/processed.
+
 ## 2. Phase tags
 
 A phase's tag is a recursive fingerprint of the configuration that produced its
@@ -178,7 +225,7 @@ A phase plugin provides only this surface:
 | `label` | OPTIONAL human-readable display label (`None` defaults to `id`). Display-only: the machine identity is always `id`. |
 | `display_label()` | Returns `label` when declared, else `id`. |
 | `depends_on` | Upstream phase ids whose tags are folded into this phase's tag. |
-| `process` | The phase body: parse/embed/purge, returning a phase result. |
+| `process` | The phase body: parse/embed/purge, returning a phase result (status plus optional warnings). |
 | `delete` | Purges this phase's artifacts for a source. |
 | `tag` | Returns the configuration fingerprint of the settings the phase consumes. |
 | `applies_to` | CAPABILITY check: `(True, None)` when the phase applies, `(False, reason)` when it does not (recorded `skipped`). |
@@ -218,7 +265,10 @@ source location. Every copy MUST agree on:
 - `processed` / `expected` are counts ONLY when the value is an `int` that is
   not a `bool`; every other type (string, float, bool, object) normalizes to
   `None`. Never coerce a numeric string or float into a count;
-- counts are telemetry only (section 1) and never change the phase state.
+- counts are telemetry only (section 1) and never change the phase state;
+- `warnings`, when present, is normalized to a list of well-formed
+  `{"code": <str>, "message": <str>}` rows (malformed rows are dropped) and
+  NEVER changes the status: it is only valid on a `done` result.
 
 If this contract changes, every copy must be updated in the same release; the
 duplication is the reason there is no single place to edit.
@@ -228,28 +278,31 @@ duplication is the reason there is no single place to edit.
 A phase whose body calls a language model is still an ordinary phase to the
 machine. The machine knows only the four outcomes `done`, `not_ready` (retried
 until its budget expires), `error` (with a `reason`) and `skipped` (with a
-`reason`). **The phase owns the mapping**: it inspects the LLM result and
-translates it into exactly one of those four outcomes. The machine never sees
-an LLM.
+`reason`), plus the optional `warnings` list on `done`. **The phase owns the
+mapping**: it inspects the LLM result and translates it into exactly one of
+those four outcomes. The machine never sees an LLM.
 
 The mapping a phase must implement is:
 
 | LLM outcome | State |
 | --- | --- |
 | timeout / 429 / 5xx / connection dropped | `not_ready` with a reason (transient) |
-| empty-but-valid response on non-empty text | `not_ready` on the first attempt, then `error` carrying the raw text |
+| empty-but-valid response on non-empty text | `not_ready` on the first attempt, then `error` carrying the raw text (the extraction attempt failed) |
 | no LLM configured | `error` with a configuration reason — never `skipped` |
 | partial output (schema drops items) | `error` for now; the reason carries `dropped=<n>` |
+| success, but it legitimately produced nothing / less than expected | `done` + a warning (`empty-extraction` / `partial-extraction`) |
 | success with a product | `done` |
 
 These are owner decisions, implemented for the graph concept phase in MyGRAPH
 `341e61c`.
 
-`done` **implies a product**. `done` means the phase produced what it was
-supposed to produce, not merely that it did not crash. A phase that returns
-`done` with zero products is a defect. (The `processed`/`expected` counters
-remain telemetry only — see section 1 — so this is an obligation on the phase,
-not a check the machine performs.)
+`done` means the phase **ran to completion**, not merely that it did not crash.
+A phase that produced nothing, or less than it should have, is still `done` but
+MUST say so with a warning (section 1); `done` with no warning asserts that the
+expected product was produced. "Could not run" is different: a timeout,
+transport error or unavailable LLM is still `not_ready` then `error`. (The
+`processed`/`expected` counters remain telemetry only — see section 1 — so this
+is an obligation on the phase, not a check the machine performs.)
 
 **Budget.** An LLM-backed phase declares `not_ready_budget_seconds` /
 `not_ready_budget_env` on the ABC. The graph concept phase points its
@@ -260,9 +313,11 @@ order is the same as the general budget: declared env var → declared value →
 generic.
 
 **OPEN DECISION — partial output.** *When a partially successful phase may be
-considered valid is not decided.* Until it is, partial output is an `error`.
-Note that "partial" has three distinct meanings and only the last is already
-handled:
+considered valid is not decided.* Until it is, partial output remains an
+`error` unless the phase can establish that the partial product is valid, in
+which case it reports `done` + a `partial-extraction` warning. Either way the
+degradation is recorded, never silent. Note that "partial" has three distinct
+meanings and only the last is already handled mechanically:
 
 - **per-item within a phase** — the LLM dropped some items the schema asked
   for (the case above);
@@ -271,8 +326,8 @@ handled:
   This one is already covered by normal error propagation (section 3).
 
 Any future definition of "valid partial" must still record the degradation in
-the diary — `processed=M of N, dropped=K, reason=...` — so a partial success is
-never silent.
+the diary — `processed=M of N, dropped=K, reason=...` and/or a warning — so a
+partial success is never silent.
 
 **`applies_to` must not mask a missing LLM.** A phase that needs an LLM and
 has none reports `error`. `applies_to` is a *capability* check — it decides

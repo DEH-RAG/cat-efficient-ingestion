@@ -29,7 +29,7 @@ import os
 import socket
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from cat.db import crud
 from cat.db.crud import escape_glob
@@ -251,6 +251,52 @@ def phase_state(entry: Optional[Dict]) -> str:
     return PHASE_STATE_COMPLETE
 
 
+#: Warning codes a phase MAY attach to a successful (``done``) result. The
+#: list is the documented vocabulary, not an enforcement allow-list: a phase
+#: may emit another code, and the machine still stores it verbatim.
+WARNING_CODES = ("empty-extraction", "partial-extraction", "degraded")
+
+
+def normalize_warnings(warnings: Any) -> list[dict]:
+    """Return the well-formed ``{"code", "message"}`` warnings of ``warnings``.
+
+    A warning is NOT a phase state: it is display/telemetry attached to a
+    phase entry that succeeded. Malformed entries (non-dict, or a missing/
+    non-string ``code``/``message``) are dropped rather than propagated, so a
+    phase can never corrupt the diary with an unusable warning.
+    """
+    if not isinstance(warnings, (list, tuple)):
+        return []
+    normalized: list[dict] = []
+    for warning in warnings:
+        if not isinstance(warning, dict):
+            continue
+        code = warning.get("code")
+        message = warning.get("message")
+        if not isinstance(code, str) or not isinstance(message, str):
+            continue
+        normalized.append({"code": code, "message": message})
+    return normalized
+
+
+def aggregate_warnings(diary: Optional[Dict]) -> list[dict]:
+    """Aggregate the warnings of every successful phase entry, with its phase.
+
+    Each row is ``{"phase": <id>, "code": <str>, "message": <str>}``. Only
+    ``complete`` entries participate: a warning describes a phase that ran,
+    and the state decision (never the warning) still drives the source status.
+    """
+    if not isinstance(diary, dict):
+        return []
+    aggregated: list[dict] = []
+    for phase_id, entry in diary.items():
+        if phase_state(entry) != PHASE_STATE_COMPLETE:
+            continue
+        for warning in normalize_warnings(entry.get("warnings")):
+            aggregated.append({"phase": phase_id, **warning})
+    return aggregated
+
+
 def normalize_phase_entry(
     entry: Optional[Dict], current_tag: Optional[str] = None
 ) -> Optional[Dict]:
@@ -278,6 +324,15 @@ def normalize_phase_entry(
         normalized["tag"] = current_tag
     normalized.setdefault("tag", "")
     normalized.setdefault("attempt", 1)
+    # Warnings are optional: a clean (or legacy) entry has none. Normalize a
+    # present list and drop it when empty, so the "absent for a clean phase"
+    # contract survives every diary rewrite.
+    if "warnings" in normalized:
+        warnings = normalize_warnings(normalized.get("warnings"))
+        if warnings:
+            normalized["warnings"] = warnings
+        else:
+            normalized.pop("warnings", None)
     return normalized
 
 
@@ -582,6 +637,11 @@ async def set_status(
             replaces only its own entry; other phase entries are preserved.
             Omitted (None) -> the existing diary is left untouched.
 
+    Every write also recomputes the source-level warning aggregate from the
+    diary: ``warnings`` (each row carrying its ``phase``), ``warning_count``
+    and ``has_warnings``. The lifecycle ``status`` is never changed by a
+    warning; a degraded-but-successful source still derives ``completed``.
+
     Returns:
         The stored status document.
     """
@@ -642,6 +702,14 @@ async def set_status(
         for phase_id, entry in completed_phases.items():
             diary[phase_id] = normalize_phase_entry(entry)
         doc["completed_phases"] = diary
+    # Source-level warning aggregate. It is DERIVED from the diary on every
+    # write (including writes that do not touch the diary), so it survives a
+    # restart with the diary and is always consistent with it. Warnings never
+    # change ``status``: a source with warnings is still ``completed``.
+    aggregated = aggregate_warnings(doc.get("completed_phases"))
+    doc["warnings"] = aggregated
+    doc["warning_count"] = len(aggregated)
+    doc["has_warnings"] = bool(aggregated)
     await crud.store(key, doc)
     return doc
 
@@ -846,6 +914,7 @@ async def record_phase_completed(
     settings_version: Optional[str] = None,
     deps: Optional[Dict] = None,
     tag: str = "",
+    warnings: Optional[list] = None,
     type_: str = "file",
     chat_id: Optional[str] = None,
 ) -> dict:
@@ -861,7 +930,13 @@ async def record_phase_completed(
                  "started_at": <epoch float|None>,
                  "owner": {"pod", "pid", "boot"}|None,
                  "tag": <str>, "attempt": <int>,
-                 "marker": ..., "settings_version": ..., "deps": {...}}}
+                 "marker": ..., "settings_version": ..., "deps": {...},
+                 "warnings": [{"code": <str>, "message": <str>}]}}
+
+    ``warnings`` is OPTIONAL and only present for a phase that RAN but
+    produced nothing (or less than expected). It is NOT a state: the entry is
+    still ``complete``, so nothing retries and no dependent is blocked. A
+    clean (or legacy) entry has no ``warnings`` key at all.
 
     **ATOMIC COMPLETION INVARIANT**: the entry is written ONLY after the phase
     body succeeded, never at phase start. A phase interrupted before this
@@ -881,6 +956,9 @@ async def record_phase_completed(
         "settings_version": settings_version,
         "deps": deps or {},
     }
+    normalized_warnings = normalize_warnings(warnings)
+    if normalized_warnings:
+        entry["warnings"] = normalized_warnings
     return await _write_phase_entry(
         agent_id, scope, source, phase, entry, type_=type_, chat_id=chat_id
     )

@@ -106,6 +106,7 @@ from .registry import (
     get_completed_phases,
     get_status,
     ingestion_canceled,
+    normalize_warnings,
     phase_lock,
     phase_state,
     record_phase_completed,
@@ -1331,7 +1332,7 @@ def _unpack_parsing_result(result):
 
 async def _finish_phase(
     ccat, cat, scope, source_name, phase, chat_id, products,
-    expected=None, processed=None,
+    expected=None, processed=None, warnings=None,
 ) -> bool:
     """Record ``state: complete`` because the phase body returned ``done``.
 
@@ -1342,6 +1343,11 @@ async def _finish_phase(
     ``expected`` / ``processed`` are TELEMETRY ONLY: when the body reported
     them they are logged at INFO, otherwise a DEBUG line says they were
     unavailable. They never feed a decision here.
+
+    ``warnings`` carries the phase's optional degradation report (e.g. it ran
+    but extracted nothing). It is attached to the SUCCESSFUL diary entry; it
+    never changes the completion decision, triggers a retry, or blocks a
+    dependent.
     """
     if expected is None and processed is None:
         log.debug(
@@ -1357,7 +1363,9 @@ async def _finish_phase(
     # ``products`` is kept in the signature for callers that still report the
     # body output; completion no longer inspects it.
     _ = products
-    await _record_phase(ccat, cat, scope, source_name, phase, chat_id=chat_id)
+    await _record_phase(
+        ccat, cat, scope, source_name, phase, chat_id=chat_id, warnings=warnings
+    )
     return True
 
 
@@ -1391,8 +1399,11 @@ async def _run_external_phase(
     absorbing ERROR in place and the caller stops the machine.
 
     ``outcome`` (optional dict) receives ``{"status": "done"|"skipped"|
-    "error", "reason": ...}`` so the caller can write the matching diary state
-    instead of inferring it from the boolean.
+    "error", "reason": ..., "warnings": [...]}`` so the caller can write the
+    matching diary state instead of inferring it from the boolean. For a
+    ``done`` result the optional ``warnings`` list is copied through: a phase
+    that RAN but produced nothing (or less than expected) is still success,
+    and its degradation is persisted on the successful entry.
 
     Returns:
         ``True`` when the phase produced ``done``/``skipped``; ``False`` when
@@ -1435,6 +1446,9 @@ async def _run_external_phase(
                 # else leaves the counts unknown. It never decides completion.
                 counts["expected"] = _phase_count(result.get("expected"))
                 counts["processed"] = _phase_count(result.get("processed"))
+            # Warnings never change the status: a phase that ran and found
+            # nothing stays ``done``; the degradation travels with it.
+            outcome["warnings"] = normalize_warnings(result.get("warnings"))
             _set_outcome("done")
             return True
         if isinstance(result, dict) and result.get("status") == "skipped":
@@ -1467,7 +1481,7 @@ async def _run_external_phase(
         return False
 
 
-async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> dict:
+async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None, warnings=None) -> dict:
     """Record the successful completion of one phase in the diary (atomic).
 
     Computes the CURRENT inputs AT COMPLETION and writes the single diary
@@ -1503,6 +1517,9 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
         source_name: the source being processed.
         phase: the phase id that just completed (e.g. ``parsing_chunking``).
         chat_id: the conversation id, when chat-scoped.
+        warnings: optional warnings reported by a body that RAN but produced
+            nothing (or less than expected); persisted on the successful
+            entry and never treated as an error.
 
     Returns:
         The stored status doc (``record_phase_completed`` output).
@@ -1517,6 +1534,7 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
         return await record_phase_completed(
             ccat.agent_key, scope, source_name, phase,
             marker=None, settings_version=None, deps={},
+            warnings=warnings,
             type_="url" if is_url(source_name) else "file",
             chat_id=chat_id,
         )
@@ -1563,6 +1581,7 @@ async def _record_phase(ccat, cat, scope, source_name, phase, chat_id=None) -> d
         settings_version=settings_version,
         deps=deps,
         tag=tag,
+        warnings=warnings,
         type_="url" if is_url(source_name) else "file",
         chat_id=chat_id,
     )
@@ -2399,6 +2418,9 @@ async def reembed_sources(
                 # ``_finish_phase`` and never used as a completion criterion.
                 phase_expected = None
                 phase_processed = None
+                # Warnings REPORTED by the phase body: attached to the
+                # successful entry, never a completion criterion.
+                phase_warnings = None
 
                 # Embedding with no reusable points is a full re-ingest: pick
                 # ``parsing_chunking`` BEFORE taking the phase lock, so no phase
@@ -2619,6 +2641,7 @@ async def reembed_sources(
                         phase_products = True
                         phase_expected = external_counts.get("expected")
                         phase_processed = external_counts.get("processed")
+                        phase_warnings = external_outcome.get("warnings")
 
                     # ---- ATOMIC COMPLETION: the body returned ``done``, so the
                     # ---- phase is complete regardless of how many items it made
@@ -2626,6 +2649,7 @@ async def reembed_sources(
                     if not await _finish_phase(
                         ccat, cat, scope, source_name, phase, chat_id, phase_products,
                         expected=phase_expected, processed=phase_processed,
+                        warnings=phase_warnings,
                     ):
                         break
                     current_phase = None

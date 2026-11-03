@@ -99,6 +99,7 @@ from .registry import (
     clear_completed_phases,
     get_completed_phases,
     get_status,
+    normalize_warnings,
     phase_state,
     set_status,
     should_abandon,
@@ -150,12 +151,23 @@ class PhaseResult:
     surfaced to an operator, but they are never a completion criterion. A
     phase is complete because ``status == "done"``, not because a count
     matches.
+
+    ``warnings`` is the OPTIONAL degradation channel for a phase that RAN
+    correctly but produced nothing (or less than it should). Each warning is
+    ``{"code": <str>, "message": <str>}``; the documented codes are
+    ``empty-extraction``, ``partial-extraction`` and ``degraded``. A warning
+    is NOT a state: it is attached to a ``done`` result, so the phase stays
+    complete, nothing retries and no dependent is blocked. "Could not run"
+    (timeout, transport error, LLM unavailable) is still ``not_ready`` then
+    ``error``. The phase owns this distinction; the machine applies no
+    size threshold.
     """
 
     status: Literal["done", "not_ready", "error", "skipped"]
     reason: str | None = None
     processed: int | None = None
     expected: int | None = None
+    warnings: list[dict] | None = None
 
 
 class IngestionPhase(ABC):
@@ -545,7 +557,9 @@ def _coerce_phase_result(phase_id: str, result: Any) -> PhaseResult:
 
     Legacy registrants return a status dict (or the fail-hard ``None``). An
     unknown/invalid return becomes an explicit ``error`` — never a silent
-    success, mirroring the dispatcher's hard-fail policy.
+    success, mirroring the dispatcher's hard-fail policy. The optional
+    ``warnings`` list is normalized (only well-formed ``{"code", "message"}``
+    rows survive) and carried on the result; it never changes the status.
     """
     if isinstance(result, PhaseResult):
         return result
@@ -556,11 +570,13 @@ def _coerce_phase_result(phase_id: str, result: Any) -> PhaseResult:
                 status="error",
                 reason=f"phase '{phase_id}' returned invalid status {status!r}",
             )
+        warnings = normalize_warnings(result.get("warnings"))
         return PhaseResult(
             status=status,
             reason=result.get("reason"),
             processed=_as_count(result.get("processed")),
             expected=_as_count(result.get("expected")),
+            warnings=warnings or None,
         )
     if result is None or result is _MISSING:
         return PhaseResult(
