@@ -40,14 +40,35 @@ is structural, never a size threshold:
 
 | Situation | Result |
 | --- | --- |
-| ran, the call succeeded, produced nothing or less than expected | `done` + one or more warnings |
-| could not run (timeout, transport error, LLM unavailable) | `not_ready` (retried) then `error` |
+| ran, the call succeeded, produced nothing and an empty product is VALID | `done` + one or more warnings |
+| ran, the call succeeded, produced nothing and an empty product is INVALID | `error` with a reason (no warning) |
+| could not run (timeout, transport error, LLM unavailable, no input) | `not_ready` (retried) then `error`, or the existing skip path |
 
 The **phase owns the decision**: it knows whether it really ran and whether an
 empty product is valid. The machine applies no input-size or item-count
 threshold. A phase that returns `done` with warnings is COMPLETE: it is not
 retried and its dependents are not blocked. Only `error` keeps the propagation
 of section 3.
+
+#### Per-phase empty-output semantics
+
+The two built-in phases that PRODUCE the searchable product are strict: when
+they ran on a source that carried input and stored nothing, the product does
+not exist and the phase is an `error`, never a warning. The phases whose empty
+result is legitimate keep the warning channel.
+
+| Phase | Situation | Result |
+| --- | --- | --- |
+| `parsing_chunking` | ran on a non-empty source and produced 0 chunks | `error`: `parsing produced no chunks from <N> bytes of '<source>'` |
+| `embedding` | ran with points to embed and stored 0 points | `error`: `embedding stored no points for <N> point(s) of '<source>'` |
+| `catalog_cards` | ran and legitimately found no card | `done` + warning |
+| graph phases (e.g. `graph_concepts`, `graph_relations`) | ran and legitimately extracted nothing | `done` + warning |
+| `parsing_chunking` / `embedding` | could not run (no bytes, no points to embed, source vanished) | unchanged `not_ready` / skip paths — not an empty-output error |
+
+"No chunks from a non-empty file" and "no points from a non-empty embedding
+run" are production failures, not documents without content, so they must not
+look complete. The judgement belongs to the phase bodies, which know the input
+size and the produced count; the machine still applies no threshold.
 
 Each warning is:
 
@@ -297,12 +318,15 @@ These are owner decisions, implemented for the graph concept phase in MyGRAPH
 `341e61c`.
 
 `done` means the phase **ran to completion**, not merely that it did not crash.
-A phase that produced nothing, or less than it should have, is still `done` but
-MUST say so with a warning (section 1); `done` with no warning asserts that the
-expected product was produced. "Could not run" is different: a timeout,
-transport error or unavailable LLM is still `not_ready` then `error`. (The
-`processed`/`expected` counters remain telemetry only — see section 1 — so this
-is an obligation on the phase, not a check the machine performs.)
+A phase that produced nothing, and whose empty product is legitimate, is still
+`done` but MUST say so with a warning (section 1); `done` with no warning
+asserts that the expected product was produced. A phase whose empty product is
+NOT valid (the built-in `parsing_chunking` / `embedding` invariants in section
+1) reports `error` instead: there is nothing to warn about because the product
+does not exist. "Could not run" is different again: a timeout, transport error
+or unavailable LLM is still `not_ready` then `error`. (The `processed`/
+`expected` counters remain telemetry only — see section 1 — so this is an
+obligation on the phase, not a check the machine performs.)
 
 **Budget.** An LLM-backed phase declares `not_ready_budget_seconds` /
 `not_ready_budget_env` on the ABC. The graph concept phase points its

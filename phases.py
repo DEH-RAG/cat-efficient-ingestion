@@ -153,14 +153,20 @@ class PhaseResult:
     matches.
 
     ``warnings`` is the OPTIONAL degradation channel for a phase that RAN
-    correctly but produced nothing (or less than it should). Each warning is
-    ``{"code": <str>, "message": <str>}``; the documented codes are
-    ``empty-extraction``, ``partial-extraction`` and ``degraded``. A warning
-    is NOT a state: it is attached to a ``done`` result, so the phase stays
-    complete, nothing retries and no dependent is blocked. "Could not run"
-    (timeout, transport error, LLM unavailable) is still ``not_ready`` then
-    ``error``. The phase owns this distinction; the machine applies no
-    size threshold.
+    correctly but produced nothing VALID TO BE EMPTY (or less than it should).
+    Each warning is ``{"code": <str>, "message": <str>}``; the documented codes
+    are ``empty-extraction``, ``partial-extraction`` and ``degraded``. A
+    warning is NOT a state: it is attached to a ``done`` result, so the phase
+    stays complete, nothing retries and no dependent is blocked.
+
+    An empty product is not universally benign: the built-in
+    ``parsing_chunking`` (a non-empty source yielding no chunk) and
+    ``embedding`` (points to embed yielding no stored point) report ``error``
+    instead, because their product is the searchable content itself. The
+    catalog and graph phases keep the warning channel. "Could not run"
+    (timeout, transport error, LLM unavailable, no input) is still
+    ``not_ready`` then ``error``. The phase owns this distinction; the machine
+    applies no size threshold.
     """
 
     status: Literal["done", "not_ready", "error", "skipped"]
@@ -377,12 +383,58 @@ class ParsingChunkingPhase(_BuiltinPhase):
     depends_on = ()
     settings_category = "chunker"
 
+    @staticmethod
+    def empty_output_error(
+        source: str, content_bytes: int, processed: int | None
+    ) -> PhaseResult | None:
+        """INVARIANT: a non-empty source that yields zero chunks failed to parse.
+
+        ``parsing_chunking`` produces the text every later phase consumes, so
+        an empty result from a source that DID carry bytes is a parse failure,
+        not a document without content. It is an ``error`` (never a warning):
+        the product does not exist and a dependent would otherwise index
+        nothing while the source looks complete.
+
+        An empty source is "could not run" and keeps whichever path it had;
+        this helper returns ``None`` for it, as it does for a real product.
+        """
+        if content_bytes > 0 and processed == 0:
+            return PhaseResult(
+                status="error",
+                reason=(
+                    f"parsing produced no chunks from {content_bytes} bytes "
+                    f"of '{source}'"
+                ),
+            )
+        return None
+
 
 class EmbeddingPhase(_BuiltinPhase):
     id = "embedding"
     label = "Computing embeddings"
     depends_on = ("parsing_chunking",)
     settings_category = "embedder"
+
+    @staticmethod
+    def empty_output_error(
+        source: str, to_embed: int | None, stored: int | None
+    ) -> PhaseResult | None:
+        """INVARIANT: an embedding run that stores zero points is a failure.
+
+        When there WERE points to embed and the run persisted none, nothing
+        exists for the source: that is an ``error`` naming the count, never a
+        warning on a ``done`` phase. "Nothing to embed" (no points at all) is
+        a different, unchanged path and yields ``None`` here.
+        """
+        if to_embed and stored == 0:
+            return PhaseResult(
+                status="error",
+                reason=(
+                    f"embedding stored no points for {to_embed} point(s) "
+                    f"of '{source}'"
+                ),
+            )
+        return None
 
 
 #: Built-in phase classes in execution order. ``get_phases`` instantiates them

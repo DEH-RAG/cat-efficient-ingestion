@@ -6,9 +6,9 @@ Covers:
      turns it into ``error`` with the phase + elapsed time in the reason;
   2. terminal rows are never rewritten by the not-ready path;
   3. the embedding phase detects zero/non-finite L2-norm vectors: a source
-     whose chunks are ALL invalid is NOT completed (it raises the not-ready
-     signal BEFORE the destructive replace), while a source with at least one
-     valid chunk proceeds normally; counts are reported per source.
+     whose chunks are ALL invalid is an ERROR (it raises BEFORE the destructive
+     replace, because nothing would be persisted), while a source with at least
+     one valid chunk proceeds normally; counts are reported per source.
 
 The Cat plugin loader imports EVERY ``.py`` under a plugin folder at
 activation, so this whole file is inert on import: every import, class and
@@ -237,7 +237,7 @@ if __name__ == "__main__":
         reembed.execute_shared_hook = _async_return(None)
         reembed.split_oversized = lambda docs, embedder: docs
 
-    async def test_all_zero_norm_is_not_completed():
+    async def test_all_zero_norm_is_an_error():
         async def _run():
             handler = FakeHandler()
             summary = {}
@@ -251,9 +251,10 @@ if __name__ == "__main__":
                         FakeEmbedder([[0.0, 0.0, 0.0]] * 3), None, None, None,
                         zero_norm_summary=summary,
                     )
-                except reembed._NothingStored as exc:
+                except Exception as exc:  # noqa: BLE001 - the invariant raises
                     raised = exc
-                assert raised is not None, "all-zero source must raise _NothingStored"
+                assert raised is not None, "all-zero source must raise (error)"
+                assert "stored no points for 3 point(s)" in str(raised), raised
                 assert handler.deletes == 0 and handler.adds == 0, (
                     f"destructive replace ran: deletes={handler.deletes} adds={handler.adds}"
                 )
@@ -262,7 +263,7 @@ if __name__ == "__main__":
                 warnings = [m for m in log.warnings if "zero/non-finite" in m]
                 assert warnings and "doc.txt" in warnings[0], log.warnings
                 assert "c0" in warnings[0] and "c2" in warnings[0], warnings[0]
-                print("PASS all-zero-norm source stays non-terminal and logs ids/count")
+                print("PASS all-zero-norm source is an error and logs ids/count")
 
         await _run()
 
@@ -307,7 +308,7 @@ if __name__ == "__main__":
         await test_not_ready_is_time_bounded_and_retryable()
         await test_not_ready_exceeds_budget_marks_error()
         await test_terminal_row_is_never_rewritten()
-        await test_all_zero_norm_is_not_completed()
+        await test_all_zero_norm_is_an_error()
         await test_partial_zero_norm_proceeds()
         await test_stale_phase_still_runs()
 

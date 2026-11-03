@@ -79,6 +79,8 @@ from .hooks import (
 )
 from .ingestion_executor import run_in_ingestion_executor
 from .phases import (
+    EmbeddingPhase,
+    ParsingChunkingPhase,
     PhaseDeleteError,
     compute_tags,
     current_legacy_inputs,
@@ -133,20 +135,6 @@ _NOT_READY_RETRY_SECONDS_DEFAULT = 5.0
 
 #: Status of a row the machine must never rewrite.
 _TERMINAL_STATUSES = (IngestionStatus.COMPLETED.value, IngestionStatus.ERROR.value)
-
-
-class _NothingStored(Exception):
-    """Signal that a phase body produced no storeable chunk.
-
-    Raised BEFORE any destructive write so old points stay intact. The
-    dispatcher treats it exactly like an external ``not_ready`` response:
-    the row stays non-terminal and is retried until the time budget expires.
-    """
-
-    def __init__(self, reason: str, retry_after: float = _NOT_READY_RETRY_SECONDS_DEFAULT):
-        super().__init__(reason)
-        self.reason = reason
-        self.retry_after = retry_after
 
 
 def _not_ready_max_seconds() -> float:
@@ -727,9 +715,10 @@ async def _embed_phase(
 
     Zero/non-finite L2-norm vectors are counted and logged at WARNING with the
     source and chunk ids (dense stores would otherwise drop them silently). If
-    a source would end up with NO valid chunk at all, :class:`_NothingStored`
-    is raised BEFORE the destructive replace, so the caller keeps the row
-    non-terminal and retries later instead of marking an empty source complete.
+    the run would persist NO point at all for a source that HAD points to
+    embed, it raises BEFORE the destructive replace: the phase is an ``error``
+    (the product does not exist), never a silent empty completion and never a
+    mere warning.
 
     Returns the list of replaced points (with vectors), or None when the
     embedding failed (the source is left for a later pass).
@@ -872,13 +861,23 @@ async def _embed_phase(
     if intended_vectors and not valid_vectors:
         # EVERY computed vector is unusable: storing these points would leave
         # the source with NO embedding at all (dense stores drop zero vectors
-        # silently). Abort BEFORE the destructive replace so the previous
-        # points/vectors stay intact and the dispatcher can retry the phase.
-        raise _NothingStored(
-            f"embedding phase produced 0 valid vectors for {intended_vectors} "
-            f"chunk(s): all have zero/non-finite L2-norm",
-            retry_after=_not_ready_retry_after(None),
+        # silently). This is an ERROR — the run produced no product — so abort
+        # BEFORE the destructive replace (not a warning, not a silent done).
+        failure = EmbeddingPhase.empty_output_error(
+            source_name, intended_vectors, valid_vectors
         )
+        if failure is not None:
+            raise Exception(
+                f"{failure.reason}: all have zero/non-finite L2-norm"
+            )
+
+    failure = EmbeddingPhase.empty_output_error(
+        source_name, len(source_points), len(points)
+    )
+    if failure is not None:
+        # Defensive: a run that builds no point at all stored nothing. Abort
+        # before the destructive replace, exactly like the zero-vector case.
+        raise Exception(failure.reason)
 
     # All vectors were computed BEFORE the delete so a failure leaves the old
     # points intact (compute-before-delete). A cancel that flipped during the
@@ -1916,11 +1915,21 @@ async def _run_parsing_phase(
             raise Exception(f"File '{source_name}' not found on disk; cannot re-ingest.")
         content_type = None
 
+    # The invariant below is about SOURCE CONTENT, not a size threshold: a
+    # source that carried bytes but yielded no chunk failed to parse. A source
+    # with no bytes is "could not run" and keeps its existing path.
+    content_bytes = len(file_bytes or b"")
+
     # 3. parse + chunk + ALWAYS extract images.
     docs, images = await _parse_and_chunk(
         ccat, rabbit_hole, source, file_bytes, content_type, cat
     )
     if not docs:
+        failure = ParsingChunkingPhase.empty_output_error(
+            source_name, content_bytes, 0
+        )
+        if failure is not None:
+            raise Exception(failure.reason)
         raise Exception(f"No valid chunks found in the file '{source_name}'.")
 
     # 3b. Emit the store hook EXACTLY ONCE for this source, after chunking and
@@ -1933,6 +1942,11 @@ async def _run_parsing_phase(
         cat, "before_rabbithole_stores_documents", docs,
     )
     if not docs:
+        failure = ParsingChunkingPhase.empty_output_error(
+            source_name, content_bytes, 0
+        )
+        if failure is not None:
+            raise Exception(failure.reason)
         raise Exception(f"No valid chunks found in the file '{source_name}'.")
 
     # 4. store text chunks + image points with EMPTY vectors.
@@ -1950,6 +1964,11 @@ async def _run_parsing_phase(
     chunks_stored = sum(
         1 for p in stored if not (p.payload or {}).get("metadata", {}).get("image")
     )
+    failure = ParsingChunkingPhase.empty_output_error(
+        source_name, content_bytes, chunks_stored
+    )
+    if failure is not None:
+        raise Exception(failure.reason)
     return source_name, stored, len(docs), chunks_stored
 
 
@@ -2527,29 +2546,15 @@ async def reembed_sources(
                                 "url" if is_url(source_name) else "file",
                             )
                             current_phase = PHASE_EMBEDDING
-                            try:
-                                embed_counts: dict = {}
-                                phase_products = await _embed_phase(
-                                    ccat, collection_name, source_name, source_points,
-                                    embedder, chat_id, cat, rabbit_hole,
-                                    zero_norm_summary=zero_norm_summary,
-                                    counts=embed_counts,
-                                )
-                                phase_expected = embed_counts.get("expected")
-                                phase_processed = embed_counts.get("processed")
-                            except _NothingStored as exc:
-                                # No valid vector at all: keep the row non-terminal
-                                # and retry the SAME phase until the time budget
-                                # expires (old points were NOT deleted). This is the
-                                # not_ready path, never a silent empty completion.
-                                if not await _wait_not_ready(
-                                    ccat, scope, source_name, PHASE_EMBEDDING,
-                                    chat_id, exc.reason, exc.retry_after,
-                                    cat=cat,
-                                ):
-                                    break
-                                await asyncio.sleep(exc.retry_after)
-                                continue
+                            embed_counts: dict = {}
+                            phase_products = await _embed_phase(
+                                ccat, collection_name, source_name, source_points,
+                                embedder, chat_id, cat, rabbit_hole,
+                                zero_norm_summary=zero_norm_summary,
+                                counts=embed_counts,
+                            )
+                            phase_expected = embed_counts.get("expected")
+                            phase_processed = embed_counts.get("processed")
                             stored_points = None
                             counter += 1
                         else:
