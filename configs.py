@@ -8,14 +8,18 @@ through the ``factory_allowed_ingestions`` hook, so the engine can be selected
 
 from pydantic import model_validator
 
-from cat.services.factory.ingestion import BaseIngestionEngine
-from cat.services.factory.models import BaseFactoryConfigModel
+from cat.services.factory.ingestion import BaseIngestionConfiguration, BaseIngestionEngine
 
 from .reembed import EfficientIngestionEngine
 
 
-class EfficientIngestionConfiguration(BaseFactoryConfigModel):
-    """Configuration of the efficient ingestion engine (category ``ingestion``)."""
+class EfficientIngestionConfiguration(BaseIngestionConfiguration):
+    """Configuration of the efficient ingestion engine (category ``ingestion``).
+
+    Inherits the upstream ``BaseIngestionConfiguration`` (which itself extends
+    ``BaseFactoryConfigModel`` and declares the abstract ``pyclass``), so the
+    class stays a valid replaceable-class config on upstream CAT.
+    """
 
     ingestion_max_concurrency: int = 5
 

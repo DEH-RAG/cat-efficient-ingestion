@@ -2,6 +2,8 @@
 
 <p id="description">This is a core plugin for the <a href="https://github.com/Grinning-Cat-RAG/grinning-cat-core">Grinning Cat</a> Project which replaces the default ingestion engine with a two-phase, resumable one: it tracks the state of every ingested source, re-embeds the stored chunks instead of re-ingesting the files when the embedder changes, and recovers ingestions interrupted by a crash or a restart.</p>
 
+The phase-ingestion contract — states, recursive tags, propagation, recovery, locks, state/data lockstep, file deletion, plugin surface and known limitations — is documented in [`docs/phase-contract.md`](docs/phase-contract.md).
+
 <h2>🧐 What it does</h2>
 
 The plugin registers `EfficientIngestionEngine` through the `factory_allowed_ingestions` hook, so the core resolves it via the ServiceFactory (`ingestion` category) instead of the default engine. The same engine drives **one** state machine for the whole lifecycle — fresh uploads, recovery, re-embed and re-ingest:
@@ -13,32 +15,45 @@ Because the two phases are separate and recorded, an embedder change only needs 
 
 <h2>🗂️ Ingestion status registry</h2>
 
-Every transition is written as a Redis-JSON document under `agents:{agent_id}:ingestion:{scope}:{sha256(source)}`, where `scope` is `agent` for the agent KB or a conversation `chat_id`.
+Every transition is written as a Redis-JSON document under `agents:{agent_id}:ingestion:{scope}:{sha256(source)}`, where `scope` is `agent` for the agent KB or a conversation `chat_id`. Source-scoped queries and deletes always carry the `chat_id` filter when chat-scoped, so the same file name uploaded in two conversations never reads or removes the other chat's chunks.
 
-Lifecycle states: `uploaded → processing → completed | error`, with `downloading → downloaded` inserted for URLs. The document also records the work `phase` (`downloading`, `parsing_chunking`, `embedding`), the `embedder_name` and the `chunker_name` that produced the stored data, plus the timestamps used by the recovery sweep.
+Lifecycle states: `uploaded → processing → completed | error`, with `downloading → downloaded` inserted for URLs. `deleting` is written before a phase-aware file deletion starts; the row is removed only after every registered phase's `delete()` ran in reverse order, so a crash there stays resumable instead of leaving stale state. A re-ingest uses the source-level `reindexing` state instead: it is written **before** the artifact wipe, the row is **never removed**, and it becomes `processing` before the phases start, so a crash leaves a recoverable row rather than a missing one. The document also records the work `phase` (`downloading`, `parsing_chunking`, `embedding`), the `embedder_name` and the `chunker_name` that produced the stored data, plus the timestamps used by the recovery sweep.
 
-Sources are claimed under a **per-source distributed lock**, so different sources of the same agent are ingested concurrently while the same source is never processed twice by two workers. A heartbeat keeps the `processing` row fresh while it is being handled, so live work is never stolen by another replica.
+Sources are claimed under a **per-source distributed lock**, so different sources of the same agent are ingested concurrently while the same source is never processed twice by two workers. A heartbeat keeps every in-flight row (`uploaded`, `downloading`, `downloaded`, `processing`) fresh while a worker handles it, so live work is never stolen by another replica. The download heartbeat is bounded (`CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS`, default `1800`): a download that fails without firing `rabbithole_url_download_completed` stops refreshing and the row ages out, becoming resumable again.
 
-<h2>🧭 Clock-free two-level phase invalidation</h2>
+<h2>🧭 Clock-free recursive phase tags</h2>
 
 The plugin decides whether a source must be re-run with a **clock-free** model: no timestamps are ever used for correctness. Each status document carries a `completed_phases` diary, keyed by phase id:
 
 ```
-completed_phases: {phase: {"marker": Any, "settings_version": str|None,
-                           "deps": {upstream_phase: upstream_marker}}}
+completed_phases: {phase: {"tag": str,
+                           "marker": Any, "deps": {upstream_phase: upstream_marker}}}
 ```
 
-- `marker` is the plugin-defined marker of the settings the phase ran with;
-- `settings_version` is an **opaque** copy of the settings entry's `updated_at`, used only for equality, never as a time;
-- `deps` maps each upstream phase to the marker it ran with.
+- `tag` is a **recursive** SHA-256: the phase's own tag is `sha256(kind + ":" + canonical_json(relevant_settings))`, then folded with the tag of every phase in `depends_on`;
+- `marker` is the plugin-defined marker of the settings the phase ran with (kept for compatibility/readability);
+- `deps` maps each upstream phase to the marker it ran with (kept for compatibility/readability).
+
+`compute_tags(cat, phases)` resolves each phase's material configuration and delegates to `phase_tag_resolver.resolve_tags(settings, phases)`, which walks the graph in dependency order. For each phase:
+
+```
+own_tag  = sha256(kind + ":" + canonical_json(relevant_settings))
+tag      = sha256(own_tag + "|" + "|".join(f"{dep}={dep_tag}" for dep in sorted(depends_on)))
+```
+
+`relevant_settings` is the whole settings value unless the phase declares a `settings_check`: a key collection keeps only those keys, while a (possibly async) callable returns the value that participates. Tag computation reads configuration only — never an LLM call.
+
+Because dependencies are resolved first, **any change deep in the chain changes every dependent's tag**, transitively. A cycle raises `PhaseTagCycleError` naming the cycle. A legacy (v1) entry has no `tag`; it is compared against the current `marker` / `settings_version` / `deps` (as the pre-tag machine did), and a current one is backfilled with its tag in place instead of being re-run.
 
 A phase is stale when any of these hold:
 
-- **(a) dependency**: an upstream in its `depends_on` is missing from the diary, or the recorded `deps[upstream]` differs from the upstream's current diary `marker` (the upstream re-ran, so this phase must re-run too);
-- **(b) settings fast-path**: the settings entry for the phase's category was **not** rewritten since the phase ran (`settings_version` equals the current entry's `updated_at`, compared as an opaque token) → FRESH, no marker comparison needed;
-- **(c) slow-path**: the plugin-defined marker from `ingestion_phase_settings_marker` differs from the recorded `marker` (the settings entry *was* rewritten; the phase-owning plugin decides whether the change is material).
+- its own diary entry is absent (pending) or its `processing` lease expired;
+- a dependency is absent (pending), `processing`, `error` or `skipped` — there is no completed upstream work to consume;
+- the stored `tag` differs from the current recursive tag;
+- a legacy (v1) entry's recorded `marker` / `settings_version` / `deps` no longer match the current values.
 
-The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) → `embedding` (depends on the embedder settings **and** the recorded `parsing_chunking` marker). So an embedder-only change re-runs only `embedding`, while a chunker change re-runs `parsing_chunking` first and `embedding` follows on the next probe.
+The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) → `embedding` (depends on the embedder settings **and** the `parsing_chunking` tag). So an embedder-only change re-runs only `embedding`, while a chunker change re-runs `parsing_chunking` first and `embedding` follows on the next probe (its tag now includes the new parsing tag).
+
 
 **Atomic-completion invariant**: a phase's diary entry is written **only** on successful completion, in a single atomic write, never at phase start. A phase interrupted by a restart therefore has no entry and is re-run on recovery.
 
@@ -46,10 +61,12 @@ The built-in phase DAG is `parsing_chunking` (depends on the chunker settings) �
 
 The phase machine is extensible through five hooks declared in the plugin itself (`hooks.py`, `@hook(priority=0)`), so external plugins can override them with higher priorities — no MyCAT core change is needed. The `completed_phases` argument threaded through the hooks is a `list[dict]` where every entry carries at least a `"phase"` key (MyGRAPH-compatible), plus optional `marker`/`deps` keys.
 
+EffING is a **system-only core plugin** (`ingestion` is a system-level factory service, like `embedder`): its own phase hooks are dispatched on BillTheLizard's plugin manager (`ccat.lizard.plugin_manager`) and no agent activates it. Phase PROVIDERS stay agent-level plugins: `ingestion_phase_specs` is collected from BOTH the system and the calling agent's manager (deduplicated by phase id, built-ins win), and `ingestion_phase_run` / `ingestion_phase_settings_marker` are dispatched to the manager that owns the phase — the system manager for the built-in phases, the agent manager for external phases such as MyGRAPH and CATALOG. The hooks accept either the `cat=` or the `lizard=` caller keyword, since the two managers use different names for the same caller value.
+
 - **`ingestion_phase_pending(pending, source, completed_phases, cat)`** — accumulator of stale phases for a source. Each registrant appends the `{"phase": <id>, ...}` entries it considers stale and returns the extended list. The default is the identity (nothing pending).
-- **`ingestion_phase_run(phase, source, completed_phases, cat)`** — runs one phase with a tri-state contract: return `{"status": "done"}` on success, `{"status": "not_ready", "retry_after": N}` when retriable but not yet runnable (the machine retries after `N` seconds), or raise on permanent failure. The default returns `None`, which the machine treats as fail-hard / unimplemented: a phase with no registrant is an error, never a silent success.
-- **`before_ingestion_status_completed(source, cat)`** — final gate before a source is marked COMPLETED. A registrant raises to force the source to ERROR instead; the default is a no-op.
-- **`ingestion_phase_settings_marker(phase, cat)`** — the plugin-defined material marker for a phase, compared against the recorded diary `marker` to decide whether the phase's settings changed materially. The default returns `None` ("unknown"), which the machine treats conservatively as stale.
+- **`ingestion_phase_run(phase, source, completed_phases, cat)`** — runs one phase with a tri-state contract: return `{"status": "done"}` on success, `{"status": "not_ready", "retry_after": N}` when retriable but not yet runnable (the machine keeps the row `processing` and retries after `N` seconds, bounded by the wall-clock budget `CAT_INGESTION_NOT_READY_MAX_SECONDS`, default `3600`, or the phase's own declared budget when it sets `not_ready_budget_seconds` / `not_ready_budget_env`; only then does the row become `error`), or raise on permanent failure. The default returns `None`, which the machine treats as fail-hard / unimplemented: a phase with no registrant is an error, never a silent success.
+- **`before_ingestion_status_completed(source, cat)`** — final gate before a source is marked COMPLETED. A registrant raises `CustomHookVetoException` to force the source to ERROR instead. The built-in implementation vetoes when the caller exposes a `has_pending_source_tasks(source)` probe and it reports pending work; absent that probe it is a no-op.
+- **`ingestion_phase_settings_marker(phase, cat)`** — the plugin-defined material marker for a phase, compared against the recorded diary `marker` to decide whether the phase's settings changed materially. The built-in phases return a stable JSON fingerprint of their service configuration (`parsing_chunking`: the agent-scoped chunker; `embedding`: the system-scoped embedder). An unknown phase returns `None` ("unknown"), which the machine treats conservatively as stale.
 - **`ingestion_phase_specs(specs, cat)`** — accumulator of `PhaseSpec` declarations. Each registrant appends the phases it owns and returns the extended list; EffING merges them into its built-in `PHASES` at probe time (built-ins win on duplicate ids). The default is the identity (no registered phases).
 
 An external phase plugin (e.g. MyGRAPH) registers by declaring its phases through `ingestion_phase_specs`, providing a material marker through `ingestion_phase_settings_marker`, and executing them through `ingestion_phase_run`; the machine dispatches any phase not in its built-in `PHASES` through the run hook and records a real diary entry once it reports `done`. See the phase-registration API section below.
@@ -61,25 +78,48 @@ External plugins can declare their own ingestion phases without touching the Eff
 A `PhaseSpec` declares three things:
 
 - `id` — the phase id (also the diary key);
-- `settings_category` — the settings category whose `updated_at` is the opaque fast-path token, or `None` for phases with no settings entry (marker-only invalidation);
-- `depends_on` — upstream phase ids whose recorded markers this phase consumed.
+- `settings_category` — the settings category the phase's material marker is read from, or `None` for phases with no settings entry (the declared `id:category:deps` string is the fallback own material);
+- `depends_on` — upstream phase ids whose tags this phase folds into its own tag;
+- `settings_check` — optional narrowing of the settings that feed the phase's own tag: a key collection keeps only those keys, a (possibly async) callable returns the value that participates; omitted/`None` uses the whole settings value.
 
 A provider only declares a spec + a marker + an execution hook:
 
 - **`ingestion_phase_specs(specs, cat)`** — declares the phase (accumulator);
-- **`ingestion_phase_settings_marker(phase, cat)`** — the material marker compared against the recorded diary `marker` (the provider decides whether a settings rewrite is material);
+- **`ingestion_phase_settings_marker(phase, cat)`** — the material marker that feeds the phase's own tag (the provider decides whether a settings rewrite is material). It may be a coroutine: `HookPhase.tag` awaits it when needed; it reads configuration only and performs no LLM call;
 - **`ingestion_phase_run(phase, source, completed_phases, cat)`** — executes the phase (tri-state contract).
 
-EffING computes staleness for ALL merged phases (deps by upstream marker identity + marker comparison), so a provider never re-implements the pending probe. Registered phases get REAL diary entries: `_record_phase` writes the marker from `ingestion_phase_settings_marker`, reads `settings_version` only when `settings_category` is set, and copies `deps` from the current diary upstream markers — the same atomic-completion invariant as the built-ins. A registered phase is therefore restartable and re-runs automatically when its upstreams re-run or its marker changes.
+EffING computes staleness for ALL merged phases by comparing the stored recursive `tag` against the freshly computed one, so a provider never re-implements the pending probe and a change deep in the chain invalidates every dependent. Registered phases get REAL diary entries: `_record_phase` writes the recursive `tag` from `compute_tags`, the marker from `ingestion_phase_settings_marker`, and copies `deps` from the current diary upstream markers — the same atomic-completion invariant as the built-ins. A registered phase is therefore restartable and re-runs automatically when it or any upstream changes.
+
+<h2>🧩 Third-party phase-extension contract</h2>
+
+A plugin that exposes an ingestion phase depends on EffING **optionally** and follows this contract:
+
+1. **Declare the dependency by folder id, with underscores.** `plugin.json` `"dependencies"` must list `cat_efficient_ingestion` (the folder id), never the hyphenated repo name `cat-efficient-ingestion`. `Plugin.missing_dependencies` (`cat/looking_glass/mad_hatter/plugin.py:264-274`) compares dependency strings against **plugin folder names**, so the hyphenated form is reported missing and silently blocks the consumer from loading.
+2. **Import `PhaseSpec` from the canonical path inside a guarded import, at module top level:**
+
+   ```python
+   from cat import hook
+
+   try:
+       from cat.core_plugins.cat_efficient_ingestion.phases import PhaseSpec
+   except ImportError:  # EffING not installed: degrade to classic ingestion only
+       PhaseSpec = None
+   ```
+
+   The canonical path is `cat.core_plugins.cat_efficient_ingestion.phases`. The host loads `cat/core_plugins/` in preference to `cat/plugins/` and derives the module name from the folder, so importing the same file through any other path (e.g. `cat.plugins.…`) yields a **second module identity**. `merged_phases` accepts a spec only when `isinstance(spec, PhaseSpec)` — with two identities that is `False` and the spec is silently dropped.
+3. **Define the phase hooks only when the import succeeded** (or make them no-ops when `PhaseSpec is None`): `ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`.
+4. **Keep the classic CAT ingestion hooks** (`rabbithole_ingestion_processing`, the `before_rabbithole_*` hooks, …) unconditionally, so **basic ingestion still works when EffING is absent**.
+
+Never require EffING at import time and never make `PhaseSpec` duck-typed: the strict class identity is what guarantees the spec reaches the phase machine. The host harness pins this contract in `tests/effing/test_phase_extension_contract.py` (fixture plugin `tests/effing/fixtures/phase_consumer/`), covering both the EffING-present and EffING-blocked imports.
 
 <h2>🔁 Probe-driven dispatcher</h2>
 
-`reembed_sources` is the one probe-driven dispatcher. For each source it reads the `completed_phases` diary (backfilling legacy completed rows), converts it to the hook list shape and threads it into the `ingestion_phase_pending` accumulator. Registrants compare the diary against the current settings markers/versions and report the stale phases:
+`reembed_sources` is the one probe-driven dispatcher. For each source it reads the `completed_phases` diary (backfilling legacy completed rows), converts it to the hook list shape and threads it into the `ingestion_phase_pending` accumulator. Registrants compare each stored recursive `tag` against the freshly computed tag (which folds in every dependency) and report the stale phases:
 
-- **no stale phases** → the source is up to date and is **skipped without claiming**;
+- **no stale phases** → the source is up to date: it is **skipped without claiming** when it is already terminal (`completed`/`error`); a non-terminal row left behind (e.g. an interrupted run that recorded every phase but never wrote `completed`) is **terminalized to `completed`** here, in one pass, so the sweep never re-hands it forever;
 - **stale phases** → the row is claimed (per-source lock) and the stale phases run **serially**, one at a time in probe order.
 
-After each phase succeeds, its diary entry (`marker` / `settings_version` / `deps`) is recorded **atomically at completion** — never at phase start — and the probe is re-run against the updated diary. When the re-probe is empty, the terminal COMPLETED status is written (after the `before_ingestion_status_completed` gate), with the work phase cleared. An `error` row is never advanced nor resurrected to COMPLETED.
+After each phase succeeds, its diary entry (`tag`, plus `marker` / `deps` for compatibility) is recorded **atomically at completion** — never at phase start — and the probe is re-run against the updated diary. When the re-probe is empty, the terminal COMPLETED status is written (after the `before_ingestion_status_completed` gate), with the work phase cleared. An `error` row is never advanced nor resurrected to COMPLETED.
 
 <h2>🛡️ Hardening</h2>
 
@@ -89,7 +129,8 @@ After each phase succeeds, its diary entry (`marker` / `settings_version` / `dep
 
 <h2>🔌 Endpoints</h2>
 
-- `GET /ingestion/status` — the registry, reconciled against the canonical sources (files on disk, URLs in the vector store, existing conversations); pass `?chat_id=<id>` for a conversation scope. In-flight and `error` entries are never purged; only terminal `completed` entries whose source has vanished are removed.
+- `GET /ingestion/status` — the registry, reconciled against the canonical sources (files on disk, URLs in the vector store, existing conversations); pass `?chat_id=<id>` for a conversation scope. In-flight and `error` entries are never purged; only terminal `completed` entries whose source has vanished are removed. Every entry also carries two display-only fields: `phase_label` (the human-readable label of its current `phase`, or `null` when it has none) and `status_label` (the lifecycle-state label). The machine fields `phase` and `status` are unchanged.
+- `GET /ingestion/phases` — the phase catalog and the lifecycle-state catalog. `phases` lists every registered phase (built-ins plus plugin phases from `get_phases`) in dependency order — each dependency before its dependents — as `{"id", "label", "order", "depends_on"}` with a 1-based `order`. `states` lists the lifecycle states as `{"id", "label"}`. Labels are English display defaults; the frontend localizes by `id` and a label is never used as a key.
 - `DELETE /ingestion/status?source=<name>[&scope=<chat_id>]` — dismiss one terminal row (`error` or `completed`); an in-flight source is refused, remove the file to abandon it.
 - `GET /ingestion/settings` — list the available ingestion engines with their schemes and the effective choice (SYSTEM READ).
 - `GET /ingestion/settings/{name}` — settings and scheme of one ingestion engine configuration (SYSTEM READ).
@@ -99,11 +140,79 @@ After each phase succeeds, its diary entry (`marker` / `settings_version` / `dep
 
 On `after_lizard_bootstrap` the plugin schedules a fire-and-forget pass (per agent, never blocking bootstrap) that:
 
-1. hands every stale `uploaded` / `processing` / `error` entry back to the phase machine, re-reading the file from disk or re-downloading the URL (entries whose file is gone are marked `error` with the reason);
+1. hands every stale `uploaded` / `processing` / `error` entry back to the phase machine, re-reading the file from disk or re-downloading the URL (entries whose file is gone are marked `error` with the reason). An `error` row is retried only while its diary still shows a stale phase, so a fresh `error` row is terminal and never re-handed;
 2. revalidates `completed` rows through the clock-free probe (see Hardening);
 3. purges the status entries whose source is absent from the canonical lists.
 
-The pass is repeated every `CAT_INGESTION_RESUME_INTERVAL_SECONDS`.
+The pass runs once at bootstrap and then every
+`CAT_INGESTION_RESUME_INTERVAL_SECONDS` (core default `60`). Set it to `<= 0`
+to run the pass only at bootstrap.
+
+<h2>🔀 Efficient vs classic ingestion (dual flow)</h2>
+
+CAT ingests a source through **one of two engines**, and the engine is unique at
+system level: the ingestion service is a single `system:agent` service in the
+`ingestion` category, so exactly ONE engine — the classic `RabbitHole` or
+`EfficientIngestionEngine` (this plugin) — ingests a given source.
+
+- **Classic ingestion** — the core `RabbitHole` pipeline. It emits
+  `before_rabbithole_stores_documents` before storing and
+  `after_rabbithole_stored_documents` at the end.
+- **Efficient ingestion** — `EfficientIngestionEngine` (this plugin) selected
+  through the `factory_allowed_ingestions` factory. It runs the
+  `parsing_chunking -> embedding` phase machine through its own phase bodies
+  and emits the `ingestion_phase_*` hooks (`ingestion_phase_pending`,
+  `ingestion_phase_run`, `ingestion_phase_settings_marker`,
+  `ingestion_phase_specs`) plus `before_ingestion_status_completed`. It also
+  emits `before_rabbithole_stores_documents` **exactly once per source**, at
+  the end of the `parsing_chunking` phase (after chunking and before the first,
+  empty-vector store), and `after_rabbithole_stored_documents` once, after its
+  `embedding` phase replaces the points. The `embedding` phase does **not**
+  emit `before_rabbithole_stores_documents` again: it rebuilds the points from
+  the stored payload, so a document transformed or appended by the hook is
+  preserved.
+
+**`before_rabbithole_stores_documents` is now emitted by BOTH engines, EXACTLY
+ONCE per source** (only one engine ingests a given source). Use it for work
+that must happen once regardless of the engine — including transforming or
+appending documents, since the returned list is what gets stored. Use the
+`ingestion_phase_*` hooks only for work that is specific to the efficient phase
+machine.
+
+**`after_rabbithole_stored_documents` is flow-agnostic and fires EXACTLY ONCE
+per source.** Because only one engine ingests a source, the hook fires once
+whichever engine is active; it cannot tell you which flow ran. Use it for work
+that must happen once regardless of the engine. When the work must be
+engine-specific, use the `ingestion_phase_*` hooks (efficient only);
+`before_rabbithole_stores_documents` is shared by both engines.
+
+<h2>🔗 Host integration contract</h2>
+
+- **Built-in phase markers.** The `parsing_chunking` marker is a deterministic
+  JSON fingerprint (`sort_keys=True`) of the class/config name plus the
+  material fields of the **agent-scoped** `chunker` (`encoding_name`,
+  `chunk_size`, `chunk_overlap`); the `embedding` marker is the same fingerprint
+  of the **system-scoped** `embedder` (model/name and, when stored, the
+  embedding size). Credentials (fields matching `SUFFIX_TO_CRYPT`) are excluded:
+  they are re-encrypted with a random IV on every write, so including them
+  would make an unchanged configuration look changed.
+- **Completion veto.** `before_ingestion_status_completed` is the last gate
+  before a source becomes `completed`. A handler raises
+  `CustomHookVetoException` to force `error`; the host's hook dispatcher
+  **re-raises** that exception (it is not logged and swallowed like other hook
+  errors) and short-circuits the remaining hooks, so the veto reaches the
+  caller instead of being silently dropped.
+- **Persisted URL bytes.** On the first ingest of a URL the fetched bytes are
+  written to the agent's file storage under a deterministic, sanitized name
+  derived from the URL; a re-ingest reads that persisted copy instead of
+  re-downloading, so re-indexing the same URL is deterministic even if the
+  remote content changed. The copy is a fallback that keeps the previous
+  content when it is absent.
+- **Status-listing API.** The plugin enumerates an agent's ingestion rows
+  through `cat.db.cruds.settings.get_ingestion_status_keys(agent_id)`: an
+  agent-scoped, **read-only** helper that escapes the (untrusted) agent id and
+  lists `agents:<agent_id>:ingestion:*` without ever writing or deleting
+  anything.
 
 <h2>🧵 Ingestion executor lane</h2>
 
@@ -111,7 +220,7 @@ Chunking, embedding and storing are dispatched to a dedicated, low-concurrency `
 
 <h2>✂️ Token-budget split</h2>
 
-The plugin also owns the oversized-chunk split (`finalize_oversized_chunks` and `before_rabbithole_stores_documents` hooks): chunks longer than the active embedder's `max_input_tokens` are split into budget-compliant sub-chunks, measured with the embedder's own tokenizer when available, with the original metadata carried forward. With this plugin disabled the core returns to upstream parity (no split).
+The plugin also owns the oversized-chunk split (`finalize_oversized_chunks` and `before_rabbithole_stores_documents` hooks): chunks longer than the active embedder's `max_input_tokens` are split into budget-compliant sub-chunks, measured with the embedder's own tokenizer when available, with the original metadata carried forward. With this plugin disabled the core returns to upstream parity (no split). Points marked `is_catalogue_card_segment: True` (the catalogue card written by `cat_alog`) are EXEMPT from the re-embed re-split: their id derives from a stable `start_index`, so re-splitting them would mint a different segment count and lose it.
 
 <h2>⚙️ Plugin settings</h2>
 
@@ -123,14 +232,50 @@ Settings live in the global `system:agent` store, category `ingestion`:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CAT_INGESTION_WORKERS` | `2` | Size of the dedicated ingestion thread pool; `<= 0` disables the lane and falls back to the default executor |
+| `CAT_INGESTION_WORKERS` | `2` | Size of the dedicated ingestion thread pool. An explicit value `<= 0` (or an empty/invalid value) disables the lane and falls back to the default executor |
 | `CAT_INGESTION_NICENESS` | `5` | `nice` applied to the ingestion worker threads; `<= 0` disables the de-prioritization |
-| `CAT_INGESTION_HEARTBEAT_SECONDS` | `30` | Interval at which a `processing` row is refreshed while being handled |
+| `CAT_INGESTION_HEARTBEAT_SECONDS` | `30` | Interval at which an in-flight row (`uploaded` / `downloading` / `downloaded` / `processing`) is refreshed while a worker handles it |
+| `CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS` | `1800` | Upper bound on the download heartbeat's lifetime; when a download fails without firing `rabbithole_url_download_completed`, the row ages out (becomes resumable) after this bound |
 | `CAT_INGESTION_RESUME_ON_STARTUP` | `true` | Enable the resume part of the sweep |
 | `CAT_INGESTION_STATUS_GC_ON_STARTUP` | `true` | Enable the reconcile (GC) part of the sweep |
-| `CAT_INGESTION_RESUME_INTERVAL_SECONDS` | `60` | Period of the recurring sweep; `0` runs the pass only at bootstrap |
-| `CAT_INGESTION_RESUME_STALE_SECONDS` | `300` | How old an entry must be to be claimable by the sweep |
+| `CAT_INGESTION_RESUME_INTERVAL_SECONDS` | `60` | Period of the recurring sweep; `0` (or `<= 0`) runs the pass only at bootstrap |
+| `CAT_INGESTION_RESUME_STALE_SECONDS` | unset (claim gate disabled; sweep falls back to `300`) | Staleness gate for the per-source re-embed claim; unset or `<= 0` disables the claim gate. The resume sweep reads the same variable and falls back to `300` seconds when it is unset |
 | `CAT_INGESTION_RESUME_BOOT_STALE_SECONDS` | `2 x heartbeat` (min `30`) | Staleness used by the pass right after a restart, so rows left behind by a dead worker are recovered quickly |
+| `CAT_INGESTION_NOT_READY_MAX_SECONDS` | `3600` | Wall-clock budget a source may stay `not_ready` (external phase, or an embedding pass with no usable vector) before the row is marked `error`. The row stays `processing` and is retried meanwhile. `0` expires immediately. A phase may declare a tighter budget (see below), which is used instead |
+| `CAT_INGESTION_LLM_NOT_READY_MAX_SECONDS` | `300` | Budget for an LLM-backed phase that declares it (`GraphConceptPhase`); read only when the phase sets `not_ready_budget_env` to this name. An upstream model failure then fails the phase in minutes instead of holding the source for the generic hour |
+
+<h2>🧪 Tests</h2>
+
+The authoritative test suite for this plugin lives in the host repo at
+`grinning-cat-core/tests/effing/`, not here. The host imports **every** `.py`
+file inside a plugin folder recursively when it activates the plugin, so a
+`conftest.py` (or any module that mutates the environment / boots the app)
+placed under `tests/` would be imported by the running Cat and poison it. The
+host harness is the only place that may own the Redis isolation
+(`CAT_REDIS_DB=1`), the host fixtures (`lizard`, `secure_client`,
+`cheshire_cat`, …) and the Redis connection setup.
+
+Run it from the core checkout:
+
+```bash
+CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
+```
+
+The harness covers the registry/lifecycle, the phase diary, the factory and
+the endpoints, plus the RED-baseline tests for the known blockers.
+
+Do not add a plugin-local test suite here: a `conftest.py` under the plugin
+would be imported at activation. Add the test to
+`grinning-cat-core/tests/effing/` instead.
+
+The one exception is a fully import-safe standalone harness: its ENTIRE body
+(imports included) lives under `if __name__ == "__main__":`, so importing it
+at activation executes nothing. `test_ingestion_safety_fixes.py` is such a
+harness; run it as a plain script from the core checkout:
+
+```bash
+uv run python /path/to/plugins/cat-efficient-ingestion/test_ingestion_safety_fixes.py
+```
 
 <h2>🛠️ Installation:</h2>
 

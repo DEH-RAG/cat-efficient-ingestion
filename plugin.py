@@ -19,15 +19,24 @@ token-budget split).
 
 from typing import List
 import asyncio
+import time
 from langchain_core.documents import Document
 
 from cat import hook
 from cat.db import crud
 from cat.db.models import generate_timestamp
+from cat.env import get_env_int
+from cat.exceptions import CustomHookVetoException
 from cat.log import log
 
 from .configs import EfficientIngestionConfiguration
-from .phases import PHASES
+from .hooks import (
+    _caller,
+    execute_phase_accumulator,
+    execute_phase_hook_on_all,
+    resolve_chunker_name,
+)
+from .phases import PHASES, delete_source, has_live_running_phase
 from .registry import (
     PHASE_DOWNLOADING,
     PHASE_PARSING_CHUNKING,
@@ -36,6 +45,7 @@ from .registry import (
     clear_agent,
     delete_status,
     get_status,
+    has_delete_marker,
     ingestion_canceled,
     set_phase,
     set_status,
@@ -61,27 +71,69 @@ def _source_type(source: str, is_url: bool = False) -> str:
     return "file"
 
 
-def _chunker_name(cat) -> str | None:
-    """Best-effort name of the active chunker, read from the caller.
-
-    The chunker is resolved lazily by the core (``cat.chunker`` on
-    BotMixin); a failure here must never break a status write.
-    """
-    try:
-        chunker = getattr(cat, "chunker", None)
-        if chunker is None:
-            return None
-        name = getattr(chunker, "name", None)
-        return str(name) if name else None
-    except Exception:  # noqa: BLE001 - status writes must never fail
-        return None
-
-
 _heartbeat_tasks: dict = {}
+
+#: Statuses that represent work an active worker owns. The heartbeat refreshes
+#: ANY of them, not just ``PROCESSING``: a URL ingestion is ``DOWNLOADING``
+#: first (long HTTP fetch, no processing hooks yet) and can flip back to
+#: ``DOWNLOADING``/``DOWNLOADED`` while a phase machine re-downloads.
+_IN_FLIGHT_STATUSES: tuple[str, ...] = (
+    IngestionStatus.UPLOADED.value,
+    IngestionStatus.DOWNLOADING.value,
+    IngestionStatus.DOWNLOADED.value,
+    IngestionStatus.PROCESSING.value,
+)
+
+
+def _heartbeat_interval() -> float:
+    """Interval (seconds) at which an in-flight ingestion row is refreshed."""
+    value = get_env_int("CAT_INGESTION_HEARTBEAT_SECONDS")
+    return float(value) if value and value > 0 else 30.0
+
+
+def _download_heartbeat_max_seconds() -> float:
+    """Upper bound on the DOWNLOADING heartbeat's lifetime.
+
+    The writer refreshes the row while the HTTP fetch is in flight. A failed
+    download never fires ``rabbithole_url_download_completed``, so without a
+    bound the heartbeat would keep a dead download row fresh forever and the
+    resume sweep could never reclaim it. Once the bound elapses, the row ages
+    out and becomes resumable (a crash, not a permanent lease).
+    """
+    value = get_env_int("CAT_INGESTION_DOWNLOAD_HEARTBEAT_MAX_SECONDS")
+    return float(value) if value and value > 0 else 1800.0
 
 
 def _heartbeat_key(agent_id: str, scope: str, source: str) -> str:
     return f"{agent_id}:{scope}:{source}"
+
+
+async def _start_heartbeat(
+    agent_id: str,
+    scope: str,
+    source: str,
+    interval: float,
+    *,
+    max_seconds: float | None = None,
+) -> None:
+    """Spawn (or replace) the heartbeat task for one in-flight row.
+
+    Replacing a task AWAITS the cancelled one before installing the new task:
+    a bare ``cancel()`` leaves the old coroutine to unwind at an arbitrary
+    point (possibly on the next event-loop turn, after the new task already
+    wrote the row). Awaiting guarantees the old writer is fully stopped first.
+    """
+    key = _heartbeat_key(agent_id, scope, source)
+    existing = _heartbeat_tasks.pop(key, None)
+    if existing is not None:
+        existing.cancel()
+        try:
+            await existing
+        except asyncio.CancelledError:
+            pass
+    _heartbeat_tasks[key] = asyncio.ensure_future(
+        _heartbeat_status(agent_id, scope, source, interval, max_seconds=max_seconds)
+    )
 
 
 async def _cancel_heartbeat(agent_id: str, scope: str, source: str) -> None:
@@ -95,51 +147,74 @@ async def _cancel_heartbeat(agent_id: str, scope: str, source: str) -> None:
         pass
 
 
-async def _heartbeat_status(agent_id: str, scope: str, source: str, interval: float) -> None:
-    """Periodically bump ``updated_at`` of a PROCESSING row while it is being handled.
+async def _heartbeat_status(
+    agent_id: str,
+    scope: str,
+    source: str,
+    interval: float,
+    *,
+    max_seconds: float | None = None,
+) -> None:
+    """Periodically bump ``updated_at`` of an in-flight row while it is handled.
 
-    A long parse/embed can otherwise make the row look stale and get re-claimed
-    by another worker (see ``claim_source_for_resume``). Stops as soon as the
-    row leaves the PROCESSING state.
+    A long download/parse/embed can otherwise make the row look stale and get
+    re-claimed by another worker (see ``claim_source_for_resume``). Refreshes
+    any of :data:`_IN_FLIGHT_STATUSES`; stops as soon as the row becomes
+    terminal (or was removed), or after ``max_seconds`` (used to bound the
+    download heartbeat so a dead writer is still resumable).
 
     The deletion marker is checked on EVERY tick: this is the fast-abort path
     for long phases (embedding can take minutes), so a deleted agent's worker
     self-aborts within one interval instead of letting the delete's bounded
     quiesce-wait time out.
     """
+    started = time.monotonic()
     while True:
         await asyncio.sleep(interval)
-        if await ingestion_canceled(agent_id):
-            # Agent deleted mid-ingestion: mark the row ERROR and stop. The
-            # ERROR write goes through a DIRECT crud.store because set_status
-            # is itself guarded by ingestion_canceled (it returns {} without
-            # writing when canceled) — the direct store bypasses the guard so
-            # the row ends terminal instead of dangling as PROCESSING. Only
-            # overwrite a row still in PROCESSING (the loop's own invariant).
+        try:
+            if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                return
+            if await ingestion_canceled(agent_id):
+                # Agent deleted mid-ingestion: mark the row ERROR and stop. The
+                # ERROR write goes through a DIRECT crud.store because set_status
+                # is itself guarded by ingestion_canceled (it returns {} without
+                # writing when canceled) — the direct store bypasses the guard so
+                # the row ends terminal instead of dangling as in-flight. Only
+                # overwrite a row still in flight (the loop's own invariant).
+                current = await get_status(agent_id, scope, source)
+                if current and current.get("status") in _IN_FLIGHT_STATUSES:
+                    await crud.store(
+                        status_key(agent_id, scope, source),
+                        {
+                            **current,
+                            "status": IngestionStatus.ERROR.value,
+                            "error": "Agent deleted — ingestion aborted",
+                            "updated_at": generate_timestamp(),
+                        },
+                    )
+                return
             current = await get_status(agent_id, scope, source)
-            if current and current.get("status") == IngestionStatus.PROCESSING.value:
-                await crud.store(
-                    status_key(agent_id, scope, source),
-                    {
-                        **current,
-                        "status": IngestionStatus.ERROR.value,
-                        "error": "Agent deleted — ingestion aborted",
-                        "updated_at": generate_timestamp(),
-                    },
+            if current and current.get("status") in _IN_FLIGHT_STATUSES:
+                await set_status(
+                    agent_id,
+                    scope,
+                    source,
+                    type_=current.get("type", "file"),
+                    status=IngestionStatus(current.get("status")),
+                    chat_id=current.get("chat_id"),
                 )
-            return
-        current = await get_status(agent_id, scope, source)
-        if current and current.get("status") == IngestionStatus.PROCESSING.value:
-            await set_status(
-                agent_id,
-                scope,
-                source,
-                type_=current.get("type", "file"),
-                status=IngestionStatus.PROCESSING,
-                chat_id=current.get("chat_id"),
+            else:
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a heartbeat tick must never raise
+            # A transient store/transport error must not kill the heartbeat: a
+            # dead task would let the row age out and be re-claimed while the
+            # work is still running. Log and retry on the next tick.
+            log.warning(
+                f"Agent id: {agent_id}. Ingestion heartbeat tick failed for "
+                f"{source!r}: {e}"
             )
-        else:
-            return
 
 
 @hook(priority=0)
@@ -161,20 +236,26 @@ async def finalize_oversized_chunks(docs: List[Document], cat) -> List[Document]
 
 
 @hook(priority=100)
-async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
-    """Apply the token-budget split on the store path of the core engine.
+async def before_rabbithole_stores_documents(
+    docs: List[Document], cat=None, lizard=None
+) -> List[Document]:
+    """Apply the token-budget split on the document-store path.
 
     Fired by ``RabbitHole.store_documents`` before the embed/store loop (e.g.
-    also covering documents added by other post-chunking hooks): split oversized
-    chunks so the 1:1 embed/store pairing is never broken.
+    also covering documents added by other post-chunking hooks) and ONCE by the
+    efficient phase machine at the end of ``parsing_chunking``, before the first
+    empty-vector store. It is the single split path on the efficient engine, so
+    the chunking step does not run ``finalize_oversized_chunks`` on top of it.
     """
+    cat = _caller(cat, lizard)
     embedder = await cat.lizard.embedder()
     return split_oversized(docs, embedder)
 
 
 @hook(priority=0)
-async def rabbithole_ingestion_start(source, metadata, is_url, cat) -> None:
+async def rabbithole_ingestion_start(source, metadata, is_url, cat=None, lizard=None) -> None:
     """Record that an ingestion is about to begin (source known, nothing stored yet)."""
+    cat = _caller(cat, lizard)
     if await ingestion_canceled(cat.agent_key):
         # Agent deleted (or master key gone): never write an UPLOADED row for
         # a dead agent — the teardown wipes the namespace anyway.
@@ -209,11 +290,29 @@ async def rabbithole_url_downloading(url, filename, cat) -> None:
         chat_id=chat_id,
         phase=PHASE_DOWNLOADING,
     )
+    # The HTTP fetch happens AFTER this hook and before
+    # ``rabbithole_url_download_completed``; refresh the row while it runs so a
+    # download longer than the resume threshold is never reclaimed and
+    # re-downloaded concurrently by the periodic sweep. Bounded so a failed
+    # download (no ``completed`` hook) still ages out and becomes resumable.
+    await _start_heartbeat(
+        cat.agent_key,
+        scope,
+        url,
+        _heartbeat_interval(),
+        max_seconds=_download_heartbeat_max_seconds(),
+    )
 
 
 @hook(priority=0)
 async def rabbithole_url_download_completed(url, filename, cat) -> None:
-    """Record that a URL download completed successfully."""
+    """Record that a URL download completed successfully.
+
+    The download is over, so the bounded download heartbeat is replaced by an
+    unbounded one: a phase machine may keep working on the downloaded bytes for
+    a long time (and may flip the row back to ``downloading`` if it re-fetches
+    a URL mid-phase).
+    """
     scope, chat_id = _scope_and_chat(cat)
     await set_status(
         cat.agent_key,
@@ -224,11 +323,13 @@ async def rabbithole_url_download_completed(url, filename, cat) -> None:
         chat_id=chat_id,
         phase=PHASE_DOWNLOADING,
     )
+    await _start_heartbeat(cat.agent_key, scope, url, _heartbeat_interval())
 
 
 @hook(priority=0)
-async def rabbithole_ingestion_processing(source, cat) -> None:
+async def rabbithole_ingestion_processing(source, cat=None, lizard=None) -> None:
     """Record that the source is being parsed, chunked and embedded."""
+    cat = _caller(cat, lizard)
     if await ingestion_canceled(cat.agent_key):
         # Agent deleted mid-ingestion: skip the write entirely. Marking the
         # row ERROR via set_status would be a NO-OP here — set_status itself
@@ -244,12 +345,12 @@ async def rabbithole_ingestion_processing(source, cat) -> None:
         status=IngestionStatus.PROCESSING,
         chat_id=chat_id,
         phase=PHASE_PARSING_CHUNKING,
-        chunker_name=_chunker_name(cat),
+        chunker_name=await resolve_chunker_name(cat),
     )
 
 
 @hook(priority=0)
-async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
+async def after_rabbithole_stored_documents(source, stored_points, cat=None, lizard=None) -> None:
     """Record that the source was stored successfully (phase-probe gated).
 
     The hook fires in the ``finally`` block of ``ingest_file`` and mid-loop
@@ -269,6 +370,7 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
       unresolved empty source. A canceled agent (delete marker / missing
       master key) is skipped entirely: no phase advance, no COMPLETED.
     """
+    cat = _caller(cat, lizard)
     if not source:
         return
     if await ingestion_canceled(cat.agent_key):
@@ -286,8 +388,13 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
     # shape, thread it into the accumulator and keep only the stale phases.
     completed = await backfill_completed_phases(current or {}, list(PHASES.keys()))
     completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-    pending = await cat.plugin_manager.execute_hook(
-        "ingestion_phase_pending", [], source, completed_as_list, caller=cat
+    pending = await execute_phase_accumulator(
+        cat,
+        "ingestion_phase_pending",
+        [],
+        source,
+        completed_as_list,
+        default=list,
     )
     pending = [p for p in (pending or []) if p and p.get("phase")]
 
@@ -304,11 +411,32 @@ async def after_rabbithole_stored_documents(source, stored_points, cat) -> None:
         )
         return
 
-    # Nothing pending: final gate, then the terminal state.
+    # A live ``running`` lease means the phase body is still in flight: never
+    # terminalize the row mid-phase (the machine owns the terminal write).
+    if has_live_running_phase(completed):
+        return
+
+    # Nothing pending: final gate, then the terminal state. The gate runs on
+    # EVERY manager: EffING's built-in one is on the system manager and
+    # agent-level providers (MyGRAPH) register their own on the agent manager.
     try:
-        await cat.plugin_manager.execute_hook(
-            "before_ingestion_status_completed", source, caller=cat
+        await execute_phase_hook_on_all(
+            cat, "before_ingestion_status_completed", source
         )
+    except CustomHookVetoException as e:
+        # a hook refused the completion: honour it and record the reason
+        log.warning(f"Ingestion completion vetoed for {source}: {e}")
+        await set_status(
+            cat.agent_key,
+            scope,
+            source,
+            type_=_source_type(source),
+            status=IngestionStatus.ERROR,
+            chat_id=chat_id,
+            error=str(e),
+            clear_phase=True,
+        )
+        return
     except Exception as e:  # noqa: BLE001 - the gate decides the terminal state
         await set_status(
             cat.agent_key,
@@ -347,25 +475,21 @@ async def rabbithole_ingestion_error(source, error, cat) -> None:
     )
 
 @hook(priority=0)
-def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat) -> None:
-    """Spawn the heartbeat task that keeps the PROCESSING row fresh."""
+async def rabbithole_processing_heartbeat_start(source: str, scope: str, interval: float, cat=None, lizard=None) -> None:
+    """Spawn the heartbeat task that keeps an in-flight row fresh."""
+    cat = _caller(cat, lizard)
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)
     if not agent_id:
         return
-    key = _heartbeat_key(agent_id, scope, source)
-    # safety: stop any pre-existing heartbeat for the same row
-    if key in _heartbeat_tasks:
-        _heartbeat_tasks[key].cancel()
-    _heartbeat_tasks[key] = asyncio.ensure_future(
-        _heartbeat_status(agent_id, scope, source, interval)
-    )
+    await _start_heartbeat(agent_id, scope, source, interval)
 
 
 @hook(priority=0)
-async def rabbithole_processing_heartbeat_stop(source: str, scope: str, cat) -> None:
+async def rabbithole_processing_heartbeat_stop(source: str, scope: str, cat=None, lizard=None) -> None:
     """Cancel the heartbeat task spawned on processing start."""
+    cat = _caller(cat, lizard)
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)
@@ -375,8 +499,63 @@ async def rabbithole_processing_heartbeat_stop(source: str, scope: str, cat) -> 
 
 
 @hook(priority=0)
+async def before_file_manager_file_delete(filename: str, scope: str, cat) -> None:
+    """Delete the file's artifacts through EVERY registered phase, in reverse.
+
+    Fired by the core single-file DELETE route right after the file is removed
+    from storage and BEFORE its memory points are deleted, so each phase's
+    ``delete(source, cat)`` still sees the inputs it needs (e.g. the graph purge
+    resolves entities through the source's chunk documents). EffING's
+    :func:`delete_source` decides on its own whether the phase path applies
+    (``phase_delete_active`` + at least one plugin-registered phase + no
+    uninstalled diary phase); otherwise it is a no-op and the standard wipe
+    below proceeds unchanged.
+
+    During an AGENT teardown (the ``agents:{agent_id}:ingestion:delete``
+    marker is present) the per-source phase cascade is SKIPPED: the standard
+    teardown already wipes the vectors and the graph plugin wipes the whole
+    tenant, so re-running every phase delete only adds work and a failure
+    mode. The phase path is reserved for SINGLE-FILE deletion. A failure to
+    read the marker is fail-open: the phase delete proceeds so a genuine
+    single-file delete is never skipped on a read error.
+
+    A phase delete raising leaves the file-level ``deleting`` row in place and
+    propagates: the standard point wipe is skipped so the remaining upstream
+    inputs stay resolvable and the operation is resumed on the next pass.
+    """
+    if cat is None:
+        return
+
+    agent_id = getattr(cat, "agent_key", None)
+    marker_present = False
+    if agent_id:
+        try:
+            marker_present = await has_delete_marker(agent_id)
+        except Exception as exc:  # noqa: BLE001 - fail-open, never skip a delete
+            log.warning(
+                f"Agent id: {agent_id}. Could not read the ingestion teardown "
+                f"marker for {filename} ({exc}); proceeding with the phase delete."
+            )
+
+    if marker_present:
+        log.info(
+            f"Agent id: {agent_id}. Agent teardown in progress; leaving the "
+            f"deletion of {filename} to the standard teardown path."
+        )
+        return
+
+    await delete_source(filename, cat, scope=scope)
+
+
+@hook(priority=0)
 async def after_file_manager_file_deleted(filename: str, scope: str, cat) -> None:
-    """Drop the per-source status row when the file is deleted."""
+    """Drop the per-source status row when the file is deleted.
+
+    This is the STANDARD cleanup and the recovery path for a row left
+    ``deleting`` by a crash (or by a deactivated phase path): it removes the
+    record unconditionally, so a stale ``deleting`` row can never sit forever.
+    When the phase path already removed it, this is an idempotent no-op.
+    """
     if cat is None:
         return
     agent_id = getattr(cat, "agent_key", None)

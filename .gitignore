@@ -17,3 +17,7 @@ uv.lock
 .opencode/
 .omo/
 AGENTS.md
+
+# runtime artifacts written by the plugin loader
+.requirements_hash
+.install.lock

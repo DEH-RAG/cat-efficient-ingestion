@@ -1,22 +1,18 @@
-"""``/ingestion/status`` and ``/ingestion/settings`` endpoints.
+"""``/ingestion/status`` endpoints.
 
-Status: exposes the ingestion-status registry over HTTP. Before returning, the
+Exposes the ingestion-status registry over HTTP. Before returning, the
 registry is reconciled against the canonical source lists (files on disk via
 the file manager, URLs via the web points in the vector store) and entries
 whose source no longer exists are purged (lazy delete). Purge failures are
 logged and never fail the request.
 
-Settings: the engine configuration of the ``ingestion`` factory category,
-stored in the global ``system:agent`` settings list and served with the same
-shapes as the core ``/embedder/settings`` routes. SYSTEM READ/WRITE protected:
-plugin endpoints are public by default, so the permission dependency is
-mandatory.
+The engine configuration endpoints (``/ingestion/settings*``) are served by
+the CAT core route (``cat/routes/ingestion.py``, ``AuthResource.INGESTION``);
+this plugin must NOT register them again or the paths would conflict.
 """
-import os
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import Query
-from pydantic import ValidationError
 
 from cat import (
     AuthorizedInfo,
@@ -25,141 +21,41 @@ from cat import (
     check_permissions,
     endpoint,
 )
-from cat.db.cruds import conversations as crud_conversations
-from cat.exceptions import CustomNotFoundException, CustomValidationException
-from cat.log import log
-from cat.services.factory.ingestion import build_factory, resolved_config_name
-from cat.services.memory.models import VectorMemoryType
 
+from .phases import phase_catalog
+from .reconcile import reconcile_agent
 from .registry import (
     delete_status,
     get_status,
     list_statuses,
+    status_catalog,
+    status_label,
 )
 
 
-async def _canonical_files(ccat, path: str) -> set:
-    """Canonical file names for a scope path (agent or chat)."""
-    try:
-        return {f.name for f in ccat.file_manager.list_files(path)}
-    except Exception as e:
-        log.error(f"Ingestion status reconcile: failed to list files for {path}: {e}")
-        return set()
+def _decorate_entries(
+    entries: List[Dict],
+    phase_labels: Dict[str, str],
+    state_labels: Dict[str, str],
+) -> List[Dict]:
+    """Add the display-only ``phase_label`` / ``status_label`` to every entry.
 
-
-async def _canonical_urls(ccat, collection, chat_id: Optional[str]) -> set:
-    """Canonical URL sources for a scope, derived from the web points."""
-    try:
-        # the Qdrant gRPC client needs the collection name as a str, not the
-        # VectorMemoryType enum (mirror reconcile.py which does str(...))
-        memory_points, _ = await ccat.vector_memory_handler.get_all_tenant_points_from_web(str(collection))
-    except Exception as e:
-        log.error(f"Ingestion status reconcile: failed to list web points for {collection}: {e}")
-        return set()
-
-    result = set()
-    for memory_point in memory_points:
-        payload = memory_point.payload or {}
-        metadata = payload.get("metadata", {})
-        if chat_id is not None and metadata.get("chat_id") != chat_id:
-            continue
-        source = metadata.get("source")
-        if source and source.startswith("http"):
-            result.add(source)
-    return result
-
-
-async def _reconcile(ccat, agent_id: str, chat_id: Optional[str], statuses: List[Dict]) -> List[Dict]:
-    """Purge registry entries whose source is absent from the canonical lists.
-
-    Returns the reconciled (post-purge) list. Purge failures are logged and
-    never propagated to the caller.
-
-    Carve-outs — never purged by this canonical-source reconcile:
-    - in-flight entries (uploaded/downloading/downloaded/processing): they are
-      legitimately not yet in the file manager / web points, so purging them
-      on first read would hide the processing queue from the dashboard;
-    - error entries: a failed upload never lands in the canonical lists, so an
-      error would otherwise vanish immediately; the teacher dismisses it via
-      DELETE /ingestion/status or re-uploads.
-
-    Only terminal COMPLETED entries whose source has genuinely vanished (file
-    removed, URL with no web points, conversation gone) are purged here; they
-    are also removed explicitly when the file is deleted.
+    ``phase`` and ``status`` are kept untouched: they remain the machine
+    fields. ``phase_label`` is the current phase's label, or ``None`` when the
+    entry has no phase. A work phase that is not a registered ingestion phase
+    (``downloading`` for URLs) falls back to its lifecycle label.
     """
-    scope = chat_id or "agent"
-
-    if chat_id is None:
-        file_path = ccat.agent_key
-        collection = VectorMemoryType.DECLARATIVE
-    else:
-        file_path = os.path.join(ccat.agent_key, chat_id)
-        collection = VectorMemoryType.EPISODIC
-
-    canonical_files = await _canonical_files(ccat, file_path)
-    canonical_urls = await _canonical_urls(ccat, collection, chat_id)
-
-    # chat-scoped entries additionally require the conversation to still exist
-    chat_exists = True
-    if chat_id is not None:
-        chat_exists = (
-            await crud_conversations.get_user_id_from_conversation_keys(agent_id, chat_id)
-            is not None
-        )
-
-    # Never purge in-flight or failed entries: a source that is still being
-    # ingested (uploaded/downloading/downloaded/processing) is legitimately not
-    # (yet) in the canonical lists — the file manager / web points populate as
-    # the pipeline advances — so purging on first read would hide the queue
-    # from the dashboard across sessions. Errors must stay visible until the
-    # teacher dismisses them (DELETE /ingestion/status) or re-uploads.
-    # Only terminal COMPLETED entries whose source has genuinely vanished
-    # (file deleted / URL gone / conversation gone) are purged.
-    never_purge = {
-        "uploaded",
-        "downloading",
-        "downloaded",
-        "processing",
-        "error",
-    }
-
-    kept: List[Dict] = []
-    for doc in statuses:
-        source = doc.get("source")
-        if not source:
-            # cannot reconcile without a source: keep it
-            kept.append(doc)
-            continue
-
-        status = doc.get("status")
-
-        # in-flight / error carve-out: never purge via the canonical reconcile
-        if status in never_purge:
-            kept.append(doc)
-            continue
-
-        type_ = doc.get("type")
-
-        if type_ == "file":
-            exists = source in canonical_files
-        elif type_ == "url":
-            exists = source in canonical_urls
-        else:
-            exists = True  # unknown type: keep
-
-        if chat_id is not None and not chat_exists:
-            exists = False
-
-        if not exists:
-            try:
-                await delete_status(agent_id, scope, source)
-            except Exception as e:
-                log.error(f"Ingestion status reconcile: failed to purge {source}: {e}")
-            continue
-
-        kept.append(doc)
-
-    return kept
+    decorated: List[Dict] = []
+    for entry in entries:
+        row = dict(entry)
+        phase = row.get("phase")
+        phase_label_value = phase_labels.get(phase) if phase else None
+        if phase and phase_label_value is None:
+            phase_label_value = state_labels.get(phase)
+        row["phase_label"] = phase_label_value
+        row["status_label"] = status_label(row.get("status"))
+        decorated.append(row)
+    return decorated
 
 
 @endpoint.get("/status", prefix="/ingestion", tags=["Ingestion"])
@@ -180,12 +76,37 @@ async def get_ingestion_status(
     if agent_id is None:
         return []
 
-    statuses = await list_statuses(agent_id, chat_id)
+    catalog = await phase_catalog(info.cheshire_cat)
+    phase_labels = {row["id"]: row["label"] for row in catalog}
+    state_labels = {row["id"]: row["label"] for row in status_catalog()}
 
     if info.cheshire_cat is None:
-        return statuses
+        statuses = await list_statuses(agent_id, chat_id)
+        return _decorate_entries(statuses, phase_labels, state_labels)
 
-    return await _reconcile(info.cheshire_cat, agent_id, chat_id, statuses)
+    # One reconcile implementation for both the endpoint and the recovery
+    # sweep: purge the vanished sources, then return the post-purge list.
+    await reconcile_agent(agent_id, chat_id=chat_id, ccat=info.cheshire_cat)
+    statuses = await list_statuses(agent_id, chat_id)
+    return _decorate_entries(statuses, phase_labels, state_labels)
+
+
+@endpoint.get("/phases", prefix="/ingestion", tags=["Ingestion"])
+async def get_ingestion_phases(
+    info: AuthorizedInfo = check_permissions(AuthResource.MEMORY, AuthPermission.READ),
+) -> Dict:
+    """Return the phase catalog and the lifecycle-state catalog.
+
+    ``phases`` lists every registered phase in dependency order (every
+    dependency before its dependents), each row
+    ``{"id", "label", "order", "depends_on"}``. ``states`` lists the
+    lifecycle states as ``{"id", "label"}``. Labels are English display
+    defaults; clients localize by ``id`` and never use a label as a key.
+    """
+    return {
+        "phases": await phase_catalog(info.cheshire_cat),
+        "states": status_catalog(),
+    }
 
 
 @endpoint.delete("/status", prefix="/ingestion", tags=["Ingestion"])
@@ -225,74 +146,3 @@ async def delete_ingestion_status(
 
     await delete_status(agent_id, scope, source)
     return {"deleted": True}
-
-
-@endpoint.get("/settings", prefix="/ingestion", tags=["Ingestion"])
-async def get_ingestion_settings(
-    info: AuthorizedInfo = check_permissions(AuthResource.SYSTEM, AuthPermission.READ),
-) -> dict[str, Any]:
-    """List the available ingestion engines with schemes and the effective choice."""
-    sf = build_factory(info.lizard)
-    # built manually: get_factory_settings breaks when no engine was ever saved
-    schemas = await sf.get_schemas()
-    settings = [
-        {"name": name, "value": await _saved_value(sf, name), "scheme": scheme}
-        for name, scheme in schemas.items()
-    ]
-    selected = await resolved_config_name(info.lizard)
-    return {"settings": settings, "selected_configuration": selected}
-
-
-async def _saved_value(sf, name: str) -> dict:
-    """Saved config value (decrypted) or {} when the entry was never stored."""
-    from cat.db.cruds import settings as crud_settings
-    from cat.db.database import DEFAULT_SYSTEM_KEY
-
-    entry = await crud_settings.get_setting_by_name(DEFAULT_SYSTEM_KEY, name)
-    if entry is None:
-        return {}
-    try:
-        factory_class = await sf._get_factory_class(name)
-        return factory_class.parse_config(entry.get("value") or {})
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-@endpoint.get("/settings/{configuration_name}", prefix="/ingestion", tags=["Ingestion"])
-async def get_ingestion_setting(
-    configuration_name: str,
-    info: AuthorizedInfo = check_permissions(AuthResource.SYSTEM, AuthPermission.READ),
-) -> dict[str, Any]:
-    """Settings and scheme of one ingestion engine configuration."""
-    sf = build_factory(info.lizard)
-    setting = await sf.get_factory_setting(configuration_name)
-    return {"name": setting.name, "value": setting.value, "scheme": setting.scheme}
-
-
-@endpoint.put("/settings/{configuration_name}", prefix="/ingestion", tags=["Ingestion"])
-async def upsert_ingestion_setting(
-    configuration_name: str,
-    payload: dict[str, Any] = {},
-    info: AuthorizedInfo = check_permissions(AuthResource.SYSTEM, AuthPermission.WRITE),
-) -> dict[str, Any]:
-    """Update one engine configuration and select it as the engine to run."""
-    sf = build_factory(info.lizard)
-
-    schemas = await sf.get_schemas()
-    if configuration_name not in schemas:
-        raise CustomNotFoundException(
-            f"Configuration {configuration_name} not found. Must be one of {list(schemas.keys())}"
-        )
-
-    try:
-        config_class = await sf._get_factory_class(configuration_name)
-        if config_class is not None:
-            config_class.model_validate(payload)
-    except ValidationError as e:
-        raise CustomValidationException("\n".join(err["msg"] for err in e.errors())) from e
-
-    result = await sf.upsert_service(configuration_name, payload)
-    # selecting a configuration is automatic: the ingestion category holds a
-    # SINGLE setting (the active engine), exactly like the embedder category —
-    # upserting the config replaces it, no separate selection entry needed.
-    return {"name": configuration_name, "value": result.get("value", payload)}

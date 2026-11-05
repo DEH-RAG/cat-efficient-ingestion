@@ -5,46 +5,119 @@ and the accumulator registrant of ``ingestion_phase_pending`` that reports
 which of them are stale for a source, using ONLY content comparison — no
 timestamps are ever used for correctness.
 
-**Clock-free two-level staleness.** A phase's diary entry (see
-``registry.completed_phases``) records ``{"marker", "settings_version",
-"deps"}``. A phase is stale when:
+**Recursive dependency tags.** A phase's diary entry (see
+``registry.completed_phases``) records the explicit state plus a material
+``tag``. The tag is a SHA-256 of the phase's OWN material (its settings
+marker, or a declared ``id:category:deps`` fallback when no marker hook
+resolves) folded with the tags of every dependency in ``spec.depends_on``.
+Because dependencies are resolved first, a change deep in the chain changes
+the tag of every dependent, transitively. ``compute_tags`` performs this
+resolution in dependency order and raises on a cycle.
 
-- (a) **dependency**: any upstream in ``spec.depends_on`` is missing from the
-  diary, or the recorded ``deps[upstream]`` differs from the upstream's
-  current diary ``marker`` (upstream re-ran -> this phase must re-run too);
-- (b) **settings fast-path**: the settings entry for ``spec.settings_category``
-  was NOT rewritten since the phase ran (``settings_version`` equals the
-  current entry's ``updated_at``, used as an OPAQUE token) -> FRESH, no
-  marker comparison needed;
-- (c) **slow-path**: the plugin-defined marker from
-  ``ingestion_phase_settings_marker`` differs from the recorded ``marker``
-  (the settings entry WAS rewritten; the phase-owning plugin decides whether
-  the change is material).
+A phase is stale when:
 
-A missing settings entry means the fast-path cannot apply (no current
-version) and the phase falls to the slow-path with the marker the plugin
-returns — conservatively stale when the marker is unknown.
+- its own entry is absent (pending) or its ``processing`` lease expired;
+- any dependency is absent (pending), ``processing``, ``error`` or
+  ``skipped`` — there is no completed upstream work to consume;
+- the stored ``tag`` differs from the recursively computed current tag, or is
+  missing (legacy entry, stale exactly once until rewritten).
 
-**Phase registration.** External plugins declare their own phases through the
+The legacy flat ``settings_version`` field is no longer part of the decision:
+the tag already folds in every material input. The field stays readable on
+old entries only.
+
+**Phase registration.** Every phase is exposed as an
+:class:`IngestionPhase` instance through :func:`get_phases`: the built-ins (as
+classes), then the instances a plugin returns from the
+``ingestion_phase_objects`` getter hook, then the legacy ``ingestion_phase_specs``
+declarations wrapped in a :class:`HookPhase` adapter (so an unmigrated plugin
+keeps working). External plugins declare their own legacy phases through the
 ``ingestion_phase_specs`` accumulator hook (see ``hooks.py``);
 :func:`merged_phases` merges the returned ``PhaseSpec`` objects into the
 built-in ``PHASES`` at probe time — built-ins win on duplicate ids — and the
 ``ingestion_phase_pending`` registrant computes staleness for ALL merged
 phases, so a provider only declares a spec + a marker and never re-implements
-staleness.
+staleness. The class API is additive for now: the dispatch loop still runs the
+legacy flow.
+
+**Mandatory cleanup.** :meth:`IngestionPhase.delete` is abstract: a subclass
+without it cannot be instantiated. :class:`HookPhase.delete` calls the legacy
+purge hook and raises :class:`PhaseDeleteError` when the hook is absent (or its
+no-op returns ``None``) — a phase never silently skips cleanup.
+
+**Third-party extension contract.** A plugin exposing a phase must (1) declare
+a dependency on ``cat_efficient_ingestion`` — the FOLDER id with underscores,
+not the hyphenated repo name, because ``Plugin.missing_dependencies`` compares
+against plugin folder names — (2) import :class:`PhaseSpec` from the canonical
+path ``cat.core_plugins.cat_efficient_ingestion.phases`` inside a module-top
+``try/except ImportError``, (3) define its phase hooks (or no-op stand-ins)
+ONLY when that import succeeded, and (4) keep the classic CAT ingestion hooks
+so basic ingestion still works when EffING is absent. The canonical path is
+mandatory: the host loads ``cat/core_plugins/`` in preference to
+``cat/plugins/`` and derives the module name from the folder, so importing the
+same file through another path creates a SECOND module identity and
+:func:`merged_phases`' ``isinstance(spec, PhaseSpec)`` check would silently
+drop the spec.
 
 Import-safe: the only top-level statements are the dataclass, the ``PHASES``
 data structure and the ``@hook`` decorator — no Redis, no network, no
 filesystem access at import time.
 """
 
+import contextvars
+import inspect
+import math
+import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, Optional
 
 from cat import hook
-from cat.db.cruds import settings as crud_settings
+from cat.env import get_env_float
+from cat.log import log
 
-from .registry import get_completed_phases
+from .hooks import (
+    _accepts_caller,
+    execute_hook_compat,
+    phase_managers,
+    phase_settings_key,
+)
+from .phase_tag_resolver import (
+    PhaseTagError,
+    compose_tag,
+    own_tag,
+    relevant_settings,
+    resolve_tags,
+)
+from .registry import (
+    PHASE_STATE_COMPLETE,
+    PHASE_STATE_ERROR,
+    PHASE_STATE_PROCESSING,
+    PHASE_STATE_SKIPPED,
+    IngestionStatus,
+    _delete_status_doc,
+    clear_completed_phases,
+    get_completed_phases,
+    get_status,
+    normalize_warnings,
+    phase_state,
+    set_status,
+    should_abandon,
+    source_lock,
+)
+
+#: Scope (``"agent"`` or a chat id) of the file deletion currently running.
+#: ``delete(source, cat)`` has no scope argument, so the delete orchestrator
+#: publishes it for the built-in phases, which purge agent/chat-scoped vector
+#: collections. Task-local (never shared across workers) and reset in a
+#: ``finally`` block.
+_DELETE_SCOPE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "effing_delete_scope", default=None
+)
+
+#: Configuration class name of the efficient ingestion engine in the SYSTEM
+#: ``ingestion`` category. Mirrors the MyGRAPH ``_phase_path_active`` predicate.
+_EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
 
 
 @dataclass(frozen=True)
@@ -58,11 +131,181 @@ class PhaseSpec:
             for phases with no settings entry (marker-only invalidation).
         depends_on: Upstream phase ids whose recorded markers this phase
             consumed; a change in any upstream marker makes this phase stale.
+        settings_check: Optional narrowing of the settings that feed
+            :meth:`IngestionPhase.tag`: a key collection keeps only those
+            keys, a (possibly async) callable returns the value that
+            participates. ``None`` means the whole settings value.
     """
 
     id: str
     settings_category: str | None
     depends_on: tuple[str, ...]
+    settings_check: Any = None
+
+
+@dataclass(frozen=True)
+class PhaseResult:
+    """Outcome of running one phase.
+
+    ``processed`` / ``expected`` are TELEMETRY ONLY: they may be logged or
+    surfaced to an operator, but they are never a completion criterion. A
+    phase is complete because ``status == "done"``, not because a count
+    matches.
+
+    ``warnings`` is the OPTIONAL degradation channel for a phase that RAN
+    correctly but produced nothing VALID TO BE EMPTY (or less than it should).
+    Each warning is ``{"code": <str>, "message": <str>}``; the documented codes
+    are ``empty-extraction``, ``partial-extraction`` and ``degraded``. A
+    warning is NOT a state: it is attached to a ``done`` result, so the phase
+    stays complete, nothing retries and no dependent is blocked.
+
+    An empty product is not universally benign: the built-in
+    ``parsing_chunking`` (a non-empty source yielding no chunk) and
+    ``embedding`` (points to embed yielding no stored point) report ``error``
+    instead, because their product is the searchable content itself. The
+    catalog and graph phases keep the warning channel. "Could not run"
+    (timeout, transport error, LLM unavailable, no input) is still
+    ``not_ready`` then ``error``. The phase owns this distinction; the machine
+    applies no size threshold.
+    """
+
+    status: Literal["done", "not_ready", "error", "skipped"]
+    reason: str | None = None
+    processed: int | None = None
+    expected: int | None = None
+    warnings: list[dict] | None = None
+
+
+class IngestionPhase(ABC):
+    """One ingestion phase, owning its applicability, work and cleanup.
+
+    Every phase MUST implement all four operations. ``delete`` is deliberately
+    abstract: a phase that cannot clean up its own artifacts would make the
+    recovery path delete data blindly, so it cannot exist. There is no no-op
+    default anywhere — a subclass without ``delete`` raises ``TypeError`` at
+    instantiation time.
+    """
+
+    #: Stable phase id (the diary key, e.g. ``"embedding"``).
+    id: str = ""
+    #: Human-readable label for display only. Never a key: the machine
+    #: identity is always :attr:`id`. ``None`` falls back to :attr:`id`.
+    label: str | None = None
+    #: Upstream phase ids this phase consumes.
+    depends_on: tuple[str, ...] = ()
+    #: Settings category whose material configuration feeds :meth:`tag`.
+    settings_category: str | None = None
+    #: Optional narrowing of the settings that feed :meth:`tag` (see
+    #: :class:`PhaseSpec`). ``None`` uses the whole settings value.
+    settings_check: Any = None
+    #: Optional wall-clock budget (seconds) this phase may stay ``not_ready``
+    #: before the machine marks it ``error``. ``None`` uses the generic
+    #: ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` budget. An LLM-backed phase sets
+    #: this (and :attr:`not_ready_budget_env`) so an upstream model failure
+    #: does not hold the source for the generic hour.
+    not_ready_budget_seconds: float | None = None
+    #: Optional env var overriding :attr:`not_ready_budget_seconds` when set to
+    #: a non-negative number. Unset/invalid falls back to the declared value.
+    not_ready_budget_env: str | None = None
+
+    def not_ready_budget(self) -> float | None:
+        """Resolve this phase's own not-ready budget, or ``None``.
+
+        Resolution order for the PHASE's budget:
+
+        1. :attr:`not_ready_budget_env`, when declared and set to a
+           non-negative number;
+        2. :attr:`not_ready_budget_seconds`, when declared and coercible to
+           a non-negative finite number.
+
+        Returns ``None`` when the phase declares no budget, which makes the
+        caller fall back to the generic
+        ``CAT_INGESTION_NOT_READY_MAX_SECONDS``.
+        """
+        if self.not_ready_budget_env:
+            try:
+                value = get_env_float(self.not_ready_budget_env)
+            except (TypeError, ValueError):
+                value = None
+            # A non-finite value (``inf``/``nan``) would either never expire or
+            # break the comparison, and a negative budget is meaningless: both
+            # are rejected so resolution falls through to the next step.
+            if value is not None and math.isfinite(value) and value >= 0:
+                return float(value)
+        declared = self.not_ready_budget_seconds
+        if declared is None:
+            return None
+        try:
+            # The attribute is typed ``float | None``, but it is a class
+            # attribute a third-party phase may set to anything. A numeric
+            # string ("300") is coerced; a genuinely wrong type is rejected
+            # instead of raising out of the resolver.
+            if isinstance(declared, bool):
+                raise TypeError("a bool is not a numeric budget")
+            value = float(declared)
+        except (TypeError, ValueError):
+            log.warning(
+                f"Phase '{self.id}' declares an invalid "
+                f"not_ready_budget_seconds {declared!r}; ignoring it and "
+                "falling back to the generic budget."
+            )
+            return None
+        # The same rules as the env path: a non-finite value would never
+        # expire (or break the comparison) and a negative budget is
+        # meaningless, so warn about the bad declared value and fall through.
+        if not math.isfinite(value) or value < 0:
+            log.warning(
+                f"Phase '{self.id}' declares an invalid "
+                f"not_ready_budget_seconds {declared!r}; ignoring it and "
+                "falling back to the generic budget."
+            )
+            return None
+        return value
+
+    @property
+    def name(self) -> str:
+        """Stable phase name (alias of :attr:`id`)."""
+        return self.id
+
+    def display_label(self) -> str:
+        """Human-readable label for this phase.
+
+        Returns :attr:`label` when declared, else :attr:`id`. The label is
+        display-only: clients localize by ``id`` and the machine never uses
+        the label as a key.
+        """
+        return self.label or self.id
+
+    @abstractmethod
+    async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
+        """Whether this phase applies, with an optional human-readable reason."""
+
+    @abstractmethod
+    async def process(self, source: str, cat) -> PhaseResult:
+        """Run the phase body for ``source``."""
+
+    @abstractmethod
+    async def delete(self, source: str, cat) -> None:
+        """Delete ONLY the artifacts this phase produced for ``source``.
+
+        Must raise when the phase has no cleanup implementation: a silent
+        no-op would let recovery delete data blindly.
+        """
+
+    async def tag(self, settings: Any = None) -> str:
+        """Detached identity of this phase's OWN material configuration.
+
+        ``sha256(kind + ":" + canonical_json(relevant_settings))`` where
+        ``relevant_settings`` is ``settings_check``-narrowed when declared,
+        else the whole ``settings`` value. Async because a declared
+        ``settings_check`` may be a coroutine. Only configuration is read —
+        never an LLM call. Folding in dependency tags is
+        :func:`phase_tag_resolver.resolve_tags`' job.
+        """
+        relevant = await relevant_settings(
+            {} if settings is None else settings, self.settings_check
+        )
+        return own_tag(self.id, relevant)
 
 
 #: The built-in phase DAG. ``parsing_chunking`` depends only on the chunker
@@ -77,37 +320,1154 @@ PHASES = {
 }
 
 
+class _BuiltinPhase(IngestionPhase):
+    """Declarative built-in phase.
+
+    The built-in phase BODIES still live in the legacy ``reembed`` dispatcher:
+    :meth:`process` refuses to run here rather than duplicating the dispatcher,
+    while :meth:`delete` delegates to the same source-scoped legacy purge the
+    recovery path uses, so the reverse-order file deletion can call EVERY
+    phase's ``delete`` (built-ins included).
+    """
+
+    async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
+        return True, None
+
+    async def process(self, source: str, cat) -> PhaseResult:
+        raise NotImplementedError(
+            f"Built-in phase '{self.id}' is executed by the legacy reembed "
+            "dispatcher until the dispatch migration; use HookPhase for "
+            "hook-declared phases."
+        )
+
+    async def delete(self, source: str, cat) -> None:
+        """Delete this phase's source-scoped products through the legacy purge.
+
+        The phase body still lives in ``reembed`` (the dispatcher owns the
+        source-scoped product boundary), so :meth:`delete` delegates to the
+        SAME legacy purge instead of duplicating it. The delete orchestrator
+        publishes the scope in :data:`_DELETE_SCOPE`; without it a caller falls
+        back to the caller's own scope (a ``StrayCat.id`` is chat-scoped, a
+        ``CheshireCat`` is agent-scoped).
+
+        Raises:
+            PhaseDeleteError: when the legacy purge reports no implementation.
+        """
+        from cat.services.memory.models import VectorMemoryType
+
+        from . import reembed
+
+        scope = _DELETE_SCOPE.get()
+        if scope is None:
+            caller_id = getattr(cat, "id", None)
+            scope = str(caller_id) if caller_id else "agent"
+        chat_id = None if scope == "agent" else scope
+        collection_name = (
+            VectorMemoryType.EPISODIC if chat_id else VectorMemoryType.DECLARATIVE
+        )
+        ccat = cat
+        if not hasattr(ccat, "_id") and hasattr(ccat, "lizard"):
+            ccat = await ccat.lizard.get_cheshire_cat(ccat.agent_key)
+        deleted = await reembed._purge_phase(
+            ccat, cat, collection_name, scope, source, chat_id, self.id
+        )
+        if not deleted:
+            raise PhaseDeleteError(
+                f"Built-in phase '{self.id}' has no delete/purge "
+                f"implementation; refusing to delete its artifacts silently"
+            )
+
+class ParsingChunkingPhase(_BuiltinPhase):
+    id = "parsing_chunking"
+    label = "Parsing and chunking"
+    depends_on = ()
+    settings_category = "chunker"
+
+    @staticmethod
+    def empty_output_error(
+        source: str, content_bytes: int, processed: int | None
+    ) -> PhaseResult | None:
+        """INVARIANT: a non-empty source that yields zero chunks failed to parse.
+
+        ``parsing_chunking`` produces the text every later phase consumes, so
+        an empty result from a source that DID carry bytes is a parse failure,
+        not a document without content. It is an ``error`` (never a warning):
+        the product does not exist and a dependent would otherwise index
+        nothing while the source looks complete.
+
+        An empty source is "could not run" and keeps whichever path it had;
+        this helper returns ``None`` for it, as it does for a real product.
+        """
+        if content_bytes > 0 and processed == 0:
+            return PhaseResult(
+                status="error",
+                reason=(
+                    f"parsing produced no chunks from {content_bytes} bytes "
+                    f"of '{source}'"
+                ),
+            )
+        return None
+
+
+class EmbeddingPhase(_BuiltinPhase):
+    id = "embedding"
+    label = "Computing embeddings"
+    depends_on = ("parsing_chunking",)
+    settings_category = "embedder"
+
+    @staticmethod
+    def empty_output_error(
+        source: str, to_embed: int | None, stored: int | None
+    ) -> PhaseResult | None:
+        """INVARIANT: an embedding run that stores zero points is a failure.
+
+        When there WERE points to embed and the run persisted none, nothing
+        exists for the source: that is an ``error`` naming the count, never a
+        warning on a ``done`` phase. "Nothing to embed" (no points at all) is
+        a different, unchanged path and yields ``None`` here.
+        """
+        if to_embed and stored == 0:
+            return PhaseResult(
+                status="error",
+                reason=(
+                    f"embedding stored no points for {to_embed} point(s) "
+                    f"of '{source}'"
+                ),
+            )
+        return None
+
+
+#: Built-in phase classes in execution order. ``get_phases`` instantiates them
+#: fresh on every call so callers can never mutate a shared phase object.
+_BUILTIN_PHASE_CLASSES: tuple[type[IngestionPhase], ...] = (
+    ParsingChunkingPhase,
+    EmbeddingPhase,
+)
+
+
+async def _registered_specs(cat) -> list[tuple[PhaseSpec, object]]:
+    """Collect every registered ``PhaseSpec`` together with its OWNER manager.
+
+    Phase providers are agent-level plugins: MyGRAPH and CATALOG register their
+    specs on the caller's agent manager. EffING itself is system-only, so its
+    built-ins are not registered this way (they live in :data:`PHASES`). The
+    spec origin is what later tells the run/marker dispatch which manager owns
+    a phase, so it must not be flattened away.
+
+    Managers are visited system-first, then agent; a duplicate phase id is kept
+    from the FIRST manager that registered it (deterministic ownership).
+    Malformed hook output is skipped, never raised on.
+    """
+    seeded: set[str] = set()
+    collected: list[tuple[PhaseSpec, object]] = []
+    for manager in phase_managers(cat):
+        # No registrant on this manager is normal (EffING is system-only, the
+        # providers are agent-level): skip silently, never warn per phase.
+        ran, specs = await execute_hook_compat(
+            manager, "ingestion_phase_specs", [], caller=cat
+        )
+        if not ran or not isinstance(specs, list):
+            continue
+        for spec in specs:
+            if isinstance(spec, PhaseSpec) and spec.id not in seeded:
+                seeded.add(spec.id)
+                collected.append((spec, manager))
+    return collected
+
+
+#: Sentinel distinguishing "no marker hook resolvable" from a marker that is
+#: legitimately ``None`` ("unknown").
+_MISSING = object()
+
+
+def _declared_tag(phase_id: str, settings_category: str | None, depends_on) -> str:
+    """Fallback material for a phase with no resolvable settings marker."""
+    return f"{phase_id}:{settings_category or '-'}:{','.join(depends_on)}"
+
+
+async def _material_settings(cat, phase) -> Any:
+    """Resolve the settings value handed to ``phase.tag`` for this run.
+
+    A HookPhase with an in-instance ``settings_marker`` resolves its own marker
+    in :meth:`HookPhase.tag`; here it gets ``{}``. For every other phase the
+    material settings marker is the configuration fingerprint: the same
+    configuration-only value the marker hook produces (no LLM call). A missing
+    marker falls back to the declared tag, and an unknown marker to an explicit
+    ``<id>:unknown`` sentinel, so a phase never silently hashes nothing.
+    """
+    if getattr(phase, "_settings_marker", None) is not None:
+        return {}
+    if cat is None:
+        return _declared_tag(
+            phase.id, getattr(phase, "settings_category", None), phase.depends_on
+        )
+    marker = await execute_phase_on_owner(
+        cat,
+        "ingestion_phase_settings_marker",
+        phase.id,
+        default=_MISSING,
+        caller=cat,
+    )
+    if marker is _MISSING:
+        return _declared_tag(
+            phase.id, getattr(phase, "settings_category", None), phase.depends_on
+        )
+    if marker is None:
+        return f"{phase.id}:unknown"
+    return marker
+
+
+async def compute_tags(cat, phases) -> dict[str, str]:
+    """Resolve every phase's recursive tag in dependency order.
+
+    Reads each phase's material configuration ONCE (the marker hook, or the
+    declared fallback) and delegates the dependency fold to
+    :func:`phase_tag_resolver.resolve_tags`. A change deep in the chain changes
+    every dependent's tag.
+
+    Raises:
+        PhaseTagCycleError: when the dependency graph cycles, naming the cycle.
+        PhaseTagError: when a dependency is not declared.
+    """
+    phase_list = list(phases)
+    settings = {
+        phase.id: await _material_settings(cat, phase) for phase in phase_list
+    }
+    return await resolve_tags(settings, phase_list)
+
+
+def _fallback_current_tag(spec: PhaseSpec) -> str:
+    """Declared-input tag used when the live tag graph cannot be resolved."""
+    return compose_tag(
+        own_tag(
+            spec.id,
+            _declared_tag(spec.id, spec.settings_category, spec.depends_on),
+        ),
+        (),
+        {},
+    )
+
+
+async def current_phase_tag(cat, spec: PhaseSpec) -> str:
+    """The current recursive tag for ``spec`` (same fallback as the probe).
+
+    Used by the dispatch guard so it evaluates staleness with EXACTLY the tag
+    the probe used; a tag-resolution failure degrades to the declared tag
+    instead of raising (mirrors :func:`_probe_pending`).
+    """
+    try:
+        tags = await compute_tags(cat, await get_phases(cat))
+        tag = tags.get(spec.id)
+    except PhaseTagError as exc:
+        log.error(f"Cannot compute phase tags: {exc}")
+        tag = None
+    return tag if isinstance(tag, str) and tag else _fallback_current_tag(spec)
+
+
+async def current_legacy_inputs(cat, spec: PhaseSpec) -> tuple[object, object]:
+    """Current material inputs for comparing a v1 (tagless) diary entry.
+
+    Returns ``(marker, settings_version)`` resolved from the SAME sources the
+    completion writer used, or ``_MISSING`` when ``cat`` is unknown / the read
+    fails (the legacy comparison then stays conservatively stale).
+    """
+    if cat is None:
+        return _MISSING, _MISSING
+    marker = await execute_phase_on_owner(
+        cat,
+        "ingestion_phase_settings_marker",
+        spec.id,
+        default=None,
+        caller=cat,
+    )
+    if spec.settings_category is None:
+        return marker, _MISSING
+    try:
+        from cat.db.cruds import settings as crud_settings
+
+        settings_key = phase_settings_key(
+            spec.id, getattr(cat, "agent_key", None)
+        )
+        settings_doc = await crud_settings.get_settings_by_category(
+            settings_key, spec.settings_category
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown inputs stay conservative
+        log.debug(f"Could not read current settings for phase {spec.id}: {exc}")
+        return marker, _MISSING
+    if not isinstance(settings_doc, dict):
+        return marker, None
+    return marker, settings_doc.get("updated_at")
+
+
+def _as_count(value: Any) -> int | None:
+    """Return ``value`` only when it is a genuine integer count (not bool)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _coerce_phase_result(phase_id: str, result: Any) -> PhaseResult:
+    """Normalize a legacy ``ingestion_phase_run`` return into ``PhaseResult``.
+
+    Legacy registrants return a status dict (or the fail-hard ``None``). An
+    unknown/invalid return becomes an explicit ``error`` — never a silent
+    success, mirroring the dispatcher's hard-fail policy. The optional
+    ``warnings`` list is normalized (only well-formed ``{"code", "message"}``
+    rows survive) and carried on the result; it never changes the status.
+    """
+    if isinstance(result, PhaseResult):
+        return result
+    if isinstance(result, dict):
+        status = result.get("status")
+        if status not in ("done", "not_ready", "error", "skipped"):
+            return PhaseResult(
+                status="error",
+                reason=f"phase '{phase_id}' returned invalid status {status!r}",
+            )
+        warnings = normalize_warnings(result.get("warnings"))
+        return PhaseResult(
+            status=status,
+            reason=result.get("reason"),
+            processed=_as_count(result.get("processed")),
+            expected=_as_count(result.get("expected")),
+            warnings=warnings or None,
+        )
+    if result is None or result is _MISSING:
+        return PhaseResult(
+            status="error",
+            reason=f"phase '{phase_id}' has no run implementation",
+        )
+    return PhaseResult(
+        status="error",
+        reason=f"phase '{phase_id}' returned {result!r} (expected a status dict)",
+    )
+
+
+async def _call_legacy_hook_async(manager, hook_name: str, phase: str, cat):
+    """Call a legacy marker registrant, awaiting it when it is a coroutine.
+
+    The marker hook only reads configuration (it performs no LLM call), so
+    awaiting it is cheap and deterministic. A plain function is called
+    directly; the first compatible registrant wins. Returns ``_MISSING`` when
+    the manager has no compatible registrant.
+    """
+    hooks = getattr(manager, "hooks", None)
+    registered = hooks.get(hook_name) if isinstance(hooks, dict) else None
+    if not registered:
+        return _MISSING
+    keyword = getattr(manager, "context_execute_hook", "cat")
+    for registered_hook in registered:
+        function = getattr(registered_hook, "function", registered_hook)
+        if not _accepts_caller(function, keyword):
+            continue
+        try:
+            value = function(phase, **{keyword: cat})
+            if inspect.isawaitable(value):
+                value = await value
+            return value
+        except Exception as exc:  # noqa: BLE001 - a marker must never break tag()
+            log.warning(f"Legacy {hook_name} for phase '{phase}' failed: {exc}")
+    return _MISSING
+
+
+class PhaseDeleteError(RuntimeError):
+    """A phase has no delete/purge implementation: refuse to delete blindly."""
+
+
+class HookPhase(IngestionPhase):
+    """Adapter keeping one legacy hook-declared phase working.
+
+    Wraps a single :class:`PhaseSpec` plus the legacy hooks
+    (``ingestion_phase_run``, ``ingestion_phase_settings_marker``,
+    ``ingestion_phase_purge``). Legacy behaviour is preserved:
+
+    - :meth:`applies_to` is ``(True, None)`` (legacy phases were always
+      considered applicable);
+    - :meth:`process` maps the legacy status dict to :class:`PhaseResult`;
+    - :meth:`delete` calls the purge hook and RAISES when it is absent (or
+      when the legacy no-op returns ``None``) — never a silent no-op;
+    - :meth:`tag` reads the settings marker (awaiting it when the registrant
+      is a coroutine) and folds the dependency tags into a recursive hash; when
+      no marker hook resolves it falls back to the declared
+      ``id:category:deps`` material (documented, never silent).
+    """
+
+    def __init__(
+        self,
+        spec: PhaseSpec,
+        *,
+        cat=None,
+        manager=None,
+        run_hook=None,
+        purge_hook=None,
+        settings_marker=None,
+    ):
+        self.spec = spec
+        self.id = spec.id
+        self.label = getattr(spec, "label", None)
+        self.depends_on = tuple(spec.depends_on)
+        self.settings_category = spec.settings_category
+        self.settings_check = getattr(spec, "settings_check", None)
+        self._cat = cat
+        self._manager = manager
+        self._run_hook = run_hook
+        self._purge_hook = purge_hook
+        self._settings_marker = settings_marker
+
+    async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
+        return True, None
+
+    async def process(self, source: str, cat) -> PhaseResult:
+        used = cat if cat is not None else self._cat
+        if self._run_hook is not None:
+            result = self._run_hook(self.id, source, [], used)
+            if inspect.isawaitable(result):
+                result = await result
+        elif self._manager is not None:
+            ran, result = await execute_hook_compat(
+                self._manager,
+                "ingestion_phase_run",
+                self.id,
+                source,
+                [],
+                caller=used,
+            )
+            if not ran:
+                result = None
+        else:
+            result = await execute_phase_on_owner(
+                used,
+                "ingestion_phase_run",
+                self.id,
+                source,
+                [],
+                default=_MISSING,
+                caller=used,
+            )
+        return _coerce_phase_result(self.id, result)
+
+    async def delete(self, source: str, cat) -> None:
+        used = cat if cat is not None else self._cat
+        if self._purge_hook is not None:
+            result = self._purge_hook(self.id, source, used)
+            if inspect.isawaitable(result):
+                result = await result
+        elif self._manager is not None:
+            ran, result = await execute_hook_compat(
+                self._manager,
+                "ingestion_phase_purge",
+                self.id,
+                source,
+                caller=used,
+            )
+            if not ran:
+                result = None
+        else:
+            result = await execute_phase_on_owner(
+                used,
+                "ingestion_phase_purge",
+                self.id,
+                source,
+                default=_MISSING,
+                caller=used,
+            )
+        if result is None or result is _MISSING:
+            raise PhaseDeleteError(
+                f"Ingestion phase '{self.id}' has no delete/purge "
+                f"implementation; refusing to delete its artifacts silently"
+            )
+
+    async def tag(self, settings: Any = None) -> str:
+        if self._settings_marker is not None:
+            marker = await self._resolve_marker(self._cat)
+            if marker is _MISSING:
+                settings = _declared_tag(
+                    self.id, self.settings_category, self.depends_on
+                )
+            elif marker is None:
+                settings = f"{self.id}:unknown"
+            else:
+                settings = marker
+        return await super().tag(settings)
+
+    async def _resolve_marker(self, cat):
+        if self._settings_marker is not None:
+            try:
+                value = self._settings_marker(self.id)
+                if inspect.isawaitable(value):
+                    value = await value
+                return value
+            except Exception as exc:  # noqa: BLE001 - a marker must never break tag()
+                log.warning(f"Settings marker for phase '{self.id}' failed: {exc}")
+                return _MISSING
+        if self._manager is not None:
+            return await _call_legacy_hook_async(
+                self._manager, "ingestion_phase_settings_marker", self.id, cat
+            )
+        return _MISSING
+
+
+async def _plugin_phase_objects(cat) -> list[IngestionPhase]:
+    """Collect phase instances contributed through ``ingestion_phase_objects``.
+
+    The hook is a getter (``ingestion_phase_objects(cat) -> list``), not an
+    accumulator: every registrant on every manager is called and its returned
+    list is merged, so two plugins can both contribute without clobbering each
+    other. Non-list / non-``IngestionPhase`` output is skipped, never raised
+    on.
+    """
+    if cat is None:
+        return []
+    collected: list[IngestionPhase] = []
+    for manager in phase_managers(cat):
+        hooks = getattr(manager, "hooks", None)
+        registered = (
+            hooks.get("ingestion_phase_objects") if isinstance(hooks, dict) else None
+        )
+        if not registered:
+            continue
+        keyword = getattr(manager, "context_execute_hook", "cat")
+        for registered_hook in registered:
+            function = getattr(registered_hook, "function", registered_hook)
+            if not _accepts_caller(function, keyword):
+                continue
+            try:
+                value = function(**{keyword: cat})
+                if inspect.isawaitable(value):
+                    value = await value
+            except Exception as exc:  # noqa: BLE001 - one bad plugin must not break the registry
+                plugin_id = getattr(registered_hook, "plugin_id", None) or "?"
+                log.error(
+                    f"Error in plugin {plugin_id}::ingestion_phase_objects: {exc}"
+                )
+                continue
+            if isinstance(value, list):
+                collected.extend(
+                    phase for phase in value if isinstance(phase, IngestionPhase)
+                )
+    return collected
+
+
+async def phase_owner(cat, phase: str):
+    """Return the plugin manager that owns ``phase``.
+
+    Built-ins belong to the system manager (EffING's own hooks). A phase
+    declared through ``ingestion_phase_specs`` belongs to the manager its
+    provider registered on (agent-level for MyGRAPH/CATALOG). Unknown phases
+    fall back to the system manager, preserving the fail-hard default.
+    """
+    managers = phase_managers(cat)
+    if phase in PHASES:
+        return managers[0] if managers else None
+    for spec, manager in await _registered_specs(cat):
+        if spec.id == phase:
+            return manager
+    return managers[0] if managers else None
+
+
+async def execute_phase_on_owner(
+    cat, hook_name: str, phase: str, *args, default=None, caller=None
+):
+    """Execute ``hook_name`` on the manager that owns ``phase``.
+
+    Reaching the owning manager is what keeps a built-in phase (system) and an
+    external MyGRAPH/CATALOG phase (agent) both working: a single-manager
+    dispatch would silently run the wrong registrant and drop the other.
+    """
+    manager = await phase_owner(cat, phase)
+    if manager is not None:
+        ran, value = await execute_hook_compat(
+            manager, hook_name, phase, *args, caller=caller
+        )
+        if ran:
+            return value
+    # no manager to ask (unit test fake / bootstrap), or no compatible
+    # registrant: same conservative degradation as a missing hook, never an
+    # AttributeError.
+    from cat.log import log
+    log.warning(
+        f"Phase hook {hook_name} is not present in any active plugin: "
+        f"treating it as no external phases"
+    )
+    return default() if callable(default) else default
+
+
 async def merged_phases(ccat, cat) -> dict[str, PhaseSpec]:
     """Merge the registered phase specs into the built-in ``PHASES``.
 
     Starts from a copy of the built-in ``PHASES`` and appends every
     ``PhaseSpec`` returned by the ``ingestion_phase_specs`` accumulator hook
-    whose ``id`` is not already present — built-ins win, a registered spec
-    with a duplicate id is IGNORED. Malformed hook output (``None``,
+    from BOTH managers (system + agent) whose ``id`` is not already present —
+    built-ins win, a registered spec with a duplicate id is IGNORED. Collecting
+    from both is what keeps agent-level MyGRAPH/CATALOG phases alive while
+    EffING itself is system-only. Malformed hook output (``None``,
     non-``PhaseSpec`` entries) is skipped, never raised on.
 
     Args:
-        ccat: the cat whose ``plugin_manager`` executes the hook (may be
-            ``None`` in unit tests -> built-ins only).
-        cat: the caller threaded into ``execute_hook(..., caller=cat)``.
+        ccat: the cat that issued the pass (unused except as a fallback when
+            ``cat`` is missing; both resolve the same managers).
+        cat: the caller whose ``lizard`` (system manager) and
+            ``plugin_manager`` (agent manager) are queried.
 
     Returns:
         The merged ``dict[str, PhaseSpec]`` (a fresh dict; ``PHASES`` is
         never mutated).
     """
     merged = dict(PHASES)
-    plugin_manager = (
-        getattr(ccat, "plugin_manager", None) if ccat is not None else None
-    )
-    if plugin_manager is None:
+    resolver = cat if cat is not None else ccat
+    if resolver is None:
         return merged
-    specs = await plugin_manager.execute_hook("ingestion_phase_specs", [], caller=cat)
-    if not isinstance(specs, list):
-        return merged
-    for spec in specs:
-        if isinstance(spec, PhaseSpec) and spec.id not in merged:
+    for spec, _manager in await _registered_specs(resolver):
+        if spec.id not in merged:
             merged[spec.id] = spec
     return merged
+
+
+async def get_phases(cat) -> list[IngestionPhase]:
+    """Return every ingestion phase as an :class:`IngestionPhase` instance.
+
+    Order: the built-in phases (as classes, in execution order), then the
+    instances contributed by plugins through the ``ingestion_phase_objects``
+    hook, then the legacy ``ingestion_phase_specs`` declarations wrapped in a
+    :class:`HookPhase` adapter. Built-ins win on duplicate ids; a phase id is
+    returned exactly once.
+
+    ``cat`` may be ``None`` (unit tests / bootstrap): only the built-ins are
+    returned. This is purely additive — the dispatch loop still runs the
+    legacy flow; the registry is consumed only where a debug listing is safe.
+    """
+    phases: list[IngestionPhase] = [cls() for cls in _BUILTIN_PHASE_CLASSES]
+    seeded = {phase.id for phase in phases}
+
+    for phase in await _plugin_phase_objects(cat):
+        if phase.id in seeded:
+            continue
+        seeded.add(phase.id)
+        phases.append(phase)
+
+    for spec, manager in await _registered_specs(cat):
+        if spec.id in seeded:
+            continue
+        seeded.add(spec.id)
+        phases.append(HookPhase(spec, cat=cat, manager=manager))
+    return phases
+
+
+def _dependency_ordered(phases: list[IngestionPhase]) -> list[IngestionPhase]:
+    """Return ``phases`` with every dependency before its dependents.
+
+    The sort is stable: phases with no declared relationship keep their
+    registration order. A dependency cycle (impossible for the built-ins, but
+    a third-party plugin could declare one) is broken at the first repeated
+    visit instead of recursing forever or raising.
+    """
+    by_id = {phase.id: phase for phase in phases}
+    ordered: list[IngestionPhase] = []
+    visited: set[str] = set()
+    visiting: set[str] = set()
+
+    def visit(phase: IngestionPhase) -> None:
+        if phase.id in visited or phase.id in visiting:
+            return
+        visiting.add(phase.id)
+        for dep_id in phase.depends_on:
+            dep = by_id.get(dep_id)
+            if dep is not None:
+                visit(dep)
+        visiting.discard(phase.id)
+        visited.add(phase.id)
+        ordered.append(phase)
+
+    for phase in phases:
+        visit(phase)
+    return ordered
+
+
+async def phase_catalog(cat) -> list[dict]:
+    """Describe every registered phase in dependency order.
+
+    Built-ins and plugin phases come from :func:`get_phases`; the result is
+    sorted so a dependency is always listed before its dependents. Each row is
+    ``{"id", "label", "order", "depends_on"}`` where ``order`` is 1-based and
+    ``label`` is :meth:`IngestionPhase.display_label`. The ``id`` remains the
+    only machine identity; labels are display-only English defaults.
+    """
+    ordered = _dependency_ordered(await get_phases(cat))
+    return [
+        {
+            "id": phase.id,
+            "label": phase.display_label(),
+            "order": index,
+            "depends_on": list(phase.depends_on),
+        }
+        for index, phase in enumerate(ordered, start=1)
+    ]
+
+
+async def _resolved_system_ingestion_config_name(cat) -> Optional[str]:
+    """Effective SYSTEM-level ``ingestion`` engine name (EffING's own gate).
+
+    Mirrors MyGRAPH's ``_phase_path_active`` helper: prefer the host's
+    ``resolved_config_name(lizard)`` when it exists, otherwise read the single
+    system-level ``ingestion`` category entry directly. Both paths return the
+    same value. Any failure is ``None`` (the gate then stays inactive).
+    """
+    try:
+        from cat.services.factory.ingestion import resolved_config_name
+    except ImportError:
+        resolved_config_name = None
+
+    if resolved_config_name is not None:
+        try:
+            return await resolved_config_name(cat)
+        except Exception:  # noqa: BLE001 - fall back to the direct settings read
+            pass
+
+    try:
+        from cat.db.cruds import settings as crud_settings
+        from cat.db.database import DEFAULT_SYSTEM_KEY
+
+        saved = await crud_settings.get_settings_by_category(
+            DEFAULT_SYSTEM_KEY, "ingestion"
+        )
+    except Exception as exc:  # noqa: BLE001 - an unresolvable gate is inactive
+        log.warning(
+            f"Could not resolve the system ingestion engine ({exc!r}); "
+            f"using the standard file deletion."
+        )
+        return None
+    return (saved or {}).get("name")
+
+
+async def phase_delete_active(cat) -> bool:
+    """Whether EffING owns the reverse-order phase deletion for this caller.
+
+    Single source of truth for the two deletion modes (mirrors MyGRAPH's
+    ``_phase_path_active``):
+
+    ==========================  ======================  ==================
+    EffING installed/loadable   SYSTEM ``ingestion``    deletion mode
+    ==========================  ======================  ==================
+    no                          any                     standard
+    yes                         core engine             standard
+    yes                         efficient engine        phase reverse
+    ==========================  ======================  ==================
+
+    Gate FALSE means the STANDARD deletion applies: no ``deleting`` state is
+    written, nothing is raised, no residue is left behind.
+    """
+    try:
+        import cat.core_plugins.cat_efficient_ingestion  # noqa: F401
+    except Exception:  # noqa: BLE001 - EffING not importable
+        return False
+
+    try:
+        name = await _resolved_system_ingestion_config_name(cat)
+    except Exception as exc:  # noqa: BLE001 - an unresolvable gate is inactive
+        log.warning(
+            f"Could not resolve the system ingestion engine ({exc!r}); "
+            f"using the standard file deletion."
+        )
+        return False
+    return name == _EFFICIENT_INGESTION_CONFIG_NAME
+
+
+def _delete_scope(cat, scope: Optional[str]) -> str:
+    """Resolve the source scope (``"agent"`` or a chat id) for a deletion."""
+    if scope:
+        return str(scope)
+    caller_id = getattr(cat, "id", None)
+    return str(caller_id) if caller_id else "agent"
+
+
+def _delete_source_type(source: str) -> str:
+    return "url" if source.startswith("http") else "file"
+
+
+def phase_execution_order(phases) -> list:
+    """Return ``phases`` in dependency (execution) order, stable by input.
+
+    A phase's depth is ``0`` without dependencies, else ``1 + max(depth(dep))``;
+    sorting by ``(depth, input position)`` yields a deterministic topological
+    order. An unknown dependency or a cycle contributes no edge instead of
+    raising, so deletion always has an order to reverse.
+    """
+    phase_list = list(phases)
+    by_id: dict[str, Any] = {}
+    for phase in phase_list:
+        by_id.setdefault(phase.id, phase)
+
+    depth: dict[str, int] = {}
+
+    def _depth(phase_id: str, visiting: set[str]) -> int:
+        if phase_id in depth:
+            return depth[phase_id]
+        phase = by_id.get(phase_id)
+        if phase is None or phase_id in visiting:
+            return 0
+        visiting.add(phase_id)
+        deps = [
+            dep
+            for dep in (getattr(phase, "depends_on", ()) or ())
+            if dep in by_id
+        ]
+        value = 0 if not deps else 1 + max(_depth(dep, visiting) for dep in deps)
+        visiting.discard(phase_id)
+        depth[phase_id] = value
+        return value
+
+    indexed = list(enumerate(phase_list))
+    indexed.sort(key=lambda item: (_depth(item[1].id, set()), item[0]))
+    return [phase for _index, phase in indexed]
+
+
+def _scope_storage_path(cat, scope: str) -> str:
+    """Relative file-storage path of a source scope (agent or conversation)."""
+    root = getattr(cat, "agent_key", None) or ""
+    if scope and scope != "agent":
+        root = os.path.join(root, str(scope))
+    return root
+
+
+async def _delete_derived_images(source: str, cat, scope: str) -> None:
+    """Remove the saved ``*_img_*`` files through the multimodal plugin.
+
+    Derived images are owned by ``cat_multimodal_ingestion``, not EffING. Its
+    documented stable helper ``delete_source_image_files`` enumerates the
+    source's image points (which carry ``metadata.image_file``), removes the
+    files from agent storage and is designed to run BEFORE the points are
+    wiped. We call that helper instead of reimplementing it. The helper only
+    removes files, so the subsequent phase deletes still remove the points.
+
+    Best effort: a missing plugin/helper, or a file already gone, never breaks
+    the artifact deletion (it is idempotent by contract).
+    """
+    try:
+        from cat.core_plugins.cat_multimodal_ingestion.ingestion import (
+            delete_source_image_files,
+        )
+    except Exception as exc:  # noqa: BLE001 - plugin not installed: nothing to own
+        log.debug(
+            f"Agent id: {getattr(cat, 'agent_key', None)}. Multimodal plugin "
+            f"unavailable, skipping its derived-image cleanup for {source}: {exc}"
+        )
+        return
+
+    from cat.services.memory.models import VectorMemoryType
+
+    chat_id = None if scope == "agent" else scope
+    collection = (
+        VectorMemoryType.DECLARATIVE if chat_id is None else VectorMemoryType.EPISODIC
+    )
+    path = _scope_storage_path(cat, scope)
+    try:
+        await delete_source_image_files(cat, str(collection), path, source)
+    except Exception as exc:  # noqa: BLE001 - already gone / best effort
+        log.warning(
+            f"Agent id: {getattr(cat, 'agent_key', None)}. Derived-image "
+            f"cleanup for {source} failed ({exc}); continuing"
+        )
+
+
+async def _delete_artifacts_locked(
+    source: str,
+    cat,
+    agent_id: str,
+    scope: str,
+    *,
+    progress_status: Optional[IngestionStatus] = None,
+    already: Optional[set[str]] = None,
+) -> None:
+    """Shared reverse-order artifact wipe; the caller HOLDS the source lock.
+
+    Removes every artifact of ``source`` (derived images first, then every
+    registered phase's products in REVERSE execution order) but NEVER the
+    source file, the file record or the status row. ``progress_status`` is the
+    lifecycle row to keep while deleting (``deleting`` for a real delete,
+    ``reindexing`` for a re-ingest); ``None`` leaves the row untouched.
+
+    No lock is taken here on purpose: both callers (:func:`delete_file` and
+    :func:`delete_artifacts`) own the ONE per-operation source-lock
+    acquisition, so an internal acquisition would deadlock/nest.
+    """
+    try:
+        phases = await get_phases(cat)
+    except Exception as exc:  # noqa: BLE001 - a broken registry is an error
+        log.error(
+            f"Agent id: {agent_id}. Could not resolve the ingestion phases "
+            f"for {source}: {exc}"
+        )
+        raise PhaseDeleteError(
+            f"Could not resolve the ingestion phases for {source}: {exc}"
+        ) from exc
+
+    already = set(already or ())
+
+    # Derived image files BEFORE any phase delete: their names live in the
+    # image-point metadata, so they must be resolved while the points exist.
+    await _delete_derived_images(source, cat, scope)
+
+    token = _DELETE_SCOPE.set(scope)
+    try:
+        for phase in reversed(phase_execution_order(phases)):
+            if phase.id in already:
+                continue
+
+            delete = getattr(phase, "delete", None)
+            if not callable(delete):
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete implementation; refusing to delete {source} silently"
+                )
+                raise PhaseDeleteError(
+                    f"Ingestion phase '{phase.id}' has no delete implementation"
+                )
+
+            try:
+                await delete(source, cat)
+            except PhaseDeleteError as exc:
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete/purge implementation for {source}: {exc}"
+                )
+                raise
+            except NotImplementedError as exc:
+                log.error(
+                    f"Agent id: {agent_id}. Ingestion phase '{phase.id}' has no "
+                    f"delete implementation for {source}: {exc}"
+                )
+                raise PhaseDeleteError(
+                    f"Ingestion phase '{phase.id}' has no delete implementation"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - surface, never skip
+                log.error(
+                    f"Agent id: {agent_id}. delete() for phase '{phase.id}' of "
+                    f"{source} raised ({exc}); leaving the row for the next pass"
+                )
+                raise PhaseDeleteError(
+                    f"delete() for phase '{phase.id}' of {source} failed: {exc}"
+                ) from exc
+
+            already.add(phase.id)
+            if progress_status is not None:
+                await set_status(
+                    agent_id,
+                    scope,
+                    source,
+                    type_=_delete_source_type(source),
+                    status=progress_status,
+                    chat_id=None if scope == "agent" else scope,
+                    clear_phase=True,
+                    extra={"deleted_phases": sorted(already)},
+                )
+    finally:
+        _DELETE_SCOPE.reset(token)
+
+
+async def _remove_source_file(source: str, cat, scope: str) -> None:
+    """Remove the source file itself (idempotent: absent -> False)."""
+    file_manager = getattr(cat, "file_manager", None)
+    if file_manager is None:
+        return
+    path = _scope_storage_path(cat, scope)
+    try:
+        file_manager.remove_file(os.path.join(path, source))
+    except Exception as exc:  # noqa: BLE001 - already gone / best effort
+        log.warning(
+            f"Agent id: {getattr(cat, 'agent_key', None)}. Could not remove "
+            f"source file {source}: {exc}"
+        )
+
+
+async def delete_artifacts(source: str, cat, scope: Optional[str] = None) -> bool:
+    """Remove EVERY artifact of ``source``; shared by deleting and reindexing.
+
+    Acquires the per-source lock internally (the one and only acquisition of
+    the operation) and calls the locked body. Does NOT touch the source file,
+    the file record or the status row: the row stays whatever it was
+    (``deleting`` / ``reindexing`` / ...), so a re-ingest never loses it.
+
+    Idempotent: every phase delete tolerates "already gone", so this can be
+    re-run after a crash.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return False
+    scope = _delete_scope(cat, scope)
+    async with source_lock(agent_id, source):
+        await _delete_artifacts_locked(source, cat, agent_id, scope)
+    return True
+
+
+async def _delete_file_locked(
+    source: str, cat, agent_id: str, scope: str
+) -> None:
+    """The locked ``deleting`` body: artifacts -> file -> status row LAST."""
+    doc = await get_status(agent_id, scope, source)
+    already: set[str] = set()
+    stored_deleted = (doc or {}).get("deleted_phases")
+    if isinstance(stored_deleted, (list, tuple, set)):
+        already = {str(phase_id) for phase_id in stored_deleted}
+
+    await set_status(
+        agent_id,
+        scope,
+        source,
+        type_=_delete_source_type(source),
+        status=IngestionStatus.DELETING,
+        chat_id=None if scope == "agent" else scope,
+        clear_phase=True,
+        extra={"deleted_phases": sorted(already)},
+    )
+
+    await _delete_artifacts_locked(
+        source,
+        cat,
+        agent_id,
+        scope,
+        progress_status=IngestionStatus.DELETING,
+        already=already,
+    )
+    await _remove_source_file(source, cat, scope)
+    # STATE LAST: the row is removed only after every artifact and the file.
+    await _delete_status_doc(agent_id, scope, source)
+
+
+async def delete_file(source: str, cat, scope: Optional[str] = None) -> bool:
+    """Delete ONE source for the ``deleting`` path: artifacts + file + row.
+
+    Used ONLY by :func:`delete_source` (the gated file-deletion path). The
+    status row is removed LAST and the shared artifact wipe runs first.
+    Acquires the per-source lock internally exactly once.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return False
+    scope = _delete_scope(cat, scope)
+    async with source_lock(agent_id, source):
+        await _delete_file_locked(source, cat, agent_id, scope)
+    return True
+
+
+async def recover_reindexing_source(
+    source: str, cat, scope: Optional[str] = None
+) -> Optional[bool]:
+    """Re-run an abandoned ``reindexing`` reset (crash recovery).
+
+    Returns ``None`` when the row is not ``reindexing``, ``False`` when a LIVE
+    owner still holds it (never touched), ``True`` after the reset completed:
+    :func:`delete_artifacts` again (idempotent) -> clear the diary -> write
+    ``processing``. Ownership reuses :func:`should_abandon` on the row's
+    ``reindex`` marker, so the CURRENT boot, a live same-pod pid or a foreign
+    pod with an unexpired lease is never touched.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return None
+    scope = _delete_scope(cat, scope)
+    async with source_lock(agent_id, source):
+        doc = await get_status(agent_id, scope, source)
+        if not doc or doc.get("status") != IngestionStatus.REINDEXING.value:
+            return None
+        if not should_abandon(doc.get("reindex")):
+            return False
+
+        await _delete_artifacts_locked(
+            source,
+            cat,
+            agent_id,
+            scope,
+            progress_status=IngestionStatus.REINDEXING,
+        )
+        await clear_completed_phases(agent_id, scope, source)
+        await set_status(
+            agent_id,
+            scope,
+            source,
+            type_=_delete_source_type(source),
+            status=IngestionStatus.PROCESSING,
+            chat_id=None if scope == "agent" else scope,
+            clear_phase=True,
+            extra={"reindex": None, "deleted_phases": []},
+        )
+        return True
+
+
+async def delete_source(source: str, cat, scope: Optional[str] = None) -> bool:
+    """Delete ONE source through EVERY registered phase in REVERSE order.
+
+    This is EffING's file-deletion path: it applies its own gate and falls
+    back to the STANDARD deletion when the phase path does not apply. When the
+    phase path applies it delegates to :func:`delete_file`, whose contract is:
+    the ``deleting`` state is written BEFORE any phase delete, every phase
+    ``delete(source, cat)`` runs in REVERSE execution order (recording each
+    completed phase so a re-run resumes with the rest), then the source file
+    record is removed, and the status record is removed LAST.
+
+    The gate requires :func:`phase_delete_active`, at least one
+    plugin-registered phase and no UNINSTALLED diary phase; otherwise ``False``
+    is returned and the STANDARD deletion applies unchanged.
+
+    Returns:
+        ``True`` when the phase path ran and the record was removed, ``False``
+        when the standard deletion applies instead.
+    """
+    agent_id = getattr(cat, "agent_key", None)
+    if not agent_id:
+        return False
+
+    scope = _delete_scope(cat, scope)
+
+    # ORDERING RULE: the delete path takes ONLY the per-source lock (never a
+    # phase lock) and holds it for the WHOLE operation — the ``deleting``
+    # write, every phase ``delete()``, the file removal and the final row
+    # removal. A concurrent re-embed pass holds the same lock for its whole
+    # per-source sequence, so it cannot write artifacts that this purge has
+    # just removed (and cannot re-create them after the row is gone).
+    async with source_lock(agent_id, source):
+        return await _delete_source_locked(source, cat, agent_id, scope)
+
+
+async def _delete_source_locked(
+    source: str, cat, agent_id: str, scope: str
+) -> bool:
+    """The phase-path body of :func:`delete_source`, run under the source lock."""
+    if not await phase_delete_active(cat):
+        # Gate FALSE: STANDARD deletion. No ``deleting`` row, no error, and
+        # the record (including a stale ``deleting`` one) is removed.
+        await _delete_status_doc(agent_id, scope, source)
+        return False
+
+    try:
+        phases = await get_phases(cat)
+    except Exception as exc:  # noqa: BLE001 - a broken registry is an error
+        log.error(
+            f"Agent id: {agent_id}. Could not resolve the ingestion phases "
+            f"for {source}: {exc}"
+        )
+        raise PhaseDeleteError(
+            f"Could not resolve the ingestion phases for {source}: {exc}"
+        ) from exc
+
+    plugin_phases = [phase for phase in phases if phase.id not in PHASES]
+    if not plugin_phases:
+        # Only the always-present built-ins: the standard wipe owns them.
+        await _delete_status_doc(agent_id, scope, source)
+        return False
+
+    doc = await get_status(agent_id, scope, source)
+    diary = (doc or {}).get("completed_phases")
+    diary_ids = set(diary) if isinstance(diary, dict) else set()
+    registered_ids = {phase.id for phase in phases}
+    uninstalled = sorted(diary_ids - registered_ids)
+    if uninstalled:
+        log.warning(
+            f"Agent id: {agent_id}. Source {source} has diary phases that are "
+            f"no longer installed ({uninstalled}); using the standard deletion."
+        )
+        await _delete_status_doc(agent_id, scope, source)
+        return False
+
+    await _delete_file_locked(source, cat, agent_id, scope)
+    return True
 
 
 def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:
@@ -139,37 +1499,105 @@ def _diary_from_completed_phases(completed_phases: Any) -> dict[str, Any]:
     return {}
 
 
+def downstream_phase_ids(phases, phase_id: str) -> list[str]:
+    """Ids that TRANSITIVELY depend on ``phase_id`` (excluding it).
+
+    ``phases`` is the merged ``{id: spec}`` map. Order follows the mapping's
+    insertion order, so the result is deterministic. Used by the deletion
+    paths: when a phase's products are wiped, every phase that consumed them
+    (directly or through another dependency) has had its data invalidated and
+    must stop being recorded as ``complete``.
+
+    A malformed entry (no ``depends_on``) simply contributes no edges; the
+    function never raises.
+    """
+    deps_by_id = {
+        pid: tuple(getattr(spec, "depends_on", ()) or ())
+        for pid, spec in phases.items()
+    }
+    downstream = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, deps in deps_by_id.items():
+            if pid == phase_id or pid in downstream:
+                continue
+            if phase_id in deps or any(dep in downstream for dep in deps):
+                downstream.add(pid)
+                changed = True
+    return [pid for pid in phases if pid in downstream]
+
+
+def dependency_outcome(phase, diary) -> Optional[tuple[str, str]]:
+    """Propagate a dependency's terminal outcome onto a dependent phase.
+
+    Pure, clock-free decision (no I/O). Iterates ``phase.depends_on`` in its
+    DECLARED order and returns the FIRST offending dependency:
+
+    - ``("error", "dependency <dep> is error")`` when that dependency's diary
+      entry is ``error``;
+    - ``("skipped", "dependency <dep> is skipped")`` when it is ``skipped``;
+    - ``None`` when no dependency is terminal-failed.
+
+    A dependent of a failed phase can never run its body or become
+    ``complete``; the dispatcher records the returned state instead.
+    """
+    diary = diary if isinstance(diary, dict) else {}
+    for dep in getattr(phase, "depends_on", ()) or ():
+        state = phase_state(diary.get(dep))
+        if state == PHASE_STATE_ERROR:
+            return PHASE_STATE_ERROR, f"dependency {dep} is error"
+        if state == PHASE_STATE_SKIPPED:
+            return PHASE_STATE_SKIPPED, f"dependency {dep} is skipped"
+    return None
+
+
 def is_phase_stale(
     spec: PhaseSpec,
     completed_phases: dict[str, Any],
-    current_settings_updated_at: object,
-    current_marker: object,
+    current_tag: object,
+    *,
+    current_marker: object = _MISSING,
+    current_settings_version: object = _MISSING,
 ) -> bool:
     """Decide whether one phase is stale, purely (no I/O).
 
-    Clock-free two-level check over the diary entry of ``spec.id``:
+    Clock-free decision over the diary entry of ``spec.id``:
 
-    - (a) dependency: for each upstream in ``spec.depends_on``, stale when the
-      upstream entry is missing, when ``deps[upstream]`` is missing, or when
-      it differs from the upstream's current diary ``marker``;
-    - (b) settings fast-path: when ``spec.settings_category`` is set AND a
-      current settings version is available, equal ``settings_version`` ->
-      FRESH (the settings entry was not rewritten since the phase ran);
-    - (c) slow-path: the plugin marker — equal to the recorded ``marker`` ->
-      fresh, different -> stale.
+    - the entry's OWN state machine is honoured first: a ``processing`` entry
+      is stale only when its lease expired (a live run is left alone), while
+      ``error`` / ``skipped`` are terminal-non-complete and not stale by
+      themselves;
+    - a dependency that is absent (pending), ``processing``, ``error`` or
+      ``skipped`` makes this phase stale — it cannot have consumed completed
+      upstream work;
+    - a v2 entry stores a ``tag`` (a recursive hash of this phase's own
+      material plus every dependency's tag); it is stale when that tag differs
+      from ``current_tag``;
+    - a LEGACY (v1) entry has no ``tag`` but carries ``marker`` /
+      ``settings_version`` / ``deps``. It is compared against the CURRENT
+      values exactly like the pre-tag machine did: the recorded upstream
+      markers in ``deps`` must equal the current upstream diary markers, and
+      the recorded ``marker`` (or, as a fast path, ``settings_version``) must
+      equal the current ones. A legacy entry whose configuration is unchanged
+      is therefore NOT stale (no re-parse), while a changed one IS stale (the
+      guard then lets its body re-run and write the v2 ``tag``). When the
+      current values are unknown (``_MISSING``, e.g. no ``cat`` in a unit
+      test), a legacy entry stays conservatively stale.
 
-    A missing diary entry (phase never completed) is always stale. A missing
-    current settings version (no settings entry) skips the fast-path and
-    falls to the slow-path — conservative.
+    ``settings_version`` is only a FRESH fast path for legacy entries: the
+    recursive tag already folds in every material input, so it never drives
+    the v2 decision.
 
     Args:
         spec: The phase declaration to evaluate.
         completed_phases: The diary dict keyed by phase id.
-        current_settings_updated_at: The current settings entry's
-            ``updated_at`` (opaque token, only ever compared for equality),
-            or None when the settings entry is missing.
-        current_marker: The plugin-defined marker from
-            ``ingestion_phase_settings_marker`` (None = unknown).
+        current_tag: The recursively computed tag for ``spec.id`` now.
+        current_marker: The current material marker for ``spec.id`` (v1
+            comparison). ``_MISSING`` = unknown.
+        current_settings_version: The current settings entry ``updated_at``
+            for ``spec.settings_category`` (v1 fast path). ``_MISSING`` /
+            ``None`` = unknown.
 
     Returns:
         True when the phase must be re-run, False when it is fresh.
@@ -178,28 +1606,78 @@ def is_phase_stale(
     if not isinstance(entry, dict):
         return True
 
-    # (a) dependency: upstream marker identity, never timestamps
+    state = phase_state(entry)
+    if state == PHASE_STATE_PROCESSING:
+        return should_abandon(entry)
+    if state in (PHASE_STATE_ERROR, PHASE_STATE_SKIPPED):
+        return False
+
+    # Dependency state: pending / processing / error / skipped upstreams mean
+    # there is no completed material for this phase to have consumed.
     for upstream in spec.depends_on:
         upstream_entry = completed_phases.get(upstream)
         if not isinstance(upstream_entry, dict):
             return True
-        deps = entry.get("deps")
-        recorded = deps.get(upstream) if isinstance(deps, dict) else None
-        if recorded is None or recorded != upstream_entry.get("marker"):
+        upstream_state = phase_state(upstream_entry)
+        if upstream_state in (
+            PHASE_STATE_PROCESSING,
+            PHASE_STATE_ERROR,
+            PHASE_STATE_SKIPPED,
+        ):
             return True
 
-    # (b) settings fast-path: opaque version equality
-    if spec.settings_category is not None and current_settings_updated_at is not None:
-        if entry.get("settings_version") == current_settings_updated_at:
-            return False
+    stored_tag = entry.get("tag")
+    if isinstance(stored_tag, str) and stored_tag:
+        return stored_tag != current_tag
 
-    # (c) slow-path: plugin marker comparison
+    # ---- LEGACY (v1) entry: no tag, compare the recorded material inputs ----
+    # Dependency markers: the upstream markers this phase consumed must still
+    # be the CURRENT upstream markers. ``None == None`` is a legitimate match
+    # (an upstream with no marker), so it never forces a livelock.
+    deps = entry.get("deps")
+    for upstream in spec.depends_on:
+        upstream_entry = completed_phases.get(upstream)
+        current_upstream_marker = (
+            upstream_entry.get("marker") if isinstance(upstream_entry, dict) else None
+        )
+        recorded = deps.get(upstream) if isinstance(deps, dict) else None
+        if recorded != current_upstream_marker:
+            return True
+
+    # Settings fast path: an unchanged settings entry proves freshness.
+    if (
+        spec.settings_category is not None
+        and current_settings_version is not _MISSING
+        and current_settings_version is not None
+        and entry.get("settings_version") == current_settings_version
+    ):
+        return False
+
+    # Slow path: compare the plugin material marker.
+    if current_marker is _MISSING:
+        return True
     return entry.get("marker") != current_marker
+
+
+def has_live_running_phase(completed_phases: Any) -> bool:
+    """Whether the diary holds a ``processing`` entry with a LIVE lease.
+
+    Such a source is being worked on by another worker (or by this process,
+    earlier in the same pass): the machine must leave it alone and must NOT
+    write a terminal COMPLETED while the lease is live. (The name is kept for
+    API compatibility; ``processing`` is the current spelling of ``running``.)
+    """
+    diary = _diary_from_completed_phases(completed_phases)
+    return any(
+        phase_state(entry) == PHASE_STATE_PROCESSING
+        and not should_abandon(entry)
+        for entry in diary.values()
+    )
 
 
 @hook(priority=0)
 async def ingestion_phase_pending(
-    pending, source, completed_phases, cat
+    pending, source, completed_phases, cat=None, lizard=None
 ) -> list[dict[str, Any]]:
     """Accumulator registrant declaring the stale phases for ``source``.
 
@@ -213,17 +1691,10 @@ async def ingestion_phase_pending(
     The phases probed are the MERGED set from :func:`merged_phases`: the
     built-in ``PHASES`` plus every ``PhaseSpec`` registered through the
     ``ingestion_phase_specs`` accumulator hook (built-ins win on duplicate
-    ids). For each ``PhaseSpec`` the current inputs are resolved live:
-
-    - ``current_settings_updated_at``: the ``updated_at`` of the settings
-      entry for ``spec.settings_category`` (via ``crud_settings`` — the
-      official CRUD API, no raw Redis), used only as an opaque equality
-      token; a missing settings entry yields None and falls to the slow-path;
-      registered phases with ``settings_category=None`` skip the fast-path
-      entirely (their marker IS the material settings fingerprint);
-    - ``current_marker``: the plugin-defined marker from the
-      ``ingestion_phase_settings_marker`` hook (None = unknown ->
-      conservative stale).
+    ids). The current recursive tags are resolved ONCE per probe with
+    :func:`compute_tags` over :func:`get_phases`; each tag already folds in the
+    phase's settings marker and every dependency's tag, so no separate
+    settings-version or marker read is needed here.
 
     Args:
         pending: list of stale-phase dicts accumulated so far (``None`` is
@@ -240,23 +1711,41 @@ async def ingestion_phase_pending(
     """
     if pending is None:
         pending = []
+    cat = cat if cat is not None else lizard
     diary = _diary_from_completed_phases(completed_phases)
 
+    tags: dict[str, str] = {}
+    if cat is not None:
+        try:
+            tags = await compute_tags(cat, await get_phases(cat))
+        except PhaseTagError as exc:
+            log.error(f"Cannot compute phase tags: {exc}")
+            tags = {}
+
     for spec in (await merged_phases(cat, cat)).values():
-        current_settings_updated_at = None
-        current_marker = None
-        if cat is not None:
-            if spec.settings_category is not None:
-                settings_doc = await crud_settings.get_settings_by_category(
-                    getattr(cat, "agent_key", None), spec.settings_category
-                )
-                if isinstance(settings_doc, dict):
-                    current_settings_updated_at = settings_doc.get("updated_at")
-            plugin_manager = getattr(cat, "plugin_manager", None)
-            if plugin_manager is not None:
-                current_marker = await plugin_manager.execute_hook(
-                    "ingestion_phase_settings_marker", spec.id, caller=cat,
-                )
-        if is_phase_stale(spec, diary, current_settings_updated_at, current_marker):
+        current_tag = tags.get(spec.id)
+        if current_tag is None:
+            current_tag = _fallback_current_tag(spec)
+        entry = diary.get(spec.id)
+        if (
+            isinstance(entry, dict)
+            and not entry.get("tag")
+            and phase_state(entry) == PHASE_STATE_COMPLETE
+        ):
+            # Legacy (v1) entry: compare its recorded marker/deps against the
+            # CURRENT values instead of treating "no tag" as always stale.
+            current_marker, current_settings_version = (
+                await current_legacy_inputs(cat, spec)
+            )
+            stale = is_phase_stale(
+                spec,
+                diary,
+                current_tag,
+                current_marker=current_marker,
+                current_settings_version=current_settings_version,
+            )
+        else:
+            stale = is_phase_stale(spec, diary, current_tag)
+        if stale:
             pending.append({"phase": spec.id})
     return pending

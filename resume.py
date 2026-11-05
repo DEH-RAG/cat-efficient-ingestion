@@ -4,9 +4,10 @@ The recovery loop of the ingestion lifecycle lives ONLY in this plugin:
 the ``after_lizard_bootstrap`` hook schedules a fire-and-forget background pass
 (per agent) that:
 
-  (a) resumes stale ``uploaded``/``processing``/``error`` ingestions by handing
-      each candidate to the SAME phase machine used by the re-embed pass
-      (:func:`reembed_sources <cat.plugins.cat_efficient_ingestion.reembed.reembed_sources>`);
+  (a) resumes stale ``uploaded``/``downloading``/``downloaded``/``processing``/
+      ``error`` ingestions by handing each candidate to the SAME phase machine
+      used by the re-embed pass
+      (:func:`reembed_sources <cat.core_plugins.cat_efficient_ingestion.reembed.reembed_sources>`);
       the machine re-reads the file from disk (or re-downloads the URL), claims
       the per-source work, records the phase, cleans up orphan images and
       performs the full re-ingest;
@@ -39,6 +40,7 @@ Importing this module has zero side effects: the loop only starts from the
 
 import asyncio
 import os
+import time
 from io import BytesIO
 from typing import Any
 
@@ -50,7 +52,8 @@ from cat.exceptions import CustomNotFoundException
 from cat.services.memory.models import VectorMemoryType
 from cat.utils import is_url
 
-from .phases import PHASES
+from .hooks import execute_phase_accumulator
+from .phases import PHASES, recover_reindexing_source
 from .reconcile import reconcile_agent
 from .reembed import reembed_sources
 from .registry import (
@@ -102,6 +105,36 @@ def _boot_stale_seconds() -> int:
     return 60
 
 
+def _maintenance_marker_key(agent_id: str) -> str:
+    """Redis key shared with the maintenance CLI (``maintenance_agent.py``)."""
+    return f"agents:{agent_id}:ingestion:maintenance"
+
+
+async def _maintenance_marker_active(agent_id: str) -> bool:
+    """Whether a maintenance CLI is currently processing this agent.
+
+    The marker is written by the GraphRAG maintenance CLI through
+    ``cat.db.crud`` with a 2h TTL and deleted at the end of the run. While it
+    is present the periodic sweep MUST NOT touch the agent: it would otherwise
+    steal/retry rows the CLI is actively rebuilding.
+
+    Fail-safe: a read failure is logged and treated as "no marker" so a Redis
+    hiccup cannot block the sweep forever; a crashed CLI's marker expires by
+    its own TTL.
+    """
+    try:
+        value = await crud.read(_maintenance_marker_key(agent_id))
+    except Exception as e:  # noqa: BLE001 - never block the sweep on a read error
+        log.warning(
+            f"Ingestion sweep: could not read the maintenance marker for agent "
+            f"{agent_id}; proceeding: {e}"
+        )
+        return False
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value is not None
+
+
 async def mark_file_missing(agent_id: str, scope: str, source: str) -> None:
     """Mark a source whose file is missing on disk as ``error``.
 
@@ -124,6 +157,28 @@ async def mark_file_missing(agent_id: str, scope: str, source: str) -> None:
 def _collection_for_scope(scope: str) -> VectorMemoryType:
     """Vector-memory collection for an ingestion scope ("agent" -> declarative, chat -> episodic)."""
     return VectorMemoryType.DECLARATIVE if scope == "agent" else VectorMemoryType.EPISODIC
+
+
+async def _pending_phases(ccat, entry: dict) -> list:
+    """READ-ONLY phase probe for one status entry.
+
+    Backfills the completed-phases diary (legacy completed rows get a sentinel so
+    they are conservatively stale once), converts it to the hook list shape and
+    lets the ``ingestion_phase_pending`` accumulator registrants report which
+    phases must be re-run against the CURRENT settings. Returns the filtered
+    stale-phase list; an empty list means the row is genuinely up to date.
+    """
+    completed = await backfill_completed_phases(entry, list(PHASES.keys()))
+    completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
+    pending = await execute_phase_accumulator(
+        ccat,
+        "ingestion_phase_pending",
+        [],
+        entry.get("source"),
+        completed_as_list,
+        default=list,
+    )
+    return [p for p in (pending or []) if p and p.get("phase")]
 
 
 def _source_from_entry(ccat, agent_id: str, scope: str, source: str, type_: str = "file"):
@@ -161,17 +216,33 @@ def _source_from_entry(ccat, agent_id: str, scope: str, source: str, type_: str 
 async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) -> None:
     """Re-trigger stale ingestions for one agent through the ONE state machine.
 
-    Only entries in ``uploaded``/``processing``/``error`` older than the stale
-    threshold are candidates; each is handed to ``reembed_sources`` (the same
-    phase machine used for re-embed): it decides the phase from the status doc,
-    claims the per-source work atomically (so two workers never double-process),
-    records the phase, cleans up any orphan images and performs the full re-ingest
-    from disk (or URL re-download). Fresh entries and ``completed`` entries are
-    left untouched (completed rows are revalidated by :func:`_revalidate_agent`).
-    A canceled agent (deletion marker or ghost) is skipped entirely.
+    Only entries in ``uploaded``/``downloading``/``downloaded``/``processing``/
+    ``error`` older than the stale threshold are candidates; each is handed to
+    ``reembed_sources`` (the same phase machine used for re-embed): it decides
+    the phase from the status doc, claims the per-source work atomically (so
+    two workers never double-process), records the phase, cleans up any orphan
+    images and performs the full re-ingest from disk (or URL re-download).
+    An ``error`` row is retried ONLY while its diary still shows a stale phase,
+    and the phase machine terminalizes an up-to-date ``processing`` row on its
+    first pass, so a fully-processed row is never re-handed.
+    Fresh entries and ``completed`` entries are left untouched (completed rows
+    are revalidated by :func:`_revalidate_agent`). A canceled agent (deletion
+    marker or ghost) is skipped entirely.
+
+    ``downloading``/``downloaded`` are resumable (a crash between download and
+    processing would otherwise be a permanent dead end). They have no PROCESSING
+    heartbeat, so they are gated by the regular resume threshold
+    (``CAT_INGESTION_RESUME_STALE_SECONDS``, default 300s) — never the shorter
+    boot threshold — so an actively downloading source is not stolen.
     """
     if await ingestion_canceled(agent_id):
         # agent is being deleted (marker) or dead (ghost): never resume it
+        return
+    if await _maintenance_marker_active(agent_id):
+        # a maintenance CLI owns this agent right now: never steal its rows
+        log.debug(
+            f"Ingestion sweep for agent {agent_id} skipped: maintenance marker present"
+        )
         return
     if ccat is None:
         try:
@@ -183,15 +254,82 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
         return
 
     boot_stale = _boot_stale_seconds()
+    # downloading/downloaded have no heartbeat: use the larger resume threshold
+    # so a live download is never re-claimed before it looks genuinely stale.
+    download_stale = max(boot_stale, float(_stale_seconds()))
+    now = time.time()
     entries = await list_statuses(agent_id)
     for entry in entries:
         status = entry.get("status")
+        source = entry.get("source")
+        scope = entry.get("scope")
+
+        if status == IngestionStatus.REINDEXING.value:
+            # A re-ingest writes ``reindexing`` BEFORE the artifact wipe: a
+            # crash leaves this row behind. Re-run the reset only when the
+            # owner is provably gone (``should_abandon`` reuses the phase
+            # lease/boot/pid precedence); a live owner is never touched.
+            if not source:
+                continue
+            try:
+                reset = await recover_reindexing_source(
+                    source, ccat, scope=str(scope or "agent")
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad row never aborts
+                log.warning(
+                    f"Ingestion resume: could not reset reindexing source "
+                    f"{source} (agent {agent_id}): {exc}"
+                )
+                continue
+            if reset:
+                log.info(
+                    f"Ingestion resume: re-ran the reindexing reset for "
+                    f"{source} (agent {agent_id}) -> processing"
+                )
+            # The row is now ``processing`` (or owned by a live worker): the
+            # normal stale-PROCESSING sweep re-dispatches it on a later pass.
+            continue
+
         if status not in (
             IngestionStatus.UPLOADED.value,
+            IngestionStatus.DOWNLOADING.value,
+            IngestionStatus.DOWNLOADED.value,
             IngestionStatus.PROCESSING.value,
             IngestionStatus.ERROR.value,
         ):
             continue
+
+        # An ``error`` row is terminal unless its diary still shows a stale
+        # phase: retrying it while every phase is fresh would resurrect a row the
+        # machine already exhausted (and re-hand it forever without any
+        # progress). A failed phase leaves its diary entry missing, so a genuinely
+        # retryable error still probes as stale and is handed below.
+        if status == IngestionStatus.ERROR.value:
+            try:
+                if not await _pending_phases(ccat, entry):
+                    continue
+            except Exception as e:  # noqa: BLE001 - a probe failure must not resurrect
+                log.warning(
+                    f"Ingestion resume: could not probe stale phases for {entry.get('source')} "
+                    f"(agent {agent_id}); leaving it error: {e}"
+                )
+                continue
+
+        # A download has no PROCESSING heartbeat: only touch it once it is
+        # older than the download threshold (an active download stays fresh).
+        if status in (
+            IngestionStatus.DOWNLOADING.value,
+            IngestionStatus.DOWNLOADED.value,
+        ):
+            try:
+                updated_at = float(entry.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                updated_at = 0
+            if now - updated_at < download_stale:
+                continue
+            claim_stale = download_stale
+        else:
+            claim_stale = boot_stale
 
         source = entry.get("source")
         scope = entry.get("scope")
@@ -212,11 +350,11 @@ async def _resume_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = None) 
             f"Ingestion resume: handing {source} (status {status}, phase {entry.get('phase')!r}) "
             f"to the ingestion phase machine for {agent_id}"
         )
-        # The phase machine claims the per-source work itself, using the boot
-        # staleness so a freshly-crashed row is recoverable at restart.
+        # The phase machine claims the per-source work itself, using the same
+        # staleness budget chosen above for this entry's status.
         await reembed_sources(
             ccat, _collection_for_scope(str(scope)), [source_obj],
-            stale_after=boot_stale,
+            stale_after=claim_stale,
         )
 
 
@@ -243,6 +381,12 @@ async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = No
     if await ingestion_canceled(agent_id):
         # agent is being deleted (marker) or dead (ghost): never revalidate it
         return
+    if await _maintenance_marker_active(agent_id):
+        # a maintenance CLI owns this agent right now: never revalidate it
+        log.debug(
+            f"Ingestion revalidation for agent {agent_id} skipped: maintenance marker present"
+        )
+        return
     if ccat is None:
         try:
             ccat = await lizard.get_cheshire_cat(agent_id)
@@ -268,12 +412,7 @@ async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = No
             # list shape (every entry carries a "phase" key) and let the
             # accumulator registrants report the stale phases. A non-empty
             # result means at least one phase must be re-run.
-            completed = await backfill_completed_phases(entry, list(PHASES.keys()))
-            completed_as_list = [dict(e, phase=p) for p, e in completed.items()]
-            pending = await ccat.plugin_manager.execute_hook(
-                "ingestion_phase_pending", [], source, completed_as_list, caller=ccat
-            )
-            pending = [p for p in (pending or []) if p and p.get("phase")]
+            pending = await _pending_phases(ccat, entry)
             if not pending:
                 # probe empty: the row is genuinely complete — never claim it
                 continue
@@ -307,10 +446,16 @@ async def _revalidate_agent(lizard: BillTheLizard, agent_id: str, ccat: Any = No
             revalidated += 1
         except Exception as e:  # noqa: BLE001 - a failing row must not abort the pass
             log.error(f"Ingestion revalidation failed for {source} (agent {agent_id}): {e}")
-    log.info(
-        f"Ingestion revalidation for agent {agent_id}: {revalidated} completed "
-        f"row(s) re-ingested"
-    )
+    if revalidated:
+        log.info(
+            f"Ingestion revalidation for agent {agent_id}: {revalidated} completed "
+            f"row(s) re-ingested"
+        )
+    else:
+        log.debug(
+            f"Ingestion revalidation for agent {agent_id}: 0 completed "
+            f"row(s) re-ingested"
+        )
 
 
 async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
@@ -325,6 +470,14 @@ async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
     """
     if await ingestion_canceled(agent_id):
         # agent is being deleted (marker) or dead (ghost): never sweep it
+        return
+    if await _maintenance_marker_active(agent_id):
+        # A maintenance CLI owns this agent: skip the whole sweep ONCE per pass
+        # (the inner _resume_agent/_revalidate_agent checks keep direct callers
+        # safe without adding a second log line to the periodic sweep).
+        log.debug(
+            f"Ingestion sweep for agent {agent_id} skipped: maintenance marker present"
+        )
         return
     try:
         async with crud.distributed_lock(f"ingestion-sweep:{agent_id}", timeout=30, blocking_timeout=5):
@@ -342,8 +495,8 @@ async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
                 await reconcile_agent(agent_id, ccat=ccat)
     except crud.LockError:
         # Another replica is already running this sweep: expected contention
-        # across workers, not a fault. Log as info and move on.
-        log.info(f"Ingestion sweep for agent {agent_id} skipped: lock held by another worker")
+        # across workers, not a fault, and absence of this line is normal.
+        log.debug(f"Ingestion sweep for agent {agent_id} skipped: lock held by another worker")
     except Exception as e:
         log.error(f"Ingestion startup pass failed for agent {agent_id}: {e}")
 
@@ -351,7 +504,7 @@ async def _pass_for_agent(lizard: BillTheLizard, agent_id: str) -> None:
 async def _startup_pass(lizard: BillTheLizard) -> None:
     """Enumerate agents and run the recovery + GC pass for each."""
     try:
-        agent_ids = await crud_settings.get_agents_main_keys()
+        agent_ids = [a["agent_id"] for a in await crud_settings.get_agents()]
     except Exception as e:
         log.error(f"Ingestion startup pass: failed to enumerate agents: {e}")
         return
