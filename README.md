@@ -110,7 +110,7 @@ A plugin that exposes an ingestion phase depends on EffING **optionally** and fo
 3. **Define the phase hooks only when the import succeeded** (or make them no-ops when `PhaseSpec is None`): `ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`.
 4. **Keep the classic CAT ingestion hooks** (`rabbithole_ingestion_processing`, the `before_rabbithole_*` hooks, …) unconditionally, so **basic ingestion still works when EffING is absent**.
 
-Never require EffING at import time and never make `PhaseSpec` duck-typed: the strict class identity is what guarantees the spec reaches the phase machine. The host harness pins this contract in `tests/effing/test_phase_extension_contract.py` (fixture plugin `tests/effing/fixtures/phase_consumer/`), covering both the EffING-present and EffING-blocked imports.
+Never require EffING at import time and never make `PhaseSpec` duck-typed: the strict class identity is what guarantees the spec reaches the phase machine. The plugin's own `test_phase_extension_contract.py` (fixture plugin `fixtures/phase_consumer/`) pins this contract, covering both the EffING-present and EffING-blocked imports.
 
 <h2>🔁 Probe-driven dispatcher</h2>
 
@@ -246,36 +246,42 @@ Settings live in the global `system:agent` store, category `ingestion`:
 
 <h2>🧪 Tests</h2>
 
-The authoritative test suite for this plugin lives in the host repo at
-`grinning-cat-core/tests/effing/`, not here. The host imports **every** `.py`
-file inside a plugin folder recursively when it activates the plugin, so a
-`conftest.py` (or any module that mutates the environment / boots the app)
-placed under `tests/` would be imported by the running Cat and poison it. The
-host harness is the only place that may own the Redis isolation
-(`CAT_REDIS_DB=1`), the host fixtures (`lizard`, `secure_client`,
-`cheshire_cat`, …) and the Redis connection setup.
+Behaviour suites that do not need the whole host app live in this repo as
+**import-safe standalone scripts**. The host imports **every** `.py` file
+inside a plugin folder recursively when it activates the plugin, so each script
+keeps its entire body (imports included) under `if __name__ == "__main__":`;
+importing it at activation executes nothing. There is no `conftest.py` here.
 
-Run it from the core checkout:
+Run one from the core checkout (the scripts force `CAT_REDIS_DB=1` before
+importing `cat`, and use the host's Redis connection):
+
+```bash
+cd grinning-cat-core
+CAT_REDIS_HOST=<redis ip> .venv/bin/python /path/to/plugins/cat-efficient-ingestion/test_ingestion_status.py
+```
+
+Plugin-local standalone scripts:
+
+`test_effing_audit_fixes.py`, `test_ingestion_loop_fix.py`,
+`test_ingestion_status.py`, `test_phase_extension_contract.py`,
+`test_plugin_imports.py`, `test_point_identity.py`, `test_startup_order.py`,
+`test_system_only_dispatch.py`, plus the pre-existing
+`test_ingestion_safety_fixes.py` family.
+
+The tests that need the host pytest fixtures (`lizard`, `secure_client`,
+`cheshire_cat`, …) and the real app/Redis/Qdrant harness stay in
+`grinning-cat-core/tests/effing/`: the installation/validation suite, the
+factory/endpoint suite, and the route/lifecycle integration suites. Run them
+from the core checkout:
 
 ```bash
 CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
 ```
 
-The harness covers the registry/lifecycle, the phase diary, the factory and
-the endpoints, plus the RED-baseline tests for the known blockers.
-
-Do not add a plugin-local test suite here: a `conftest.py` under the plugin
-would be imported at activation. Add the test to
+Do not add a `conftest.py` under this plugin: it would be imported at
+activation. A new plugin-local test must be a fully import-safe standalone
+script; if it needs the host app fixtures, add it to
 `grinning-cat-core/tests/effing/` instead.
-
-The one exception is a fully import-safe standalone harness: its ENTIRE body
-(imports included) lives under `if __name__ == "__main__":`, so importing it
-at activation executes nothing. `test_ingestion_safety_fixes.py` is such a
-harness; run it as a plain script from the core checkout:
-
-```bash
-uv run python /path/to/plugins/cat-efficient-ingestion/test_ingestion_safety_fixes.py
-```
 
 <h2>🛠️ Installation:</h2>
 
