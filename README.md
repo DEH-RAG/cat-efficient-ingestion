@@ -268,11 +268,13 @@ Plugin-local standalone scripts:
 `test_system_only_dispatch.py`, plus the pre-existing
 `test_ingestion_safety_fixes.py` family.
 
-The tests that need the host pytest fixtures (`lizard`, `secure_client`,
-`cheshire_cat`, …) and the real app/Redis/Qdrant harness stay in
-`grinning-cat-core/tests/effing/`: the installation/validation suite, the
-factory/endpoint suite, and the route/lifecycle integration suites. Run them
-from the core checkout:
+The plugin owns its test suite: the standalone, import-safe scripts above are
+the authoritative plugin checks and run without the host app. The tests that
+need the host pytest fixtures (`lizard`, `secure_client`, `cheshire_cat`, …)
+and the real app/Redis/Qdrant harness are a deliberate cross-repo integration
+exception: they stay in `grinning-cat-core/tests/effing/`
+(installation/validation, factory/endpoint, route/lifecycle) and run from the
+MyCAT integration checkout, not from this plugin:
 
 ```bash
 CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
