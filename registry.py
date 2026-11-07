@@ -36,6 +36,17 @@ from cat.db.crud import escape_glob
 from cat.db.cruds import settings as crud_settings
 from cat.db.models import generate_timestamp
 from cat.env import get_env_int
+# The delete-marker key and helpers are the CORE contract
+# (``cat.looking_glass.agent_deletion``): imported here, never re-implemented,
+# so the schema (``{"delete_marker": True, "started_at": <float>}``) has one
+# home. ``has_delete_marker`` is presence-only, so legacy markers without
+# ``started_at`` keep working until the next teardown rewrites them.
+from cat.looking_glass.agent_deletion import (
+    clear_delete_marker,  # noqa: F401 - re-exported registry API
+    delete_marker_key,
+    has_delete_marker,
+    set_delete_marker,  # noqa: F401 - re-exported registry API
+)
 from cat.utils import Enum
 
 
@@ -501,26 +512,10 @@ def status_key(agent_id: str, scope: str, source: str) -> str:
     return f"agents:{agent_id}:ingestion:{scope}:{digest}"
 
 
-#: Key part of the deletion marker, stored INSIDE the ``agents:{agent_id}:ingestion:*``
+#: The deletion marker is stored INSIDE the ``agents:{agent_id}:ingestion:*``
 #: namespace on purpose: the namespace wipe includes it, and the agent master
-#: keys (``agents:*:agent``) never list it.
-DELETE_MARKER_KEY_PART = "delete"
-
-
-def delete_marker_key(agent_id: str) -> str:
-    """Redis key of the deletion marker for an agent.
-
-    The marker is persistent (no TTL): written by the delete flow, removed
-    ONLY at teardown completion. Invariant: marker present <=> teardown
-    incomplete.
-
-    Args:
-        agent_id: The agent (chatbot) id.
-
-    Returns:
-        ``agents:{agent_id}:ingestion:delete``
-    """
-    return f"agents:{agent_id}:ingestion:{DELETE_MARKER_KEY_PART}"
+#: keys (``agents:*:agent``) never list it. Its key and helpers are imported
+#: from the core (``cat.looking_glass.agent_deletion``) above.
 
 
 async def _list_status_keys(agent_id: str) -> List[str]:
@@ -533,21 +528,6 @@ async def _list_status_keys(agent_id: str) -> List[str]:
     agent id. Never a raw client.
     """
     return await crud_settings.get_ingestion_status_keys(agent_id)
-
-
-async def set_delete_marker(agent_id: str) -> None:
-    """Write the deletion marker for an agent (idempotent)."""
-    await crud.store(delete_marker_key(agent_id), {"delete_marker": True})
-
-
-async def has_delete_marker(agent_id: str) -> bool:
-    """Whether the deletion marker is present for an agent."""
-    return await crud.read(delete_marker_key(agent_id)) is not None
-
-
-async def clear_delete_marker(agent_id: str) -> None:
-    """Remove the deletion marker for an agent (teardown completion)."""
-    await crud.delete(delete_marker_key(agent_id))
 
 
 async def ingestion_canceled(agent_id: str) -> bool:
