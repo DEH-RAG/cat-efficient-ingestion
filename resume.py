@@ -515,6 +515,21 @@ async def _startup_pass(lizard: BillTheLizard) -> None:
         await _pass_for_agent(lizard, agent_id)
 
 
+async def resume(lizard: BillTheLizard) -> int:
+    """Run one recovery pass and return how many agents were swept.
+
+    Public entry for the core ``IngestionRecovery`` contract; the hook path
+    still schedules :func:`_startup_pass` fire-and-forget.
+    """
+    try:
+        agent_ids = [a["agent_id"] for a in await crud_settings.get_agents()]
+    except Exception as e:
+        log.error(f"Ingestion startup pass: failed to enumerate agents: {e}")
+        return 0
+    await _startup_pass(lizard)
+    return len(agent_ids)
+
+
 async def _periodic_sweep_loop(lizard: BillTheLizard) -> None:
     """Re-run the recovery + GC pass every ``CAT_INGESTION_RESUME_INTERVAL_SECONDS``.
 

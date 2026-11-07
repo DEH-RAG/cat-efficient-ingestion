@@ -10,6 +10,13 @@ from pydantic import model_validator
 
 from cat.services.factory.ingestion import BaseIngestionConfiguration, BaseIngestionEngine
 
+from .profile import (
+    EfficientLockManager,
+    EfficientPhaseDagPipeline,
+    EfficientRecovery,
+    EfficientStateStore,
+    EfficientTagResolver,
+)
 from .reembed import EfficientIngestionEngine
 
 
@@ -44,3 +51,23 @@ class EfficientIngestionConfiguration(BaseIngestionConfiguration):
     @classmethod
     def base_class(cls) -> type:
         return BaseIngestionEngine
+
+    @classmethod
+    def pipeline(cls) -> type:
+        return EfficientPhaseDagPipeline
+
+    @classmethod
+    def state_store(cls) -> type:
+        return EfficientStateStore
+
+    @classmethod
+    def recovery(cls) -> type:
+        return EfficientRecovery
+
+    @classmethod
+    def locks(cls) -> type:
+        return EfficientLockManager
+
+    @classmethod
+    def tags(cls) -> type:
+        return EfficientTagResolver
