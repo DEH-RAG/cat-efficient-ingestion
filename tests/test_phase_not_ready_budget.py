@@ -342,8 +342,11 @@ if __name__ == "__main__":
 
     async def test_i_declared_garbage_never_raises():
         _clear_env()
-        original_log = phases_module.log
-        phases_module.log = FakeLog()
+        # The ABC is core-owned when the host provides the contract; patch the
+        # logger of whichever module actually defines it.
+        phase_module = sys.modules[phases_module.IngestionPhase.__module__]
+        original_log = phase_module.log
+        phase_module.log = FakeLog()
         bad_values = (
             object(), "", "abc", [300], {"seconds": 300}, True,
             float("nan"), float("inf"), -1.0,
@@ -352,7 +355,7 @@ if __name__ == "__main__":
             for bad in bad_values:
                 phase = FakePhase("graph_llm_extraction", budget=bad)
                 assert phase.not_ready_budget() is None, bad
-            warnings = phases_module.log.warnings
+            warnings = phase_module.log.warnings
             assert len(warnings) >= len(bad_values), warnings
             assert all("not_ready_budget_seconds" in w for w in warnings), warnings
             # A declared None is "not declared", not a bad value: no warning.
@@ -360,9 +363,9 @@ if __name__ == "__main__":
                 FakePhase("graph_llm_extraction", budget=None).not_ready_budget()
                 is None
             )
-            assert len(phases_module.log.warnings) == len(bad_values)
+            assert len(phase_module.log.warnings) == len(bad_values)
         finally:
-            phases_module.log = original_log
+            phase_module.log = original_log
 
         # In a real run a garbage declared value falls back to the generic
         # 3600s instead of raising out of the resolver.

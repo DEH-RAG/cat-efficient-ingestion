@@ -120,193 +120,195 @@ _DELETE_SCOPE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
 
 
-@dataclass(frozen=True)
-class PhaseSpec:
-    """Declaration of one ingestion phase and its invalidation inputs.
+try:
+    from cat.services.ingestion import IngestionPhase, PhaseResult, PhaseSpec
+except ImportError:  # upstream CAT: the core ingestion contract package is absent
+    @dataclass(frozen=True)
+    class PhaseSpec:
+        """Declaration of one ingestion phase and its invalidation inputs.
 
-    Attributes:
-        id: The phase id (also the diary key, e.g. ``"embedding"``).
-        settings_category: The settings category whose ``updated_at`` is the
-            opaque fast-path token (``"chunker"``, ``"embedder"``), or None
-            for phases with no settings entry (marker-only invalidation).
-        depends_on: Upstream phase ids whose recorded markers this phase
-            consumed; a change in any upstream marker makes this phase stale.
-        settings_check: Optional narrowing of the settings that feed
-            :meth:`IngestionPhase.tag`: a key collection keeps only those
-            keys, a (possibly async) callable returns the value that
-            participates. ``None`` means the whole settings value.
-    """
-
-    id: str
-    settings_category: str | None
-    depends_on: tuple[str, ...]
-    settings_check: Any = None
-
-
-@dataclass(frozen=True)
-class PhaseResult:
-    """Outcome of running one phase.
-
-    ``processed`` / ``expected`` are TELEMETRY ONLY: they may be logged or
-    surfaced to an operator, but they are never a completion criterion. A
-    phase is complete because ``status == "done"``, not because a count
-    matches.
-
-    ``warnings`` is the OPTIONAL degradation channel for a phase that RAN
-    correctly but produced nothing VALID TO BE EMPTY (or less than it should).
-    Each warning is ``{"code": <str>, "message": <str>}``; the documented codes
-    are ``empty-extraction``, ``partial-extraction`` and ``degraded``. A
-    warning is NOT a state: it is attached to a ``done`` result, so the phase
-    stays complete, nothing retries and no dependent is blocked.
-
-    An empty product is not universally benign: the built-in
-    ``parsing_chunking`` (a non-empty source yielding no chunk) and
-    ``embedding`` (points to embed yielding no stored point) report ``error``
-    instead, because their product is the searchable content itself. The
-    catalog and graph phases keep the warning channel. "Could not run"
-    (timeout, transport error, LLM unavailable, no input) is still
-    ``not_ready`` then ``error``. The phase owns this distinction; the machine
-    applies no size threshold.
-    """
-
-    status: Literal["done", "not_ready", "error", "skipped"]
-    reason: str | None = None
-    processed: int | None = None
-    expected: int | None = None
-    warnings: list[dict] | None = None
-
-
-class IngestionPhase(ABC):
-    """One ingestion phase, owning its applicability, work and cleanup.
-
-    Every phase MUST implement all four operations. ``delete`` is deliberately
-    abstract: a phase that cannot clean up its own artifacts would make the
-    recovery path delete data blindly, so it cannot exist. There is no no-op
-    default anywhere — a subclass without ``delete`` raises ``TypeError`` at
-    instantiation time.
-    """
-
-    #: Stable phase id (the diary key, e.g. ``"embedding"``).
-    id: str = ""
-    #: Human-readable label for display only. Never a key: the machine
-    #: identity is always :attr:`id`. ``None`` falls back to :attr:`id`.
-    label: str | None = None
-    #: Upstream phase ids this phase consumes.
-    depends_on: tuple[str, ...] = ()
-    #: Settings category whose material configuration feeds :meth:`tag`.
-    settings_category: str | None = None
-    #: Optional narrowing of the settings that feed :meth:`tag` (see
-    #: :class:`PhaseSpec`). ``None`` uses the whole settings value.
-    settings_check: Any = None
-    #: Optional wall-clock budget (seconds) this phase may stay ``not_ready``
-    #: before the machine marks it ``error``. ``None`` uses the generic
-    #: ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` budget. An LLM-backed phase sets
-    #: this (and :attr:`not_ready_budget_env`) so an upstream model failure
-    #: does not hold the source for the generic hour.
-    not_ready_budget_seconds: float | None = None
-    #: Optional env var overriding :attr:`not_ready_budget_seconds` when set to
-    #: a non-negative number. Unset/invalid falls back to the declared value.
-    not_ready_budget_env: str | None = None
-
-    def not_ready_budget(self) -> float | None:
-        """Resolve this phase's own not-ready budget, or ``None``.
-
-        Resolution order for the PHASE's budget:
-
-        1. :attr:`not_ready_budget_env`, when declared and set to a
-           non-negative number;
-        2. :attr:`not_ready_budget_seconds`, when declared and coercible to
-           a non-negative finite number.
-
-        Returns ``None`` when the phase declares no budget, which makes the
-        caller fall back to the generic
-        ``CAT_INGESTION_NOT_READY_MAX_SECONDS``.
+        Attributes:
+            id: The phase id (also the diary key, e.g. ``"embedding"``).
+            settings_category: The settings category whose ``updated_at`` is the
+                opaque fast-path token (``"chunker"``, ``"embedder"``), or None
+                for phases with no settings entry (marker-only invalidation).
+            depends_on: Upstream phase ids whose recorded markers this phase
+                consumed; a change in any upstream marker makes this phase stale.
+            settings_check: Optional narrowing of the settings that feed
+                :meth:`IngestionPhase.tag`: a key collection keeps only those
+                keys, a (possibly async) callable returns the value that
+                participates. ``None`` means the whole settings value.
         """
-        if self.not_ready_budget_env:
+
+        id: str
+        settings_category: str | None
+        depends_on: tuple[str, ...]
+        settings_check: Any = None
+
+
+    @dataclass(frozen=True)
+    class PhaseResult:
+        """Outcome of running one phase.
+
+        ``processed`` / ``expected`` are TELEMETRY ONLY: they may be logged or
+        surfaced to an operator, but they are never a completion criterion. A
+        phase is complete because ``status == "done"``, not because a count
+        matches.
+
+        ``warnings`` is the OPTIONAL degradation channel for a phase that RAN
+        correctly but produced nothing VALID TO BE EMPTY (or less than it should).
+        Each warning is ``{"code": <str>, "message": <str>}``; the documented codes
+        are ``empty-extraction``, ``partial-extraction`` and ``degraded``. A
+        warning is NOT a state: it is attached to a ``done`` result, so the phase
+        stays complete, nothing retries and no dependent is blocked.
+
+        An empty product is not universally benign: the built-in
+        ``parsing_chunking`` (a non-empty source yielding no chunk) and
+        ``embedding`` (points to embed yielding no stored point) report ``error``
+        instead, because their product is the searchable content itself. The
+        catalog and graph phases keep the warning channel. "Could not run"
+        (timeout, transport error, LLM unavailable, no input) is still
+        ``not_ready`` then ``error``. The phase owns this distinction; the machine
+        applies no size threshold.
+        """
+
+        status: Literal["done", "not_ready", "error", "skipped"]
+        reason: str | None = None
+        processed: int | None = None
+        expected: int | None = None
+        warnings: list[dict] | None = None
+
+
+    class IngestionPhase(ABC):
+        """One ingestion phase, owning its applicability, work and cleanup.
+
+        Every phase MUST implement all four operations. ``delete`` is deliberately
+        abstract: a phase that cannot clean up its own artifacts would make the
+        recovery path delete data blindly, so it cannot exist. There is no no-op
+        default anywhere — a subclass without ``delete`` raises ``TypeError`` at
+        instantiation time.
+        """
+
+        #: Stable phase id (the diary key, e.g. ``"embedding"``).
+        id: str = ""
+        #: Human-readable label for display only. Never a key: the machine
+        #: identity is always :attr:`id`. ``None`` falls back to :attr:`id`.
+        label: str | None = None
+        #: Upstream phase ids this phase consumes.
+        depends_on: tuple[str, ...] = ()
+        #: Settings category whose material configuration feeds :meth:`tag`.
+        settings_category: str | None = None
+        #: Optional narrowing of the settings that feed :meth:`tag` (see
+        #: :class:`PhaseSpec`). ``None`` uses the whole settings value.
+        settings_check: Any = None
+        #: Optional wall-clock budget (seconds) this phase may stay ``not_ready``
+        #: before the machine marks it ``error``. ``None`` uses the generic
+        #: ``CAT_INGESTION_NOT_READY_MAX_SECONDS`` budget. An LLM-backed phase sets
+        #: this (and :attr:`not_ready_budget_env`) so an upstream model failure
+        #: does not hold the source for the generic hour.
+        not_ready_budget_seconds: float | None = None
+        #: Optional env var overriding :attr:`not_ready_budget_seconds` when set to
+        #: a non-negative number. Unset/invalid falls back to the declared value.
+        not_ready_budget_env: str | None = None
+
+        def not_ready_budget(self) -> float | None:
+            """Resolve this phase's own not-ready budget, or ``None``.
+
+            Resolution order for the PHASE's budget:
+
+            1. :attr:`not_ready_budget_env`, when declared and set to a
+               non-negative number;
+            2. :attr:`not_ready_budget_seconds`, when declared and coercible to
+               a non-negative finite number.
+
+            Returns ``None`` when the phase declares no budget, which makes the
+            caller fall back to the generic
+            ``CAT_INGESTION_NOT_READY_MAX_SECONDS``.
+            """
+            if self.not_ready_budget_env:
+                try:
+                    value = get_env_float(self.not_ready_budget_env)
+                except (TypeError, ValueError):
+                    value = None
+                # A non-finite value (``inf``/``nan``) would either never expire or
+                # break the comparison, and a negative budget is meaningless: both
+                # are rejected so resolution falls through to the next step.
+                if value is not None and math.isfinite(value) and value >= 0:
+                    return float(value)
+            declared = self.not_ready_budget_seconds
+            if declared is None:
+                return None
             try:
-                value = get_env_float(self.not_ready_budget_env)
+                # The attribute is typed ``float | None``, but it is a class
+                # attribute a third-party phase may set to anything. A numeric
+                # string ("300") is coerced; a genuinely wrong type is rejected
+                # instead of raising out of the resolver.
+                if isinstance(declared, bool):
+                    raise TypeError("a bool is not a numeric budget")
+                value = float(declared)
             except (TypeError, ValueError):
-                value = None
-            # A non-finite value (``inf``/``nan``) would either never expire or
-            # break the comparison, and a negative budget is meaningless: both
-            # are rejected so resolution falls through to the next step.
-            if value is not None and math.isfinite(value) and value >= 0:
-                return float(value)
-        declared = self.not_ready_budget_seconds
-        if declared is None:
-            return None
-        try:
-            # The attribute is typed ``float | None``, but it is a class
-            # attribute a third-party phase may set to anything. A numeric
-            # string ("300") is coerced; a genuinely wrong type is rejected
-            # instead of raising out of the resolver.
-            if isinstance(declared, bool):
-                raise TypeError("a bool is not a numeric budget")
-            value = float(declared)
-        except (TypeError, ValueError):
-            log.warning(
-                f"Phase '{self.id}' declares an invalid "
-                f"not_ready_budget_seconds {declared!r}; ignoring it and "
-                "falling back to the generic budget."
+                log.warning(
+                    f"Phase '{self.id}' declares an invalid "
+                    f"not_ready_budget_seconds {declared!r}; ignoring it and "
+                    "falling back to the generic budget."
+                )
+                return None
+            # The same rules as the env path: a non-finite value would never
+            # expire (or break the comparison) and a negative budget is
+            # meaningless, so warn about the bad declared value and fall through.
+            if not math.isfinite(value) or value < 0:
+                log.warning(
+                    f"Phase '{self.id}' declares an invalid "
+                    f"not_ready_budget_seconds {declared!r}; ignoring it and "
+                    "falling back to the generic budget."
+                )
+                return None
+            return value
+
+        @property
+        def name(self) -> str:
+            """Stable phase name (alias of :attr:`id`)."""
+            return self.id
+
+        def display_label(self) -> str:
+            """Human-readable label for this phase.
+
+            Returns :attr:`label` when declared, else :attr:`id`. The label is
+            display-only: clients localize by ``id`` and the machine never uses
+            the label as a key.
+            """
+            return self.label or self.id
+
+        @abstractmethod
+        async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
+            """Whether this phase applies, with an optional human-readable reason."""
+
+        @abstractmethod
+        async def process(self, source: str, cat) -> PhaseResult:
+            """Run the phase body for ``source``."""
+
+        @abstractmethod
+        async def delete(self, source: str, cat) -> None:
+            """Delete ONLY the artifacts this phase produced for ``source``.
+
+            Must raise when the phase has no cleanup implementation: a silent
+            no-op would let recovery delete data blindly.
+            """
+
+        async def tag(self, settings: Any = None) -> str:
+            """Detached identity of this phase's OWN material configuration.
+
+            ``sha256(kind + ":" + canonical_json(relevant_settings))`` where
+            ``relevant_settings`` is ``settings_check``-narrowed when declared,
+            else the whole ``settings`` value. Async because a declared
+            ``settings_check`` may be a coroutine. Only configuration is read —
+            never an LLM call. Folding in dependency tags is
+            :func:`phase_tag_resolver.resolve_tags`' job.
+            """
+            relevant = await relevant_settings(
+                {} if settings is None else settings, self.settings_check
             )
-            return None
-        # The same rules as the env path: a non-finite value would never
-        # expire (or break the comparison) and a negative budget is
-        # meaningless, so warn about the bad declared value and fall through.
-        if not math.isfinite(value) or value < 0:
-            log.warning(
-                f"Phase '{self.id}' declares an invalid "
-                f"not_ready_budget_seconds {declared!r}; ignoring it and "
-                "falling back to the generic budget."
-            )
-            return None
-        return value
-
-    @property
-    def name(self) -> str:
-        """Stable phase name (alias of :attr:`id`)."""
-        return self.id
-
-    def display_label(self) -> str:
-        """Human-readable label for this phase.
-
-        Returns :attr:`label` when declared, else :attr:`id`. The label is
-        display-only: clients localize by ``id`` and the machine never uses
-        the label as a key.
-        """
-        return self.label or self.id
-
-    @abstractmethod
-    async def applies_to(self, cat, deps_state) -> tuple[bool, str | None]:
-        """Whether this phase applies, with an optional human-readable reason."""
-
-    @abstractmethod
-    async def process(self, source: str, cat) -> PhaseResult:
-        """Run the phase body for ``source``."""
-
-    @abstractmethod
-    async def delete(self, source: str, cat) -> None:
-        """Delete ONLY the artifacts this phase produced for ``source``.
-
-        Must raise when the phase has no cleanup implementation: a silent
-        no-op would let recovery delete data blindly.
-        """
-
-    async def tag(self, settings: Any = None) -> str:
-        """Detached identity of this phase's OWN material configuration.
-
-        ``sha256(kind + ":" + canonical_json(relevant_settings))`` where
-        ``relevant_settings`` is ``settings_check``-narrowed when declared,
-        else the whole ``settings`` value. Async because a declared
-        ``settings_check`` may be a coroutine. Only configuration is read —
-        never an LLM call. Folding in dependency tags is
-        :func:`phase_tag_resolver.resolve_tags`' job.
-        """
-        relevant = await relevant_settings(
-            {} if settings is None else settings, self.settings_check
-        )
-        return own_tag(self.id, relevant)
-
+            return own_tag(self.id, relevant)
 
 #: The built-in phase DAG. ``parsing_chunking`` depends only on the chunker
 #: settings; ``embedding`` depends on the embedder settings AND the recorded
