@@ -1,10 +1,9 @@
-"""Final-wave findings (N1/N3/N4 + download lease) owned by the plugin.
+"""Final-wave findings (N1/N3/N4 + download lease + the real chunker route).
 
-Moved out of the core suite: these cases exercise the plugin's lease/heartbeat
-logic and the generic Redis CRUD layer only, with fake cats. The chunker-change
-case that drives the REAL ``PUT /chunking/settings`` route stays in core
-(``grinning-cat-core/tests/effing/test_final_wave_findings.py``) because it
-needs the full host boot (secure_client / cheshire_cat / lizard).
+Owned by the plugin. The lease/heartbeat/NX cases run with fake cats and the
+generic Redis CRUD layer; the chunker-change case drives the REAL
+``PUT /chunking/settings`` route and the real engine re-run on a full
+``CheshireCat``/``BillTheLizard`` boot, so all of them now live here together.
 
 Standalone and import-safe: the entire body lives under
 ``if __name__ == "__main__":``. Run from the core checkout::
@@ -15,10 +14,11 @@ Standalone and import-safe: the entire body lives under
 if __name__ == "__main__":
     import asyncio
     import time
+    from io import BytesIO
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    from _testkit import bootstrap, new_agent_id, run, teardown
+    from _testkit import bootstrap, new_agent_id, run_with_host, teardown
 
     bootstrap()
     from cat.db import crud
@@ -32,20 +32,18 @@ if __name__ == "__main__":
         set_status,
         status_key,
     )
+    from cat.db.cruds import settings as crud_settings
+    from cat.db.models import Setting
     from cat.services.memory.models import VectorMemoryType
-
 
     def _agent_id() -> str:
         return new_agent_id()
 
-
     async def _seed_master_key(agent_id: str) -> None:
         await crud.store(f"agents:{agent_id}:agent", [{"name": "x", "value": 1}])
 
-
     async def _drop(agent_id: str) -> None:
         await teardown([agent_id])
-
 
     async def _age_doc(agent_id: str, scope: str, source: str, *, age: float, **fields) -> None:
         """Rewrite a status row's ``updated_at`` (and extra fields) to a chosen age."""
@@ -58,11 +56,9 @@ if __name__ == "__main__":
         doc.update(fields)
         await crud.store(key, doc)
 
-
     # ---------------------------------------------------------------------------
     # B2 — active download lease/heartbeat
     # ---------------------------------------------------------------------------
-
 
     async def test_active_download_heartbeat_prevents_stealing_but_stale_row_is_claimed():
         """A live download writer keeps the row fresh; a dead one ages out."""
@@ -104,11 +100,9 @@ if __name__ == "__main__":
         finally:
             await _drop(agent)
 
-
     # ---------------------------------------------------------------------------
     # N1 — lost NX create is detected
     # ---------------------------------------------------------------------------
-
 
     async def test_store_nx_detects_a_lost_create():
         """The second ``nx=True`` store must report the lost create as ``None``."""
@@ -122,11 +116,9 @@ if __name__ == "__main__":
         finally:
             await _drop(agent)
 
-
     # ---------------------------------------------------------------------------
     # N3 — resume_created lease is finite when the claim gate is disabled
     # ---------------------------------------------------------------------------
-
 
     async def test_resume_created_row_is_reclaimed_after_its_lease():
         """With ``stale_after=0`` a crashed no-doc claim must not be refused forever."""
@@ -151,11 +143,9 @@ if __name__ == "__main__":
         finally:
             await _drop(agent)
 
-
     # ---------------------------------------------------------------------------
     # N4 — batch/recovery pass starts and stops the heartbeat
     # ---------------------------------------------------------------------------
-
 
     class _RecordingPluginManager:
         def __init__(self):
@@ -168,7 +158,6 @@ if __name__ == "__main__":
             elif name == "rabbithole_processing_heartbeat_stop":
                 self.stopped.append(args)
             return None
-
 
     async def test_reembed_sources_heartbeats_the_claimed_source():
         """``reembed_sources`` (batch/recovery path) brackets the work with a heartbeat."""
@@ -222,7 +211,6 @@ if __name__ == "__main__":
         finally:
             await _drop(agent)
 
-
     _tests = [
         test_active_download_heartbeat_prevents_stealing_but_stale_row_is_claimed,
         test_store_nx_detects_a_lost_create,
@@ -230,4 +218,82 @@ if __name__ == "__main__":
         test_reembed_sources_heartbeats_the_claimed_source,
     ]
 
-    run(_tests)
+    _LONG_TEXT = ("The quick brown fox jumps over the lazy dog. " * 120).strip()
+
+    def build(host):
+        async def test_chunker_change_through_the_real_route_reruns_parsing():
+            """Change the chunker via ``PUT /chunking/settings`` and re-run the
+            engine: the phase marker must read the same agent scope, the engine
+            really re-parses and the stored point count changes."""
+            with patch("cat.routes.chunker.run_background_task", lambda *a, **k: None):
+                agent_key = host.agent_id
+                await host.lizard.create_cheshire_cat(agent_key)
+
+                # The default file manager is the no-op Dummy one; a real
+                # LocalFileManager is needed for the re-embed pass to find the
+                # stored source on disk.
+                await crud_settings.upsert_setting_by_category(
+                    agent_key,
+                    Setting(name="LocalFileManagerConfig", value={}, category="file_manager"),
+                )
+                ccat = await host.lizard.get_cheshire_cat(agent_key)
+
+                engine = reembed.EfficientIngestionEngine()
+                source = "final-wave-chunker.txt"
+
+                async def point_count() -> int:
+                    points, _ = await ccat.vector_memory_handler.get_all_tenant_points(
+                        str(VectorMemoryType.DECLARATIVE), with_vectors=False
+                    )
+                    return sum(
+                        1
+                        for p in points
+                        if (p.payload or {}).get("metadata", {}).get("source") == source
+                    )
+
+                async def put_chunk_size(size: int) -> None:
+                    res = await host.client.put(
+                        "/chunking/settings/RecursiveTextChunkerSettings",
+                        headers=host.headers,
+                        json={
+                            "encoding_name": "cl100k_base",
+                            "chunk_size": size,
+                            "chunk_overlap": 0,
+                        },
+                    )
+                    assert res.status_code == 200, res.text
+                    current = await crud_settings.get_settings_by_category(agent_key, "chunker")
+                    assert current["value"]["chunk_size"] == size
+
+                await put_chunk_size(32)
+                # Re-resolve the cat: its services are snapshotted at creation.
+                ccat = await host.lizard.get_cheshire_cat(agent_key)
+                assert ccat.chunker._chunk_size == 32
+                await engine.ingest_file(
+                    ccat, BytesIO(_LONG_TEXT.encode()), source, content_type="text/plain"
+                )
+                first = await point_count()
+                assert first > 1, f"expected several chunks at chunk_size=32, got {first}"
+
+                doc = await get_status(agent_key, "agent", source)
+                assert doc is not None and doc.get("status") == IngestionStatus.COMPLETED.value
+                first_marker = doc["completed_phases"]["parsing_chunking"]["marker"]
+                assert first_marker is not None
+
+                # Real route change -> parsing phase must be re-run by the engine.
+                await put_chunk_size(128)
+                assert await engine.run(host.lizard) is True
+
+                second = await point_count()
+                assert second < first, (
+                    f"a larger chunk_size must produce fewer points ({second} !< {first}); "
+                    "the chunker change was not detected through the real route"
+                )
+
+                doc = await get_status(agent_key, "agent", source)
+                assert doc.get("status") == IngestionStatus.COMPLETED.value
+                assert doc["completed_phases"]["parsing_chunking"]["marker"] != first_marker
+
+        return list(_tests) + [test_chunker_change_through_the_real_route_reruns_parsing]
+
+    run_with_host(build)

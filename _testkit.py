@@ -335,6 +335,32 @@ async def teardown(agent_ids) -> None:
         await crud.destroy(f"agents:{agent_id}:*")
 
 
+async def _execute_tests(tests) -> tuple[int, int, list[tuple[str, BaseException, str]]]:
+    """Run ``tests`` in the *current* event loop, printing one line per test."""
+    passed = 0
+    failures: list[tuple[str, BaseException, str]] = []
+    for test in tests:
+        name = getattr(test, "__name__", repr(test))
+        try:
+            result = test()
+            if hasattr(result, "__await__"):
+                await result
+        except BaseException as exc:  # noqa: BLE001 - report every failure
+            failures.append((name, exc, traceback.format_exc()))
+            print(f"FAIL {name}: {type(exc).__name__}: {exc}")
+        else:
+            passed += 1
+            print(f"PASS {name}")
+    return passed, len(list(tests)), failures
+
+
+def _report(passed: int, total: int, failures) -> None:
+    for name, _exc, tb in failures:
+        print(f"\n--- {name} ---\n{tb}")
+    print(f"{passed}/{total} passed")
+    sys.exit(0 if passed == total else 1)
+
+
 def run(main) -> None:
     """Run ``main`` (a list/tuple of async test callables) in ONE event loop.
 
@@ -343,28 +369,188 @@ def run(main) -> None:
     is a process singleton.
     """
     tests = list(main)
-    passed = 0
-    failures: list[tuple[str, BaseException, str]] = []
+    passed, total, failures = asyncio.run(_execute_tests(tests))
+    _report(passed, total, failures)
 
-    async def _run_all():
-        nonlocal passed
-        for test in tests:
-            name = getattr(test, "__name__", repr(test))
+
+# ---------------------------------------------------------------------------
+# Real-host runner
+# ---------------------------------------------------------------------------
+
+
+def _redis_client():
+    """A short-lived synchronous client on the dedicated db (read/delete only)."""
+    from redis import Redis
+
+    from cat.db.database import get_redis_kwargs
+
+    kwargs = get_redis_kwargs()
+    return Redis(
+        host=kwargs["host"],
+        port=kwargs["port"],
+        db=DEDICATED_REDIS_DB,
+        password=kwargs.get("password"),
+        ssl=kwargs.get("ssl", False),
+        decode_responses=True,
+    )
+
+
+def _snapshot_dedicated_db() -> set[str]:
+    """Return the key set currently living in the dedicated db."""
+    client = _redis_client()
+    try:
+        return {str(key) for key in client.scan_iter(match="*")}
+    finally:
+        client.close()
+
+
+def _restore_dedicated_db(before: set[str]) -> None:
+    """Delete only the keys a host run created, leaving the prior state intact.
+
+    Booting the real app writes ``system:*`` and ``agents:<id>:*`` keys. They
+    are removed here by diffing against :func:`_snapshot_dedicated_db`, so the
+    db the strict :func:`_guard_db_is_ours` proves at the next bootstrap stays
+    exactly as this run found it. Scoped deletion — never ``flushdb``.
+    """
+    client = _redis_client()
+    try:
+        current = {str(key) for key in client.scan_iter(match="*")}
+        created = sorted(current - before)
+        if created:
+            client.delete(*created)
+    finally:
+        client.close()
+
+
+def run_with_host(build, *, agent_id: str = "agent_test") -> None:
+    """Boot the real host app once, then run the tests ``build(host)`` returns.
+
+    For the suites that genuinely need the live ``CheshireCat``/``BillTheLizard``
+    boot, the real routes and dispatcher, and a real (in-memory) vector store.
+    The same Redis-isolation contract as :func:`bootstrap` applies: ``CAT_REDIS_DB``
+    is forced to :data:`DEDICATED_REDIS_DB` **before** importing ``cat``, the db is
+    guarded, and no ``flushdb`` is ever issued — the run's own keys are removed by
+    diffing the key set.
+
+    ``build(host)`` is called while the app is live and must return the list of
+    zero-argument test callables (they may close over ``host``). ``host`` exposes
+    ``lizard``, ``client`` (async httpx over the ASGI app), ``headers``,
+    ``agent_id``, ``core_root``, ``memory_client`` and ``new_agent_id``.
+    """
+    _force_test_env()
+    os.environ.setdefault("CAT_API_KEY", "meow_http")
+    _guard_dedicated_db()
+    before = _snapshot_dedicated_db()
+
+    async def _amain():
+        from contextlib import ExitStack
+        from inspect import iscoroutinefunction
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from asgi_lifespan import LifespanManager
+        from httpx import ASGITransport, AsyncClient
+        from qdrant_client import AsyncQdrantClient
+
+        from cat import utils
+        from cat.auth import auth_utils
+        from cat.looking_glass.mad_hatter.plugin import Plugin
+        from cat.routes import routes_utils
+        from cat.services.factory.vector_db import QdrantHandler
+        from cat.startup import create_app
+
+        core_root = Path(utils.__file__).resolve().parent.parent
+        memory_client = AsyncQdrantClient(":memory:")
+        stack = ExitStack()
+        try:
+
+            def _mock_qdrant_init(self, *args, **kwargs):
+                super(QdrantHandler, self).__init__()
+                self._client = memory_client
+                self.save_memory_snapshots = kwargs.get("save_memory_snapshots", False)
+
+            stack.enter_context(patch.object(QdrantHandler, "__init__", _mock_qdrant_init))
+            stack.enter_context(patch.object(QdrantHandler, "close", lambda self: None))
+            stack.enter_context(
+                patch.object(
+                    utils,
+                    "get_plugins_path",
+                    lambda: str(core_root / "tests/mocks/mock_plugin_folder") + "/",
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    utils,
+                    "get_file_manager_root_storage_path",
+                    lambda: str(core_root / "tests/data/storage"),
+                )
+            )
+
+            async def _noop_install_requirements(self):
+                return None
+
+            stack.enter_context(
+                patch.object(Plugin, "_install_requirements", _noop_install_requirements)
+            )
+            stack.enter_context(
+                patch.object(
+                    auth_utils, "extract_agent_id_from_request", lambda *a, **k: agent_id
+                )
+            )
+
+            async def _immediate_task(background_tasks, func, *args, **kwargs):
+                if iscoroutinefunction(func):
+                    await func(*args, **kwargs)
+                else:
+                    func(*args, **kwargs)
+
+            stack.enter_context(
+                patch.object(routes_utils, "run_background_task", _immediate_task)
+            )
+
+            utils.singleton.instances.clear()
+            app = create_app()
+            async with LifespanManager(app):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    client._fastapi_test_app = app
+                    host = SimpleNamespace(
+                        app=app,
+                        lizard=app.state.lizard,
+                        client=client,
+                        memory_client=memory_client,
+                        agent_id=agent_id,
+                        headers={
+                            "X-Agent-ID": agent_id,
+                            "Authorization": "Bearer meow_http",
+                        },
+                        core_root=core_root,
+                        new_agent_id=new_agent_id,
+                    )
+                    tests = build(host)
+                    if hasattr(tests, "__await__"):
+                        tests = await tests
+                    return await _execute_tests(list(tests))
+        finally:
+            stack.close()
+            utils.singleton.instances.clear()
             try:
-                result = test()
-                if hasattr(result, "__await__"):
-                    await result
-            except BaseException as exc:  # noqa: BLE001 - report every failure
-                failures.append((name, exc, traceback.format_exc()))
-                print(f"FAIL {name}: {type(exc).__name__}: {exc}")
-            else:
-                passed += 1
-                print(f"PASS {name}")
+                collections = await memory_client.get_collections()
+                for collection in collections.collections:
+                    await memory_client.delete_collection(collection.name)
+            except Exception:  # noqa: BLE001 - cleanup must not hide the outcome
+                pass
+            await memory_client.close()
 
-    asyncio.run(_run_all())
+    try:
+        passed, total, failures = asyncio.run(_amain())
+    except BaseException as exc:  # noqa: BLE001 - report boot/teardown failures
+        traceback.print_exc()
+        _restore_dedicated_db(before)
+        print(f"FAIL host boot: {type(exc).__name__}: {exc}")
+        print("0/1 passed")
+        sys.exit(1)
 
-    for name, _exc, tb in failures:
-        print(f"\n--- {name} ---\n{tb}")
-    total = len(tests)
-    print(f"{passed}/{total} passed")
-    sys.exit(0 if passed == total else 1)
+    _restore_dedicated_db(before)
+    _report(passed, total, failures)

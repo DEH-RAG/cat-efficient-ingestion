@@ -246,14 +246,14 @@ Settings live in the global `system:agent` store, category `ingestion`:
 
 <h2>🧪 Tests</h2>
 
-Behaviour suites that do not need the whole host app live in this repo as
-**import-safe standalone scripts**. The host imports **every** `.py` file
-inside a plugin folder recursively when it activates the plugin, so each script
-keeps its entire body (imports included) under `if __name__ == "__main__":`;
-importing it at activation executes nothing. There is no `conftest.py` here.
+This repository owns its whole test suite as **import-safe standalone
+scripts**. The host imports **every** `.py` file inside a plugin folder
+recursively when it activates the plugin, so each script keeps its entire body
+(imports included) under `if __name__ == "__main__":`; importing it at
+activation executes nothing. There is no `conftest.py` here.
 
-Run one from the core checkout (the scripts force `CAT_REDIS_DB=1` before
-importing `cat`, and use the host's Redis connection):
+Run one from the core checkout (the harness forces the dedicated test Redis db
+and uses the host's Redis connection; RedisJSON is required):
 
 ```bash
 cd grinning-cat-core
@@ -269,79 +269,68 @@ Plugin-local standalone scripts:
 `test_ingestion_safety_fixes.py` family, and the suites handed over from the
 core checkout:
 
-`test_ingestion_status_phases.py` (registry + `completed_phases` diary),
-`test_final_wave_findings.py` (download lease, NX create, resume lease,
-batch heartbeat), `test_known_blockers.py` (B1 status listing, B3/B3b
-download resumability), `test_round2_findings.py` (NN1-NN3 heartbeat/lease),
-`test_plugin_dependency_metadata.py` (manifest + pyproject self-consistency),
-and `test_maintenance_coordination.py` (the CLI/maintenance-marker contract
-with MyGRAPH, moved here from the MyGRAPH repo; it drives the real MyGRAPH
-`maintenance_agent`, so point `MYGRAPH_PLUGIN_DIR` at that checkout if it is
-not a sibling).
+- `test_ingestion_status_phases.py` (registry + `completed_phases` diary)
+- `test_final_wave_findings.py` (download lease, NX create, resume lease,
+  batch heartbeat, and the real `PUT /chunking/settings` chunker change)
+- `test_known_blockers.py` (B1 status listing, B2/B2b markers, B3/B3b download
+  resumability, B4 completion veto)
+- `test_round2_findings.py` (NN1-NN3 heartbeat/lease, BN1/NN4 two-agent
+  concurrency)
+- `test_plugin_dependency_metadata.py` (manifest + pyproject self-consistency,
+  host-side `Plugin.missing_dependencies` / `lizard` load, `min_cat_version`
+  pin)
+- `test_efficient_ingestion_installation.py` (system-only plugin contract and
+  the phase-hook guard)
+- `test_efficient_ingestion.py` (ServiceFactory selection and the real
+  `/ingestion/settings` routes)
+- `test_store_hook_once.py` (real hook dispatcher + engine on a real cat)
+- `test_url_source_persistence.py` (real `CheshireCat`, file manager and vector
+  store for URL byte persistence)
+- `test_maintenance_coordination.py` (the CLI/maintenance-marker contract with
+  MyGRAPH; point `MYGRAPH_PLUGIN_DIR` at that checkout if it is not a sibling)
 
-### Phase-contract testkit
+The fixture-based host suites listed above now live here too: the old
+`grinning-cat-core/tests/effing/` directory is gone.
+
+### Test harness
+
+`_testkit.py` is import-safe (no `cat` import, no env or Redis access at import;
+the host imports it at activation) and provides:
+
+- `bootstrap()` — forces `CAT_REDIS_DB=15` **before** importing `cat`, then
+  refuses to continue unless the *resolved* Redis db (env and, if present, the
+  live connection pool) is the dedicated test db and the db holds only this
+  suite's `agents:effingtest*` keys (the data-loss guard);
+- `run_with_host(build)` — boots the REAL host app (`create_app` + lifespan,
+  in-memory Qdrant, the plugin path/file-manager/loader doubles the core
+  `conftest.py` used) once, then runs the tests `build(host)` returns. Same
+  db-15 guard as `bootstrap`; it never flushes, and on exit deletes only the
+  keys its own run created by diffing the key set, so the db is left exactly
+  as it was found. `host` exposes `lizard`, an async `client`, `headers`,
+  `agent_id`, `core_root` and `memory_client`;
+- `teardown(agent_ids)` — deletes only `agents:<id>:*` for the ids a test
+  created (never `flushdb`/`flushall`);
+- `run([...])` — executes the tests in one event loop and prints `N/M passed`,
+  exiting non-zero on failure.
 
 `effing_testkit.py` is the single published copy of EffING's phase-contract
 doubles for the other plugins: `PhaseSpec`, `PhaseResult`, `IngestionPhase`,
 `make_diary_entry`, and `install_stub_package()` / `uninstall_stub_package()`,
 which register and remove the synthetic
 `cat.core_plugins.cat_efficient_ingestion` package (plus `.phases` and
-`.split`) for a bare checkout. It is import-safe (no `cat` import, no env or
-Redis access at import), the installer prefers a real installation and is
-idempotent, and `uninstall` restores the exact previous `sys.modules` state.
+`.split`) for a bare checkout. It is import-safe, the installer prefers a real
+installation and is idempotent, and `uninstall` restores the exact previous
+`sys.modules` state.
 
-
-Those five share ONE import-safe harness, `_testkit.py` (also imported by the
-host at activation, hence side-effect free):
-
-- `bootstrap()` forces `CAT_REDIS_DB=1` **before** importing `cat`, then
-  refuses to continue unless the *resolved* Redis db (env and, if present, the
-  live connection pool) is the dedicated test db — the data-loss guard;
-- `teardown(agent_ids)` deletes only `agents:<id>:*` for the ids a test
-  created (never `flushdb`/`flushall`);
-- `run([...])` executes the tests in one event loop and prints `N/M passed`,
-  exiting non-zero on failure.
-
-Run any of them from the core checkout (RedisJSON is required; without an
-explicit `CAT_REDIS_HOST` the harness resolves the dev `redis-stack` container,
-falling back to `localhost`):
-
-```bash
-cd grinning-cat-core
-.venv/bin/python /path/to/plugins/cat-efficient-ingestion/test_ingestion_status_phases.py
-```
-
-The plugin owns its test suite: the standalone, import-safe scripts above are
-the authoritative plugin checks and run without the host app. The tests that
-need the host pytest fixtures (`lizard`, `secure_client`, `cheshire_cat`,
-`stray`, …) and the real app/Redis/Qdrant harness are a deliberate cross-repo
-integration exception: they stay in `grinning-cat-core/tests/effing/` and run
-from the MyCAT integration checkout, not from this plugin:
-
-- `test_efficient_ingestion_installation.py` — BillTheLizard startup validation
-  and system-only plugin contract.
-- `test_efficient_ingestion.py` — ServiceFactory selection and
-  `/ingestion/settings` routes.
-- `test_store_hook_once.py` — real hook dispatcher + engine on a real cat.
-- `test_url_source_persistence.py` — real `CheshireCat`, file manager and
-  vector store for URL byte persistence.
-- `test_final_wave_findings.py` — the one chunker-change case through the real
-  `PUT /chunking/settings` route.
-- `test_known_blockers.py` — B2/B2b (real `CheshireCat` settings) and B4 (real
-  dispatcher via `StrayCat`).
-- `test_round2_findings.py` — the concurrent two-agent chunker isolation case
-  (needs a real `lizard`).
-- `test_plugin_dependency_metadata.py` — host-side loader
-  (`Plugin.missing_dependencies`, `lizard` load) and the `min_cat_version` pin.
-
-```bash
-CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
-```
+The suite is hermetic on the shared stores: Redis uses the dedicated db 15
+(guarded, scoped cleanup, never a flush) and Qdrant is an in-memory client, so
+no external vector store is touched. `fixtures/` holds the stub phase-consumer
+used by `test_phase_extension_contract.py`.
 
 Do not add a `conftest.py` under this plugin: it would be imported at
 activation. A new plugin-local test must be a fully import-safe standalone
-script; if it needs the host app fixtures, add it to
-`grinning-cat-core/tests/effing/` instead.
+script; if it needs the real host app, write it under `run_with_host(build)`.
+
 
 <h2>🛠️ Installation:</h2>
 

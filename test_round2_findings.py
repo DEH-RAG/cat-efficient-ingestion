@@ -1,9 +1,12 @@
-"""Round-2 heartbeat/lease findings (NN1-NN3) owned by the plugin.
+"""Round-2 heartbeat/lease findings (NN1-NN3) and the two-agent concurrency case.
 
-Moved out of the core suite: the ``resume_created`` URL lease, the hook-level
-download heartbeat bound, heartbeat replacement and tick resilience all run
-against the plugin with fake cats and standard Redis CRUD. The concurrent
-two-agent case (BN1/NN4) stays in core because it needs the real ``lizard``.
+- **NN1-NN3**: ``resume_created`` URL lease, the hook-level download heartbeat
+  bound, heartbeat replacement and tick resilience — fake cats + Redis CRUD.
+- **BN1/NN4**: two real ``CheshireCat`` instances ingest at once; each source
+  must be chunked by its own agent's chunker. Needs the real ``lizard``, real
+  chunker services and a barrier inside both split steps.
+
+All owned by the plugin; the whole suite boots the real host app.
 
 Standalone and import-safe: the entire body lives under
 ``if __name__ == "__main__":``. Run from the core checkout::
@@ -16,12 +19,14 @@ if __name__ == "__main__":
     import time
     from unittest.mock import patch
 
-    from _testkit import bootstrap, new_agent_id, run, teardown
+    from _testkit import bootstrap, new_agent_id, run_with_host, teardown
 
     bootstrap()
     from cat.db import crud
 
+    from cat.core_plugins.cat_efficient_ingestion import hooks
     from cat.core_plugins.cat_efficient_ingestion import plugin as ingestion_plugin
+    from cat.core_plugins.cat_efficient_ingestion import reembed
     from cat.core_plugins.cat_efficient_ingestion.registry import (
         IngestionStatus,
         claim_source_for_resume,
@@ -29,19 +34,19 @@ if __name__ == "__main__":
         set_status,
         status_key,
     )
-
+    from cat.db.cruds import settings as crud_settings
+    from cat.db.models import Setting
+    from cat.services.factory.embedder import embedding_size
+    from cat.services.memory.models import VectorMemoryType
 
     def _agent_id() -> str:
         return new_agent_id()
 
-
     async def _seed_master_key(agent_id: str) -> None:
         await crud.store(f"agents:{agent_id}:agent", [{"name": "x", "value": 1}])
 
-
     async def _drop(agent_id: str) -> None:
         await teardown([agent_id])
-
 
     async def _age_doc(agent_id: str, scope: str, source: str, *, age: float, **fields) -> None:
         key = status_key(agent_id, scope, source)
@@ -53,11 +58,9 @@ if __name__ == "__main__":
         doc.update(fields)
         await crud.store(key, doc)
 
-
     # ---------------------------------------------------------------------------
     # NN1 — the resume_created lease covers URL rows that flip out of PROCESSING
     # ---------------------------------------------------------------------------
-
 
     async def test_resume_created_lease_covers_a_url_row_out_of_processing():
         """A live URL row (DOWNLOADING) created by the no-doc path is not stolen."""
@@ -87,18 +90,15 @@ if __name__ == "__main__":
         finally:
             await _drop(agent)
 
-
     # ---------------------------------------------------------------------------
     # NN2 — the download heartbeat bound at the HOOK level
     # ---------------------------------------------------------------------------
-
 
     class _HookCat:
         """Minimal agent-scoped hook caller (no ``id`` -> agent scope)."""
 
         def __init__(self, agent_key: str):
             self.agent_key = agent_key
-
 
     async def test_download_hook_heartbeat_stops_at_its_bound():
         """``rabbithole_url_downloading`` bounds the heartbeat so a dead download ages out."""
@@ -123,7 +123,9 @@ if __name__ == "__main__":
                 stopped_at = (await get_status(agent, "agent", source))["updated_at"]
                 await asyncio.sleep(0.05)
                 after = (await get_status(agent, "agent", source))["updated_at"]
-                assert after == stopped_at, "the bounded download heartbeat kept refreshing after its bound"
+                assert after == stopped_at, (
+                    "the bounded download heartbeat kept refreshing after its bound"
+                )
                 assert stopped_at >= first
 
                 # The row now ages out and becomes resumable.
@@ -138,11 +140,9 @@ if __name__ == "__main__":
             )
             await _drop(agent)
 
-
     # ---------------------------------------------------------------------------
     # NN3 — replacing a heartbeat awaits the cancelled task; a raising tick is safe
     # ---------------------------------------------------------------------------
-
 
     async def test_start_heartbeat_awaits_the_replaced_task():
         """The old heartbeat must be fully unwound before the replacement is installed."""
@@ -171,7 +171,6 @@ if __name__ == "__main__":
         finally:
             await ingestion_plugin._cancel_heartbeat(agent, "agent", source)
 
-
     async def test_heartbeat_tick_never_raises():
         """A transient store error in one tick must not kill the heartbeat."""
         agent = _agent_id()
@@ -197,10 +196,137 @@ if __name__ == "__main__":
                 except asyncio.CancelledError:
                     pass
 
-
-    run([
+    _tests = [
         test_resume_created_lease_covers_a_url_row_out_of_processing,
         test_download_hook_heartbeat_stops_at_its_bound,
         test_start_heartbeat_awaits_the_replaced_task,
         test_heartbeat_tick_never_raises,
-    ])
+    ]
+
+    # ---------------------------------------------------------------------------
+    # BN1 / NN4 — concurrent two-agent re-embed uses each agent's own chunker
+    # ---------------------------------------------------------------------------
+
+    _LONG_TEXT = ("The quick brown fox jumps over the lazy dog. " * 100).strip()
+
+    def build(host):
+        async def _put_chunk_size(agent_id: str, size: int) -> None:
+            await crud_settings.upsert_setting_by_category(
+                agent_id,
+                Setting(
+                    name="RecursiveTextChunkerSettings",
+                    value={"encoding_name": "cl100k_base", "chunk_size": size, "chunk_overlap": 0},
+                    category="chunker",
+                ),
+            )
+
+        async def _point_count(ccat, source: str) -> int:
+            points, _ = await ccat.vector_memory_handler.get_all_tenant_points(
+                str(VectorMemoryType.DECLARATIVE), with_vectors=False
+            )
+            return sum(
+                1
+                for p in points
+                if (p.payload or {}).get("metadata", {}).get("source") == source
+            )
+
+        async def _marker(phase: str, cat) -> object:
+            result = hooks.ingestion_phase_settings_marker.function(phase, cat)
+            return await result if hasattr(result, "__await__") else result
+
+        async def test_concurrent_two_agent_ingestion_uses_each_agents_chunker():
+            """Both agents ingest at once; each source must be chunked by its own
+            agent. The two chunkers are held at an ``asyncio.Barrier`` inside the
+            split step, so both phase machines are provably inside chunking at
+            the same time. With a shared-``RabbitHole`` mutation whichever
+            ``setup`` ran last would win and BOTH sources would get the same
+            chunker."""
+            lizard = host.lizard
+            agent_a = _agent_id()
+            agent_b = _agent_id()
+            source_a = "concurrent-a.txt"
+            source_b = "concurrent-b.txt"
+            engine = reembed.EfficientIngestionEngine()
+            ccat_a = None
+            ccat_b = None
+            try:
+                ccat_a = await lizard.create_cheshire_cat(agent_a)
+                ccat_b = await lizard.create_cheshire_cat(agent_b)
+                await _put_chunk_size(agent_a, 32)
+                await _put_chunk_size(agent_b, 256)
+                # Services are snapshotted at creation: re-resolve to apply the
+                # chunker settings written above, then re-initialize the (fresh)
+                # vector handler so it sees the collections created by
+                # ``create_cheshire_cat``.
+                ccat_a = await lizard.get_cheshire_cat(agent_a)
+                ccat_b = await lizard.get_cheshire_cat(agent_b)
+                embedder = await lizard.embedder()
+                size = await embedding_size(embedder)
+                await ccat_a.vector_memory_handler.initialize(embedder.name, size)
+                await ccat_b.vector_memory_handler.initialize(embedder.name, size)
+                assert ccat_a.chunker._chunk_size == 32
+                assert ccat_b.chunker._chunk_size == 256
+
+                # Hold both split steps at the same barrier: the old code has
+                # already mutated the shared RabbitHole by the time it reaches
+                # the split.
+                barrier = asyncio.Barrier(2)
+
+                def _barriered(chunker):
+                    original = chunker.split_documents
+
+                    async def split_documents(docs):
+                        await barrier.wait()
+                        return await original(docs)
+
+                    chunker.split_documents = split_documents
+
+                _barriered(ccat_a.chunker)
+                _barriered(ccat_b.chunker)
+
+                await asyncio.gather(
+                    engine.ingest_file(
+                        ccat_a, _LONG_TEXT.encode(), source_a, content_type="text/plain"
+                    ),
+                    engine.ingest_file(
+                        ccat_b, _LONG_TEXT.encode(), source_b, content_type="text/plain"
+                    ),
+                )
+
+                count_a = await _point_count(ccat_a, source_a)
+                count_b = await _point_count(ccat_b, source_b)
+                assert count_a > 1 and count_b > 1
+                # The 32-token chunker must produce many more chunks than the 256 one.
+                assert count_a > count_b * 2, (
+                    f"agent A (32) and agent B (256) produced {count_a}/{count_b} chunks: "
+                    "an agent was chunked with the other agent's chunker"
+                )
+
+                doc_a = await get_status(agent_a, "agent", source_a)
+                doc_b = await get_status(agent_b, "agent", source_b)
+                assert doc_a["status"] == IngestionStatus.COMPLETED.value
+                assert doc_b["status"] == IngestionStatus.COMPLETED.value
+                assert (
+                    doc_a["completed_phases"]["parsing_chunking"]["marker"]
+                    == await _marker("parsing_chunking", ccat_a)
+                )
+                assert (
+                    doc_b["completed_phases"]["parsing_chunking"]["marker"]
+                    == await _marker("parsing_chunking", ccat_b)
+                )
+                # NN4: the shared RabbitHole was never mutated.
+                assert lizard.rabbit_hole.cat is not ccat_a
+                assert lizard.rabbit_hole.cat is not ccat_b
+            finally:
+                for cat in (ccat_a, ccat_b):
+                    if cat is not None:
+                        try:
+                            await cat.destroy()
+                        except Exception:  # noqa: BLE001 - best-effort cleanup
+                            pass
+                await _drop(agent_a)
+                await _drop(agent_b)
+
+        return list(_tests) + [test_concurrent_two_agent_ingestion_uses_each_agents_chunker]
+
+    run_with_host(build)
