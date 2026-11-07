@@ -379,3 +379,19 @@ them:
    3's message but is a real refactor: it extracted the tag resolver. It is
    present on the remote and was not rewritten. Read it as a refactor, not as
    the phase-3 behaviour change its message describes.
+
+## 10. Core ingestion ABCs
+
+`profile.py` implements the core ingestion contract: `EfficientPhaseDagPipeline`,
+`EfficientStateStore`, `EfficientRecovery`, `EfficientLockManager` and
+`EfficientTagResolver` subclass the ABCs in `cat.services.ingestion`, and
+`EfficientIngestionConfiguration` exposes them through
+`BaseIngestionConfiguration.profile()`. The classes delegate to this plugin's
+existing phase machine, registry, recovery loop, locks and tag resolver — no
+ingestion algorithm is reimplemented there.
+
+The pipeline's `delete(source, cat, scope)` delegates to the existing
+`phases.delete_file`, which already enforces the artifacts → file → status-row-last
+order. Per-phase restart and recovery stay plugin-private; the core exposes no
+restart and documents the profile contract in its own `AGENTS.md` (section
+*Ingestion profile*).
