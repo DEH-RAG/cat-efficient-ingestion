@@ -155,6 +155,10 @@ class FakeCheshireCat:
         return False
 
 
+#: A StrayCat is the agent-scoped view of a CheshireCat; reuse the fake.
+FakeStrayCat = FakeCheshireCat
+
+
 class FakeLizard:
     """Minimal BillTheLizard stand-in: hands out fake cats by agent key."""
 
@@ -240,6 +244,7 @@ def bootstrap() -> SimpleNamespace:
         new_agent_id=new_agent_id,
         FakePluginManager=FakePluginManager,
         FakeCheshireCat=FakeCheshireCat,
+        FakeStrayCat=FakeStrayCat,
         FakeLizard=FakeLizard,
         FakeHandler=FakeHandler,
         client=_build_test_client(),
