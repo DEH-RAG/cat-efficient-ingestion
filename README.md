@@ -110,7 +110,7 @@ A plugin that exposes an ingestion phase depends on EffING **optionally** and fo
 3. **Define the phase hooks only when the import succeeded** (or make them no-ops when `PhaseSpec is None`): `ingestion_phase_specs`, `ingestion_phase_settings_marker`, `ingestion_phase_run`.
 4. **Keep the classic CAT ingestion hooks** (`rabbithole_ingestion_processing`, the `before_rabbithole_*` hooks, …) unconditionally, so **basic ingestion still works when EffING is absent**.
 
-Never require EffING at import time and never make `PhaseSpec` duck-typed: the strict class identity is what guarantees the spec reaches the phase machine. The plugin's own `test_phase_extension_contract.py` (fixture plugin `fixtures/phase_consumer/`) pins this contract, covering both the EffING-present and EffING-blocked imports.
+Never require EffING at import time and never make `PhaseSpec` duck-typed: the strict class identity is what guarantees the spec reaches the phase machine. The plugin's own `tests/test_phase_extension_contract.py` (fixture plugin `tests/fixtures/phase_consumer/`) pins this contract, covering both the EffING-present and EffING-blocked imports.
 
 <h2>🔁 Probe-driven dispatcher</h2>
 
@@ -257,8 +257,11 @@ and uses the host's Redis connection; RedisJSON is required):
 
 ```bash
 cd grinning-cat-core
-CAT_REDIS_HOST=<redis ip> .venv/bin/python /path/to/plugins/cat-efficient-ingestion/test_ingestion_status.py
+CAT_REDIS_HOST=<redis ip> .venv/bin/python /path/to/plugins/cat-efficient-ingestion/tests/test_ingestion_status.py
 ```
+
+Every test artifact lives under `tests/` (standalone `test_*.py` scripts, the
+`_testkit.py` / `effing_testkit.py` harnesses, and `fixtures/`).
 
 Plugin-local standalone scripts:
 
@@ -294,7 +297,7 @@ The fixture-based host suites listed above now live here too: the old
 
 ### Test harness
 
-`_testkit.py` is import-safe (no `cat` import, no env or Redis access at import;
+`tests/_testkit.py` is import-safe (no `cat` import, no env or Redis access at import;
 the host imports it at activation) and provides:
 
 - `bootstrap()` — forces `CAT_REDIS_DB=15` **before** importing `cat`, then
@@ -313,7 +316,7 @@ the host imports it at activation) and provides:
 - `run([...])` — executes the tests in one event loop and prints `N/M passed`,
   exiting non-zero on failure.
 
-`effing_testkit.py` is the single published copy of EffING's phase-contract
+`tests/effing_testkit.py` is the single published copy of EffING's phase-contract
 doubles for the other plugins: `PhaseSpec`, `PhaseResult`, `IngestionPhase`,
 `make_diary_entry`, and `install_stub_package()` / `uninstall_stub_package()`,
 which register and remove the synthetic
@@ -324,7 +327,7 @@ installation and is idempotent, and `uninstall` restores the exact previous
 
 The suite is hermetic on the shared stores: Redis uses the dedicated db 15
 (guarded, scoped cleanup, never a flush) and Qdrant is an in-memory client, so
-no external vector store is touched. `fixtures/` holds the stub phase-consumer
+no external vector store is touched. `tests/fixtures/` holds the stub phase-consumer
 used by `test_phase_extension_contract.py`.
 
 Do not add a `conftest.py` under this plugin: it would be imported at
