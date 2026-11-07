@@ -25,7 +25,7 @@ if __name__ == "__main__":
     os.environ.setdefault("CAT_REDIS_HOST", "localhost")
     os.environ.setdefault("CAT_REDIS_PORT", "6379")
     os.environ.setdefault("CAT_JWT_SECRET", "test_only_jwt_secret_0123456789_abcdefghij")
-    os.environ["CAT_REDIS_DB"] = "1"
+    os.environ["CAT_REDIS_DB"] = "15"
 
     from cat.core_plugins.cat_efficient_ingestion import resume
 

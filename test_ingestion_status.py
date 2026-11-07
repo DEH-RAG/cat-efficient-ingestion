@@ -11,7 +11,7 @@ from the host repository::
     cd /root/git/grinning-cat-core
     .venv/bin/python /root/git/plugins/cat-efficient-ingestion/test_ingestion_status.py
 
-Redis isolation: ``CAT_REDIS_DB=1`` is forced BEFORE importing ``cat``; every
+Redis isolation: ``CAT_REDIS_DB=15`` is forced BEFORE importing ``cat``; every
 key lives under a unique ``agents:effingtest_<uuid>:`` namespace and is
 destroyed after each test.
 """
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     os.environ.setdefault("CAT_REDIS_HOST", "localhost")
     os.environ.setdefault("CAT_REDIS_PORT", "6379")
     os.environ.setdefault("CAT_JWT_SECRET", "test_only_jwt_secret_0123456789_abcdefghij")
-    os.environ["CAT_REDIS_DB"] = "1"
+    os.environ["CAT_REDIS_DB"] = "15"
 
     from cat.core_plugins.cat_efficient_ingestion import plugin as ingestion_plugin
     from cat.core_plugins.cat_efficient_ingestion.registry import (

@@ -12,7 +12,7 @@ Standalone and import-safe: the entire body lives under
     cd /root/git/grinning-cat-core
     .venv/bin/python /root/git/plugins/cat-efficient-ingestion/test_ingestion_status_phases.py
 
-Redis isolation: ``_testkit.bootstrap()`` forces ``CAT_REDIS_DB=1`` before
+Redis isolation: ``_testkit.bootstrap()`` forces ``CAT_REDIS_DB=15`` before
 importing ``cat`` and refuses any other db. Every key lives under the unique
 ``agents:<AGENT>:`` namespace and is destroyed after each test.
 """

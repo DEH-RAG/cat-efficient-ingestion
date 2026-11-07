@@ -11,12 +11,15 @@ the standalone test scripts call from under ``if __name__ == "__main__":``.
 
 Redis safety
 ------------
-``bootstrap()`` forces ``CAT_REDIS_DB=1`` **before importing anything from
-``cat``**. The ``Database`` singleton binds its connection the first time it is
-used, so a bind to the default ``db=0`` (production) would make scoped cleanup
-dangerous. After importing the host, ``bootstrap()`` re-checks the *resolved*
-Redis db (both the env-derived kwargs and, if a client already exists, the live
-connection pool) and raises rather than run against a non-test db.
+Production uses Redis db ``0``, ``1`` and ``2``; the plugin test suite uses the
+dedicated **db 15**. ``bootstrap()`` defaults ``CAT_REDIS_DB`` to 15 **before
+importing anything from ``cat``**. The ``Database`` singleton binds its
+connection the first time it is used, so a bind to a production db would make
+scoped cleanup dangerous. After importing the host, ``bootstrap()`` does not
+merely trust the db number: it rejects production/too-low dbs and then *proves*
+db15 is ours by scanning it for keys, aborting if any key does not start with
+``agents:effingtest`` (emptiness is proved at bootstrap, not assumed). It also
+re-checks the live client's connection pool, if one already exists.
 
 Cleanup is always scoped (``agents:<id>:*`` for the ids a test created); this
 module never calls ``flushdb``/``flushall``.
@@ -43,8 +46,13 @@ import sys
 import traceback
 from types import SimpleNamespace
 
-#: The only Redis db a plugin test may touch. ``db=0`` is production.
-DEDICATED_REDIS_DB = 1
+#: The only Redis db a plugin test may touch. ``db=0``, ``1`` and ``2`` are
+#: production.
+DEDICATED_REDIS_DB = 15
+
+#: Every key a plugin test owns must start with this prefix; the guard treats
+#: anything else in the dedicated db as a foreign key.
+OWNED_KEY_PREFIX = "agents:effingtest"
 
 #: Prefix per test *file*; individual tests add a uuid suffix (e.g.
 #: ``effingtest_<uuid>``). Kept here so cleanup helpers can reason about it.
@@ -86,21 +94,78 @@ def _resolve_redis_host() -> str | None:
 
 
 def _force_test_env() -> None:
-    """Set the isolated Redis db and the minimal host env BEFORE importing cat."""
+    """Default the isolated Redis db and the minimal host env BEFORE importing cat.
+
+    ``CAT_REDIS_DB`` is only defaulted (not overwritten) so an explicitly forced
+    production db reaches :func:`_guard_dedicated_db` and aborts the run instead
+    of being silently replaced.
+    """
     os.environ.setdefault("CAT_REDIS_HOST", _resolve_redis_host() or "localhost")
     os.environ.setdefault("CAT_REDIS_PORT", "6379")
     os.environ.setdefault(
         "CAT_JWT_SECRET", "test_only_jwt_secret_0123456789_abcdefghij"
     )
     # MUST happen before any ``cat`` import: the Database singleton binds here.
-    os.environ["CAT_REDIS_DB"] = str(DEDICATED_REDIS_DB)
+    os.environ.setdefault("CAT_REDIS_DB", str(DEDICATED_REDIS_DB))
+
+
+def _guard_db_is_ours(db: int) -> None:
+    """Prove ``db`` belongs to this suite, not production.
+
+    Opens a short-lived **synchronous** Redis client (the async host client is a
+    singleton that may not be usable yet), scans every key and aborts unless all
+    of them start with :data:`OWNED_KEY_PREFIX`. Read-only: it never flushes.
+    """
+    from redis import Redis
+
+    from cat.db.database import get_redis_kwargs
+
+    kwargs = get_redis_kwargs()
+    client = Redis(
+        host=kwargs["host"],
+        port=kwargs["port"],
+        db=db,
+        password=kwargs.get("password"),
+        ssl=kwargs.get("ssl", False),
+        decode_responses=True,
+    )
+    try:
+        foreign = [
+            key
+            for key in client.scan_iter(match="*")
+            if not str(key).startswith(OWNED_KEY_PREFIX)
+        ]
+    finally:
+        client.close()
+
+    if foreign:
+        examples = ", ".join(repr(key) for key in foreign[:3])
+        raise RuntimeError(
+            f"Refusing to run plugin tests: Redis db {db} holds "
+            f"{len(foreign)} key(s) that do not start with "
+            f"{OWNED_KEY_PREFIX!r} (e.g. {examples}). The db is not proven to be "
+            "ours; a destructive op could touch another suite's or production "
+            "data."
+        )
 
 
 def _guard_dedicated_db() -> None:
-    """Abort unless the resolved Redis db is the dedicated test db."""
+    """Abort unless the resolved Redis db is the dedicated test db and is ours."""
     from cat.db.database import Database, get_redis_kwargs
 
     env_db = get_redis_kwargs().get("db")
+    if env_db in (0, 1, 2):
+        raise RuntimeError(
+            "Refusing to run plugin tests: resolved CAT_REDIS_DB is "
+            f"{env_db!r}, a PRODUCTION Redis db (0/1/2). A destructive op could "
+            "wipe production data."
+        )
+    if env_db is None or env_db < 10:
+        raise RuntimeError(
+            "Refusing to run plugin tests: resolved CAT_REDIS_DB is "
+            f"{env_db!r}; the dedicated test db must be >= 10 "
+            f"(expected {DEDICATED_REDIS_DB})."
+        )
     if env_db != DEDICATED_REDIS_DB:
         raise RuntimeError(
             "Refusing to run plugin tests: resolved CAT_REDIS_DB is "
@@ -118,8 +183,10 @@ def _guard_dedicated_db() -> None:
                 "Refusing to run plugin tests: the live Redis client is bound to "
                 f"db={live_db!r}, not the dedicated test db "
                 f"{DEDICATED_REDIS_DB}. It was likely created before "
-                "bootstrap() forced CAT_REDIS_DB."
+                "bootstrap() defaulted CAT_REDIS_DB."
             )
+
+    _guard_db_is_ours(DEDICATED_REDIS_DB)
 
 
 class FakePluginManager:

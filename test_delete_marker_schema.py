@@ -17,7 +17,7 @@ Covers the one-schema contract owned by ``cat.looking_glass.agent_deletion``:
   (c) the registry helpers ARE the core helpers (imported, not mirrored), so a
       second schema implementation cannot appear.
 
-Redis isolation: ``CAT_REDIS_DB=1`` is forced BEFORE importing ``cat``; every
+Redis isolation: ``CAT_REDIS_DB=15`` is forced BEFORE importing ``cat``; every
 key lives under a unique ``agents:effingtest_<uuid>:`` namespace and is
 destroyed after each test.
 """
@@ -31,7 +31,7 @@ if __name__ == "__main__":
     os.environ.setdefault("CAT_REDIS_HOST", "localhost")
     os.environ.setdefault("CAT_REDIS_PORT", "6379")
     os.environ.setdefault("CAT_JWT_SECRET", "test_only_jwt_secret_0123456789_abcdefghij")
-    os.environ["CAT_REDIS_DB"] = "1"
+    os.environ["CAT_REDIS_DB"] = "15"
 
     from cat.core_plugins.cat_efficient_ingestion import registry
     from cat.db import crud
