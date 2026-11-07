@@ -273,7 +273,23 @@ core checkout:
 `test_final_wave_findings.py` (download lease, NX create, resume lease,
 batch heartbeat), `test_known_blockers.py` (B1 status listing, B3/B3b
 download resumability), `test_round2_findings.py` (NN1-NN3 heartbeat/lease),
-`test_plugin_dependency_metadata.py` (manifest + pyproject self-consistency).
+`test_plugin_dependency_metadata.py` (manifest + pyproject self-consistency),
+and `test_maintenance_coordination.py` (the CLI/maintenance-marker contract
+with MyGRAPH, moved here from the MyGRAPH repo; it drives the real MyGRAPH
+`maintenance_agent`, so point `MYGRAPH_PLUGIN_DIR` at that checkout if it is
+not a sibling).
+
+### Phase-contract testkit
+
+`effing_testkit.py` is the single published copy of EffING's phase-contract
+doubles for the other plugins: `PhaseSpec`, `PhaseResult`, `IngestionPhase`,
+`make_diary_entry`, and `install_stub_package()` / `uninstall_stub_package()`,
+which register and remove the synthetic
+`cat.core_plugins.cat_efficient_ingestion` package (plus `.phases` and
+`.split`) for a bare checkout. It is import-safe (no `cat` import, no env or
+Redis access at import), the installer prefers a real installation and is
+idempotent, and `uninstall` restores the exact previous `sys.modules` state.
+
 
 Those five share ONE import-safe harness, `_testkit.py` (also imported by the
 host at activation, hence side-effect free):
