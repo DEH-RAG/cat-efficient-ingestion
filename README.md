@@ -266,15 +266,57 @@ Plugin-local standalone scripts:
 `test_ingestion_status.py`, `test_phase_extension_contract.py`,
 `test_plugin_imports.py`, `test_point_identity.py`, `test_startup_order.py`,
 `test_system_only_dispatch.py`, plus the pre-existing
-`test_ingestion_safety_fixes.py` family.
+`test_ingestion_safety_fixes.py` family, and the suites handed over from the
+core checkout:
+
+`test_ingestion_status_phases.py` (registry + `completed_phases` diary),
+`test_final_wave_findings.py` (download lease, NX create, resume lease,
+batch heartbeat), `test_known_blockers.py` (B1 status listing, B3/B3b
+download resumability), `test_round2_findings.py` (NN1-NN3 heartbeat/lease),
+`test_plugin_dependency_metadata.py` (manifest + pyproject self-consistency).
+
+Those five share ONE import-safe harness, `_testkit.py` (also imported by the
+host at activation, hence side-effect free):
+
+- `bootstrap()` forces `CAT_REDIS_DB=1` **before** importing `cat`, then
+  refuses to continue unless the *resolved* Redis db (env and, if present, the
+  live connection pool) is the dedicated test db — the data-loss guard;
+- `teardown(agent_ids)` deletes only `agents:<id>:*` for the ids a test
+  created (never `flushdb`/`flushall`);
+- `run([...])` executes the tests in one event loop and prints `N/M passed`,
+  exiting non-zero on failure.
+
+Run any of them from the core checkout (RedisJSON is required; without an
+explicit `CAT_REDIS_HOST` the harness resolves the dev `redis-stack` container,
+falling back to `localhost`):
+
+```bash
+cd grinning-cat-core
+.venv/bin/python /path/to/plugins/cat-efficient-ingestion/test_ingestion_status_phases.py
+```
 
 The plugin owns its test suite: the standalone, import-safe scripts above are
 the authoritative plugin checks and run without the host app. The tests that
-need the host pytest fixtures (`lizard`, `secure_client`, `cheshire_cat`, …)
-and the real app/Redis/Qdrant harness are a deliberate cross-repo integration
-exception: they stay in `grinning-cat-core/tests/effing/`
-(installation/validation, factory/endpoint, route/lifecycle) and run from the
-MyCAT integration checkout, not from this plugin:
+need the host pytest fixtures (`lizard`, `secure_client`, `cheshire_cat`,
+`stray`, …) and the real app/Redis/Qdrant harness are a deliberate cross-repo
+integration exception: they stay in `grinning-cat-core/tests/effing/` and run
+from the MyCAT integration checkout, not from this plugin:
+
+- `test_efficient_ingestion_installation.py` — BillTheLizard startup validation
+  and system-only plugin contract.
+- `test_efficient_ingestion.py` — ServiceFactory selection and
+  `/ingestion/settings` routes.
+- `test_store_hook_once.py` — real hook dispatcher + engine on a real cat.
+- `test_url_source_persistence.py` — real `CheshireCat`, file manager and
+  vector store for URL byte persistence.
+- `test_final_wave_findings.py` — the one chunker-change case through the real
+  `PUT /chunking/settings` route.
+- `test_known_blockers.py` — B2/B2b (real `CheshireCat` settings) and B4 (real
+  dispatcher via `StrayCat`).
+- `test_round2_findings.py` — the concurrent two-agent chunker isolation case
+  (needs a real `lizard`).
+- `test_plugin_dependency_metadata.py` — host-side loader
+  (`Plugin.missing_dependencies`, `lizard` load) and the `min_cat_version` pin.
 
 ```bash
 CAT_REDIS_HOST=<redis ip> uv run pytest tests/effing -q
